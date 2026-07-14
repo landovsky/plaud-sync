@@ -1,0 +1,11 @@
+api-reference/
+*.har
+.DS_Store
+.envrc
+__pycache__/
+*.pyc
+docs/audio/
+docs/working/
+docs/transcripts/
+tmp/
+.claude/

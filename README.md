@@ -1,0 +1,280 @@
+# plaud-sync
+
+Turn [Plaud.ai](https://plaud.ai) voice recordings into clean, structured, project-filed Markdown — automatically.
+
+`plaud-sync` pulls your recordings from the Plaud cloud, transcribes them, summarizes and classifies them with an LLM, and drops the results straight into the right project repository. No web app, no copy-pasting, no manual file wrangling.
+
+> ⚠️ **Unofficial.** This tool talks to Plaud's private, undocumented API (reverse-engineered from the web app). It can break whenever Plaud changes their backend. It is not affiliated with or endorsed by Plaud.ai. Use it on your own account, at your own risk.
+
+---
+
+## The problem it solves
+
+Plaud does a great job recording and transcribing meetings. But the path from *"recording done"* to *"information is actionable in my project"* is all friction:
+
+1. Open the Plaud web app
+2. Wait for / trigger transcription
+3. Copy-paste or download the transcript
+4. Save it to the right file, in the right project folder
+5. Point an AI tool at it to actually do something
+
+So recordings pile up unprocessed for days. `plaud-sync` collapses steps 2–5 into one command. Say *"process today's meetings"* and structured transcripts + summaries land in the correct repo, ready for AI-assisted follow-up.
+
+**What you get per recording:**
+
+- 🎙️ A **diarized, timestamped transcript** (speaker-labeled, filler removed)
+- 📝 A **structured summary** — context, key points, decisions, action items, open questions
+- 🏷️ **Automatic classification** — recording type, tags, and which project it belongs to
+- 📂 **Automatic routing** — Plaud folders / content map to project directories
+- 🔁 **Incremental sync** — state tracking means nothing gets downloaded or transcribed twice
+- ✅ **Auto-commit** — processed files are committed to the repo for you
+
+---
+
+## How it works
+
+```
+Plaud device
+  └─► Plaud cloud   (auto-syncs over Bluetooth / phone app)
+        └─► plaud-sync
+              1. list recordings for the last N days
+              2. download audio (Fernet-decrypt the pre-signed URL)
+              3. transcribe  → ElevenLabs Scribe v2 (diarized)
+              4. summarize + classify + clean  → Claude
+              5. route to the right project dir, write Markdown
+              6. git commit
+```
+
+The repo ships **two tools** — pick based on whether you want your own transcription/summaries or Plaud's:
+
+| Tool | What it does | Uses |
+|------|--------------|------|
+| **`plaud_transcribe.py`** | Full pipeline. Downloads the **audio**, transcribes it yourself (ElevenLabs), then summarizes/classifies with Claude. Best quality + control. | ElevenLabs + Claude |
+| **`plaud_sync.py`** | Lighter. Downloads **Plaud's own** transcript, outline, and summaries (whatever Plaud already generated) and files them as Markdown. No re-transcription. | Plaud only |
+
+Most people want **`plaud_transcribe.py`**. Use `plaud_sync.py` if you're happy with Plaud's built-in output and want to skip the transcription/LLM cost.
+
+---
+
+## Quickstart
+
+### 1. Prerequisites
+
+- **Python 3.10+** (uses only the standard library, plus `cryptography`)
+- **`cryptography`** — `pip install cryptography` (needed to decrypt Plaud's audio URLs)
+- **`git`** and **`curl`** on your `PATH`
+- For `plaud_transcribe.py`:
+  - An **[ElevenLabs](https://elevenlabs.io) API key** (Scribe v2 speech-to-text)
+  - **Claude** — either the [Claude Code CLI](https://claude.com/claude-code) (`claude` on your `PATH`) or an Anthropic API key
+
+### 2. Get your Plaud token
+
+The Plaud API uses a long-lived bearer token (JWT, ~10 months). To grab it:
+
+1. Log in to <https://web.plaud.ai>
+2. Open DevTools → **Network** tab
+3. Click any request to `api.plaud.ai` and copy the `Authorization: Bearer <token>` value
+
+### 3. Set your secrets
+
+```bash
+export PLAUD_BEARER_TOKEN="eyJhbGci..."      # from step 2
+export ELEVENLABS_API_KEY="sk_..."           # for plaud_transcribe.py
+# Claude auth — one of:
+export CLAUDE_CODE_OAUTH_TOKEN="..."         # Claude Code subscription token, or
+export ANTHROPIC_API_KEY="sk-ant-..."        # Anthropic API key
+```
+
+> Tip: keep these in a `.envrc` (with [direnv](https://direnv.net)) or your shell profile. `.envrc` is git-ignored in this repo.
+
+### 4. Configure your projects
+
+Create `~/.plaud-sync/config.json` mapping Plaud folders → destination directories:
+
+```json
+{
+  "projects": {
+    "playgrove":  "~/git/playgrove/docs/transcripts",
+    "medovia":    "~/git/medovia/docs/transcripts",
+    "greenfield": "~/git/greenfield/docs/transcripts"
+  },
+  "default_output": "~/git/plaud-sync/docs/transcripts",
+  "timezone": "Europe/Prague"
+}
+```
+
+`plaud_sync.py` can scaffold this for you: `./plaud_sync.py init`.
+
+### 5. Run it
+
+```bash
+# Interactive: pick which recordings to process
+./plaud_transcribe.py
+
+# Non-interactive: process everything unprocessed from the last 30 days
+./plaud_transcribe.py --all
+```
+
+That's it. Transcripts and summaries appear under the mapped project directory and are committed automatically.
+
+---
+
+## Usage
+
+### `plaud_transcribe.py` — the full pipeline
+
+```bash
+./plaud_transcribe.py [command] [options]
+```
+
+**Commands**
+
+| Command | Description |
+|---------|-------------|
+| `process` *(default)* | Interactively select and process recordings |
+| `list` | Show recordings and their status (✓ done · – skipped · blank pending) |
+| `move <ref> <project>` | Move an already-processed recording to a different project |
+
+**Options**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--days N` | `30` | How many days back to fetch |
+| `--all` | off | Process every unprocessed recording, no prompts |
+| `--language` | `cs` | Primary language hint for transcription |
+
+**Interactive prompt commands** (in `process` mode):
+
+```
+1,3      process recordings 1 and 3
+s1,3     skip recordings 1 and 3 (won't show again)
+m1,2     merge recordings 1 and 2 into one session, then process
+all      process everything listed
+q        quit
+```
+
+**Merging** is handy when one meeting spans several recordings — they're concatenated and summarized as a single session.
+
+**Moving** a recording after the fact:
+
+```bash
+# non-interactive
+./plaud_transcribe.py move 59485297e34e... medovia
+./plaud_transcribe.py move 2026-05-04-patient-portal-...  medovia   # by output dir name
+
+# interactive: fuzzy-pick a transcript, then a project
+./plaud_transcribe.py move
+```
+
+### `plaud_sync.py` — pull Plaud's native output
+
+```bash
+./plaud_sync.py init              # write a default config
+./plaud_sync.py list --days 7     # list recent recordings + sync status
+./plaud_sync.py sync --days 7     # download transcripts/outlines/summaries
+./plaud_sync.py sync --dry-run    # show what would download, without doing it
+./plaud_sync.py sync --folder Medovia   # only one Plaud folder
+```
+
+---
+
+## Output
+
+Each recording becomes a dated, slugified directory in its project:
+
+```
+docs/transcripts/
+  2026-05-04-14-30-medovia-patient-portal-kickoff/
+    summary.md         # structured summary with YAML front matter
+    transcript.md      # cleaned, diarized, timestamped transcript
+    metadata.json      # file_id, duration, project, tags, raw metadata
+```
+
+`summary.md` and `transcript.md` carry YAML front matter for easy indexing:
+
+```yaml
+---
+title: Medovia patient portal — kickoff
+date: 2026-05-04
+type: meeting
+tags: [medovia, portal, onboarding]
+project: medovia
+language: cs
+duration: 47m
+plaud_id: 59485297e34e7f472060c0f6baa90648
+---
+```
+
+(`plaud_sync.py` writes a slightly different set: `transcript.md`, `outline.md`, and one file per Plaud summary type — `task-assignment.md`, `meeting-report.md`, `meeting-minutes.md`.)
+
+---
+
+## How it decides where things go
+
+`plaud_transcribe.py` classifies each recording with Claude and asks it to pick the best-matching **project key** from your config (or `default` if nothing fits). The result is validated against your real config keys, so a hallucinated project name falls back to `default` rather than mis-filing.
+
+`plaud_sync.py` routes by **Plaud folder** instead: it reads each recording's folder tag and looks it up in `folder_mapping`. A folder mapped to `null` (e.g. `"Archiv": null`) is explicitly skipped.
+
+---
+
+## State & incremental sync
+
+State lives in `~/.plaud-sync/state.json` and is what makes sync idempotent:
+
+- **`plaud_transcribe.py`** tracks each recording under `transcribed` with a status:
+  - `done` — fully processed and filed
+  - `transcribed` — audio was transcribed but summarization failed; retried next run (shown as `[incomplete]`)
+  - `skipped` — you skipped it, or it was auto-skipped (recordings under 10 seconds are dropped automatically)
+- **`plaud_sync.py`** tracks downloads under `downloaded` keyed by `version_ms`, so an updated recording re-downloads but an unchanged one doesn't.
+
+Downloaded audio is cached under `docs/audio/` and intermediate transcripts under `docs/working/` (both git-ignored), so re-runs are cheap and never re-download or re-transcribe.
+
+---
+
+## Configuration reference
+
+`~/.plaud-sync/config.json`:
+
+| Key | Used by | Description |
+|-----|---------|-------------|
+| `projects` | transcribe | `{ "key": "~/path/to/dir" }` — classification targets |
+| `folder_mapping` | sync | `{ "Plaud Folder": "~/path" }` — folder → dir (use `null` to skip). Also used as a fallback by transcribe |
+| `default_output` | both | Where unmatched recordings go |
+| `timezone` | both | IANA tz for the Plaud API (default `Europe/Prague`) |
+| `token` | both | Optional: Plaud token here instead of the env var |
+
+**Environment variables**
+
+| Var | Purpose |
+|-----|---------|
+| `PLAUD_BEARER_TOKEN` | Plaud API token (overrides `config.json`) |
+| `ELEVENLABS_API_KEY` | ElevenLabs Scribe v2 (transcribe only) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code subscription auth (transcribe only) |
+| `ANTHROPIC_API_KEY` | Alternative Claude auth (transcribe only) |
+
+---
+
+## The Plaud API
+
+Everything here was reverse-engineered by capturing traffic from the Plaud web app. The full annotated reference — endpoints, JWT structure, response formats, the S3 content layout, and the response encryption scheme — is in **[DESIGN.md](DESIGN.md)**. (Raw captured API responses aren't published, since they contain live account data.)
+
+A couple of things worth knowing if it breaks:
+
+- **Token expired?** The scripts detect a `401` and tell you to grab a fresh token from DevTools.
+- **Fernet decryption failed?** Plaud rotated their audio-URL encryption key. `plaud_transcribe.py:fernet_decrypt()` explains how to recover the new key from the JS bundle. This is the most fragile part of the pipeline.
+
+---
+
+## Limitations & notes
+
+- **Private API** — expect it to break on Plaud backend changes.
+- **Language** — defaults to Czech (`cs`); pass `--language en` (or another code) as needed. Summary section headings in the prompt are Czech.
+- **Costs** — `plaud_transcribe.py` spends ElevenLabs and Claude credits per recording. `plaud_sync.py` is free (only downloads what Plaud already made).
+- **Personal defaults** — the example project paths (`~/git/playgrove`, etc.) are placeholders; set your own in `config.json`.
+- **Secrets** — never commit real tokens. `.envrc`, `docs/audio/`, and `docs/working/` are git-ignored.
+
+---
+
+## License
+
+No license specified yet — add one before sharing publicly if you want others to reuse it.
