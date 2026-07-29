@@ -1,0 +1,11 @@
+{
+  "projects": {
+    "project-a": "~/git/project-a/docs/transcripts",
+    "project-b": "~/git/project-b/docs/transcripts"
+  },
+  "default_output": "~/git/plaud-sync/docs/transcripts",
+  "timezone": "Europe/Prague",
+  "language": "en",
+  "auto_commit": false,
+  "process_bookmarks": false
+}

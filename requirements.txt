@@ -1,0 +1,7 @@
+# plaud-transcribe / plaud-sync Python dependencies.
+# Everything else is Python 3.10+ standard library.
+#
+# External CLI tools also required at runtime:
+#   - git          (both tools; optional auto-commit in plaud_transcribe.py)
+#   - claude        (Claude Code CLI — plaud_transcribe.py summarization)
+cryptography>=42

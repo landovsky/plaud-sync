@@ -6,15 +6,21 @@ Full pipeline:
   2. Interactive selection of unprocessed recordings
   3. Download audio
   4. Transcribe via ElevenLabs Scribe v2
-  5. Classify & summarize via Claude API (Sonnet)
-  6. Write outputs to target project directory
-  7. Commit working files to this repo
+  5. Classify & summarize via the Claude Code CLI (`claude`)
+  6. Write outputs to the target project directory
+  7. (optional) Commit outputs into their target repo — set "auto_commit": true
+
+Summarization prompts live in prompts/summarize.<lang>.md (cs, en) — edit them
+there rather than in this file.
+
+Summarization currently requires the Claude Code CLI (`claude`) on your PATH.
+A pluggable LLM gateway (Anthropic API / OpenAI-compatible) is on the roadmap —
+pull requests welcome.
 
 Env vars:
-  PLAUD_BEARER_TOKEN      — Plaud.ai API token (or set in ~/.plaud-sync/config.json)
+  PLAUD_BEARER_TOKEN      — Plaud.ai API token (or set "token" in ~/.plaud-sync/config.json)
   ELEVENLABS_API_KEY      — ElevenLabs API key for transcription
-  CLAUDE_CODE_OAUTH_TOKEN — Claude subscription OAuth token for summarization
-  ANTHROPIC_API_KEY       — Alternative: Anthropic API key (console.anthropic.com)
+  CLAUDE_CODE_OAUTH_TOKEN — Claude Code auth (or just have `claude` logged in)
 """
 
 import argparse
@@ -38,6 +44,12 @@ STATE_FILE = CONFIG_DIR / "state.json"
 PROJECT_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = PROJECT_DIR / "docs" / "audio"
 WORKING_DIR = PROJECT_DIR / "docs" / "working"
+PROMPTS_DIR = PROJECT_DIR / "prompts"
+DEFAULT_OUTPUT_DIR = PROJECT_DIR / "docs" / "transcripts"
+
+# Plaud encrypts some responses with a *global* app key (not per-user). If Plaud
+# rotates it, override via "fernet_key" in config.json — see fernet_decrypt().
+DEFAULT_FERNET_KEY = b"8rRmMCskL3NaUiGr-UsmEEeI8NKH-ZfeGbpRGqSLpuI="
 
 HEADERS_TEMPLATE = {
     "app-platform": "web",
@@ -77,6 +89,13 @@ def get_projects(config):
         return projects
     fm = config.get("folder_mapping", {})
     return {k: v for k, v in fm.items() if v is not None}
+
+
+def default_output_dir(config):
+    """Where recordings land when no project matches. Defaults to this tool's
+    own docs/transcripts so a cloner isn't pointed at a stranger's path."""
+    val = config.get("default_output")
+    return Path(val).expanduser() if val else DEFAULT_OUTPUT_DIR
 
 
 # --- Plaud API ---
@@ -170,17 +189,22 @@ def fetch_folders(token, config):
     return {f["id"]: f["name"] for f in data.get("data_filetag_list", [])}
 
 
-def fernet_decrypt(data):
+def fernet_decrypt(data, config=None):
     from cryptography.fernet import Fernet, InvalidToken
-    key = b"8rRmMCskL3NaUiGr-UsmEEeI8NKH-ZfeGbpRGqSLpuI="
+    key = (config or {}).get("fernet_key") or DEFAULT_FERNET_KEY
+    if isinstance(key, str):
+        key = key.encode()
     try:
         return Fernet(key).decrypt(data)
     except InvalidToken:
         print(
             "Error: Fernet decryption failed — Plaud.ai likely rotated their encryption key.\n"
-            "To fix: open web.plaud.ai in Chrome DevTools, capture a HAR, then search the JS\n"
-            "bundles for the fernet chunk and extract the new key from the bf() function.\n"
-            "Update the key in plaud_transcribe.py:fernet_decrypt().",
+            "Fixes, in order of effort:\n"
+            "  1. Use plaud_sync.py instead — it downloads Plaud's own transcripts, needs no\n"
+            "     audio decryption, and is therefore immune to key rotation.\n"
+            '  2. Set a fresh key in ~/.plaud-sync/config.json as "fernet_key": "<key>".\n'
+            "  3. Recover the key: open web.plaud.ai in Chrome DevTools, capture a HAR, search\n"
+            "     the JS bundles for the fernet chunk, and read it from the bf() function.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -194,7 +218,7 @@ def plaud_get_encrypted(path, token, config):
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         encrypted = resp.read()
-    return json.loads(fernet_decrypt(encrypted))
+    return json.loads(fernet_decrypt(encrypted, config))
 
 
 def download_audio(file_id, token, config):
@@ -213,28 +237,44 @@ def download_audio(file_id, token, config):
 
 # --- ElevenLabs Transcription ---
 
-def transcribe_audio(audio_path, language="cs"):
+def _encode_multipart(fields, file_field, filename, filedata):
+    """Build a multipart/form-data body so we can POST via urllib instead of
+    shelling out to curl (one less dependency; keeps the API key out of argv)."""
+    boundary = "----plaudsync" + os.urandom(16).hex()
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+        f'filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
+    )
+    body = b"".join(parts) + filedata + f"\r\n--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def transcribe_audio(audio_path, language="cs", config=None):
     api_key = os.environ.get("ELEVENLABS_API_KEY")
     if not api_key:
         print("Error: ELEVENLABS_API_KEY not set.", file=sys.stderr)
         sys.exit(1)
 
-    result = subprocess.run(
-        [
-            "curl", "-s", "-X", "POST", ELEVENLABS_API,
-            "-H", f"xi-api-key: {api_key}",
-            "-F", f"file=@{audio_path}",
-            "-F", "model_id=scribe_v2",
-            "-F", "diarize=true",
-            "-F", f"language_code={language}",
-        ],
-        capture_output=True, text=True, timeout=600,
+    model = (config or {}).get("elevenlabs_model", "scribe_v2")
+    audio_path = Path(audio_path)
+    fields = {"model_id": model, "diarize": "true", "language_code": language}
+    body, content_type = _encode_multipart(fields, "file", audio_path.name, audio_path.read_bytes())
+    req = urllib.request.Request(
+        ELEVENLABS_API, data=body,
+        headers={"xi-api-key": api_key, "Content-Type": content_type},
     )
-    if result.returncode != 0:
-        print(f"Error: ElevenLabs failed: {result.stderr}", file=sys.stderr)
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        print(f"Error: ElevenLabs failed ({e.code}): {detail}", file=sys.stderr)
         sys.exit(1)
-
-    return json.loads(result.stdout)
 
 
 def download_gzipped_json(url):
@@ -256,9 +296,13 @@ def fetch_bookmarks(recording, token, config):
     carries no user text, just a position, so we surface it as a neutral
     marker and let downstream summarization react to it however it wants.
 
-    Returns [] on any failure or when the recording has no marks (graceful:
-    a missing bookmark must never block transcription).
+    Opt-in via config: only runs when "process_bookmarks": true is set in
+    ~/.plaud-sync/config.json. Returns [] on any failure or when the
+    recording has no marks (graceful: a missing bookmark must never block
+    transcription).
     """
+    if not config.get("process_bookmarks"):
+        return []
     if not recording.get("is_markmemo"):
         return []
     file_id = recording["id"]
@@ -322,48 +366,28 @@ def format_diarized_transcript(transcription_data, bookmarks=None):
 
 # --- Claude CLI for Classification & Summarization ---
 
-def claude_summarize(transcript_text, recording_meta, projects):
-    project_list = "\n".join(f"- {name}: {path}" for name, path in projects.items())
+def load_prompt_template(language):
+    """Load the summarization prompt for a language from prompts/summarize.<lang>.md.
+    Falls back to English if the requested language has no template."""
+    path = PROMPTS_DIR / f"summarize.{language}.md"
+    if not path.exists():
+        path = PROMPTS_DIR / "summarize.en.md"
+    return path.read_text(encoding="utf-8")
+
+
+def claude_summarize(transcript_text, recording_meta, projects, language="en"):
+    project_list = "\n".join(f"- {name}: {path}" for name, path in projects.items()) or "(none configured)"
     duration_min = recording_meta.get("duration", 0) // 60000
 
-    prompt = f"""You are processing a transcribed recording. Analyze it and produce a JSON response.
-
-## Recording metadata
-- Original filename: {recording_meta.get('filename', 'unknown')}
-- Duration: {duration_min} minutes
-- Date: {recording_meta.get('date', 'unknown')}
-- Plaud folder: {recording_meta.get('folder', 'none')}
-
-## Known projects
-{project_list}
-
-## Tasks
-
-1. **Classify**: determine recording type, assign to a project key from the list above (or "default" if none match), pick a short descriptive name in the recording's language, add relevant tags.
-
-2. **Summarize**: write a structured summary in the recording's language. Include these sections:
-   - **Kontext** (who, what, why — 2-3 sentences)
-   - **Klíčové body** (bulleted)
-   - **Rozhodnutí** (bulleted, if any)
-   - **Akční položky** (bulleted with owner if identifiable, e.g. "[speaker_0]")
-   - **Otevřené otázky** (if any)
-
-3. **Clean transcript**: produce a cleaned version that removes filler words (eh, mhm, no, jo used as pure filler) and irrelevant passages (background noise, phone interruptions) ONLY with high confidence. Keep all substantive content, speaker labels, and timestamps.
-
-Respond with ONLY valid JSON, no markdown fences, no explanation:
-{{
-  "name": "short descriptive name in recording language",
-  "type": "meeting|developer-sync|lecture|interview|brainstorm|call|other",
-  "tags": ["tag1", "tag2"],
-  "project": "project-key-from-list or default",
-  "language": "cs|en",
-  "summary": "full markdown summary",
-  "clean_transcript": "cleaned transcript text"
-}}
-
-## Transcript
-
-{transcript_text}"""
+    prompt = (
+        load_prompt_template(language)
+        .replace("{{FILENAME}}", str(recording_meta.get("filename", "unknown")))
+        .replace("{{DURATION_MIN}}", str(duration_min))
+        .replace("{{DATE}}", str(recording_meta.get("date", "unknown")))
+        .replace("{{FOLDER}}", str(recording_meta.get("folder", "none")))
+        .replace("{{PROJECT_LIST}}", project_list)
+        .replace("{{TRANSCRIPT}}", transcript_text)
+    )
 
     timeout = max(300, duration_min * 30)
     try:
@@ -371,6 +395,15 @@ Respond with ONLY valid JSON, no markdown fences, no explanation:
             ["claude", "-p", "--output-format", "text"],
             input=prompt, capture_output=True, text=True, timeout=timeout,
         )
+    except FileNotFoundError:
+        print(
+            "Error: the 'claude' CLI (Claude Code) was not found on your PATH.\n"
+            "plaud-transcribe currently requires Claude Code for summarization:\n"
+            "  https://claude.com/claude-code\n"
+            "(A pluggable LLM gateway is on the roadmap — PRs welcome.)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except subprocess.TimeoutExpired:
         print(f"TIMEOUT ({timeout}s)", file=sys.stderr)
         return None
@@ -519,7 +552,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
         raw_text = transcript_path.read_text(encoding="utf-8")
     else:
         print(f"  [2/4] Transcribing via ElevenLabs...", end=" ", flush=True)
-        transcription = transcribe_audio(audio_path, language)
+        transcription = transcribe_audio(audio_path, language, config)
         bookmarks = fetch_bookmarks(recording, token, config)
         raw_text = format_diarized_transcript(transcription, bookmarks)
 
@@ -535,7 +568,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
 
     # 3. Classify & summarize via Claude
     print(f"  [3/4] Classifying & summarizing via Claude...", end=" ", flush=True)
-    classification = claude_summarize(raw_text, recording_meta, projects)
+    classification = claude_summarize(raw_text, recording_meta, projects, language)
     if not classification:
         print("FAILED")
         state.setdefault("transcribed", {})[file_id] = {
@@ -569,7 +602,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
     if project_key != "default":
         target_base = Path(projects[project_key]).expanduser()
     else:
-        target_base = Path(config.get("default_output", "~/git/plaud-sync/docs/transcripts")).expanduser()
+        target_base = default_output_dir(config)
 
     output_dir = target_base / dir_name
     write_outputs(classification, recording_meta, raw_text, output_dir)
@@ -643,7 +676,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
             raw_text = transcript_path.read_text(encoding="utf-8")
         else:
             print(f"  [{step}/{step_total}] Transcribing {part_label}...", end=" ", flush=True)
-            transcription = transcribe_audio(audio_path, language)
+            transcription = transcribe_audio(audio_path, language, config)
             bookmarks = fetch_bookmarks(rec, token, config)
             raw_text = format_diarized_transcript(transcription, bookmarks)
             word_count = len([w for w in transcription.get("words", []) if w["type"] == "word"])
@@ -678,7 +711,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     # Classify & summarize
     step += 1
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
-    classification = claude_summarize(combined_transcript, recording_meta, projects)
+    classification = claude_summarize(combined_transcript, recording_meta, projects, language)
     if not classification:
         print("FAILED")
         for fid in file_ids:
@@ -713,7 +746,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     if project_key != "default":
         target_base = Path(projects[project_key]).expanduser()
     else:
-        target_base = Path(config.get("default_output", "~/git/plaud-sync/docs/transcripts")).expanduser()
+        target_base = default_output_dir(config)
 
     output_dir = target_base / dir_name
     write_outputs(classification, recording_meta, combined_transcript, output_dir)
@@ -846,7 +879,15 @@ def cmd_list(args, token, config, state, folders):
 
     pending = [r for r in recordings if r["id"] not in transcribed]
     done = [r for r in recordings if r["id"] in transcribed]
-    print(f"\n{len(pending)} pending, {len(done)} done/skipped\n")
+    print(f"\n{len(pending)} pending, {len(done)} done/skipped")
+    print("  ✓ done · ~ incomplete · – skipped · (blank) pending\n")
+
+    def shorten(path):
+        """Show the output path relative to $HOME (~) so it stays readable."""
+        try:
+            return f"~/{Path(path).relative_to(Path.home())}"
+        except ValueError:
+            return str(path)
 
     for r in recordings:
         dt = datetime.fromtimestamp(r.get("start_time", 0) / 1000, tz=timezone.utc)
@@ -857,32 +898,70 @@ def cmd_list(args, token, config, state, folders):
         folder_str = f" ({folder})" if folder else ""
 
         entry = transcribed.get(r["id"], {})
-        if entry.get("status") == "skipped":
+        entry_status = entry.get("status")
+        if entry_status == "skipped":
             status = "–"
-        elif entry:
+        elif entry_status == "done":
             status = "✓"
+        elif entry:  # transcribed but summarization not finished
+            status = "~"
         else:
             status = " "
 
         print(f"  {status} {date_str}  {dur:>6}  {fname}{folder_str}")
 
+        # Overlay where the outputs landed, so `list` doubles as a "where is it?"
+        if entry_status == "done" and entry.get("output_dir"):
+            project = entry.get("project")
+            tag = f"  [{project}]" if project and project != "default" else ""
+            print(f"        → {shorten(entry['output_dir'])}{tag}")
+        elif entry and entry_status not in ("done", "skipped") and entry.get("work_dir"):
+            print(f"        → {shorten(entry['work_dir'])}  (incomplete — will retry)")
 
-def git_commit_working(results):
-    if not results:
+
+def git_commit_working(results, config):
+    """Optionally commit each recording's output into the repo that actually
+    contains it (the destination project repo), not the plaud-sync clone.
+
+    Off by default — enable with "auto_commit": true in ~/.plaud-sync/config.json.
+    Output dirs that aren't inside a git repo (or are gitignored there) are
+    silently skipped.
+    """
+    if not results or not config.get("auto_commit"):
         return
-    try:
-        subprocess.run(["git", "add", "docs/"], cwd=PROJECT_DIR, capture_output=True, timeout=10)
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "docs/"],
-            cwd=PROJECT_DIR, capture_output=True, text=True, timeout=10,
-        )
-        if status.stdout.strip():
-            subprocess.run(
-                ["git", "commit", "-m", f"Transcribe {len(results)} recording(s)"],
-                cwd=PROJECT_DIR, capture_output=True, timeout=30,
+
+    # Group output dirs by their containing git repo root.
+    repos = {}
+    for r in results:
+        out = r.get("output_dir")
+        if not out:
+            continue
+        try:
+            top = subprocess.run(
+                ["git", "-C", out, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=10,
             )
-    except Exception:
-        pass
+        except Exception:
+            continue
+        root = top.stdout.strip()
+        if top.returncode == 0 and root:
+            repos.setdefault(root, []).append(out)
+
+    for root, dirs in repos.items():
+        try:
+            subprocess.run(["git", "-C", root, "add", *dirs], capture_output=True, timeout=15)
+            status = subprocess.run(
+                ["git", "-C", root, "status", "--porcelain", *dirs],
+                capture_output=True, text=True, timeout=15,
+            )
+            if status.stdout.strip():
+                subprocess.run(
+                    ["git", "-C", root, "commit", "-m", f"Add {len(dirs)} transcript(s)"],
+                    capture_output=True, timeout=30,
+                )
+                print(f"  committed {len(dirs)} transcript(s) in {root}")
+        except Exception:
+            pass
 
 
 def execute_selection(selected, merge, token, config, folders, projects, state, language):
@@ -899,7 +978,7 @@ def execute_selection(selected, merge, token, config, folders, projects, state, 
             if result:
                 results.append(result)
 
-    git_commit_working(results)
+    git_commit_working(results, config)
 
     if results:
         print(f"\n{'='*60}")
@@ -1018,7 +1097,7 @@ def do_move(file_id, entry, project_name, config, state):
         print(f"Unknown project '{project_name}'. Known: {', '.join(projects)}, default")
         return False
     if target_base is None:  # default
-        target_base = Path(config.get("default_output", "~/git/plaud-sync/docs/transcripts")).expanduser()
+        target_base = default_output_dir(config)
 
     old_dir = Path(entry["output_dir"])
     new_dir = target_base / old_dir.name
@@ -1125,20 +1204,54 @@ def cmd_process(args, token, config, state, folders):
         execute_selection(selected, merge, token, config, folders, projects, state, args.language)
 
 
+EXAMPLE_CONFIG = {
+    "projects": {
+        "project-a": "~/git/project-a/docs/transcripts",
+        "project-b": "~/git/project-b/docs/transcripts",
+    },
+    "default_output": str(DEFAULT_OUTPUT_DIR),
+    "timezone": "Europe/Prague",
+    "language": "en",
+    "auto_commit": False,
+    "process_bookmarks": False,
+}
+
+
+def cmd_init(force=False):
+    """Write a starter config to ~/.plaud-sync/config.json."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_FILE.exists() and not force:
+        print(f"Config already exists at {CONFIG_FILE}")
+        print("Use 'init --force' to overwrite.")
+        return
+    CONFIG_FILE.write_text(json.dumps(EXAMPLE_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Wrote starter config to {CONFIG_FILE}")
+    print("Edit 'projects' to map classification labels to your repo paths.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Download, transcribe, classify and summarize Plaud recordings",
     )
-    parser.add_argument("command", nargs="?", default="process", choices=["list", "process", "move"])
+    parser.add_argument("command", nargs="?", default="process", choices=["list", "process", "move", "init"])
     parser.add_argument("extra", nargs="*", help="For 'move': <file_id|dir-name|path> <project>")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--all", action="store_true", help="Process all unprocessed recordings")
-    parser.add_argument("--language", default="cs", help="Primary language (default: cs)")
+    parser.add_argument("--language", default=None, help="Primary language (default: config 'language' or cs)")
+    parser.add_argument("--force", action="store_true", help="For 'init': overwrite an existing config")
     args = parser.parse_args()
 
     config = load_config()
     state = load_state()
+
+    # Resolve language: CLI flag > config "language" > cs
+    if not args.language:
+        args.language = config.get("language", "cs")
+
+    if args.command == "init":
+        cmd_init(force=args.force)
+        return
 
     if args.command == "move":
         cmd_move(args, config, state)

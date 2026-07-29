@@ -14,19 +14,20 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 API_BASE_DEFAULT = "https://api.plaud.ai"
+PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path.home() / ".plaud-sync"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 
+# `folder_mapping` keys must match your actual Plaud folder names exactly;
+# each maps to the directory where that folder's recordings should be filed.
+# Map a folder to null to skip it. Edit these to your own projects.
 DEFAULT_CONFIG = {
     "folder_mapping": {
-        "Playgrove": "~/git/playgrove/docs/transcripts",
-        "Medovia": "~/git/medovia/docs/transcripts",
-        "Greenfield": "~/git/greenfield/docs/transcripts",
-        "AI Guild": "~/git/ai-guild/docs/transcripts",
+        "My Project": "~/git/my-project/docs/transcripts",
         "Archive": None,
     },
-    "default_output": "~/git/plaud-sync/docs/transcripts",
+    "default_output": str(PROJECT_DIR / "docs" / "transcripts"),
     "timezone": "Europe/Prague",
     "device_id": "plaud-sync-cli",
 }
