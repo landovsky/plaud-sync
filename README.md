@@ -137,7 +137,7 @@ That's it. Transcripts and summaries appear under the mapped project directory. 
 | Command | Description |
 |---------|-------------|
 | `process` *(default)* | Interactively select and process recordings |
-| `list` | Show recordings, their status (✓ done · ~ incomplete · – skipped · blank pending), and where each processed recording's output landed |
+| `list` | Show recordings, their status (✓ done · ~ incomplete · – skipped · blank pending), and where each processed recording's output landed. Local [Wispr Flow](#wispr-flow-meetings) meetings appear here too, in a `Plaud`/`Wispr` provider column |
 | `move <ref> <project>` | Move an already-processed recording to a different project |
 | `init` | Write a starter config to `~/.plaud-sync/config.json` |
 
@@ -262,6 +262,35 @@ It's graceful: recordings without marks are untouched (output is byte-identical 
 
 ---
 
+## Wispr Flow meetings
+
+[Wispr Flow](https://wisprflow.ai) records meetings and transcribes them **locally** — so unlike Plaud, the diarized, speaker-named transcript already sits on your disk. When enabled, `plaud_transcribe.py` reads those meetings straight from Wispr's local store and runs them through the *same* pipeline as Plaud recordings: `list` and `process` show them alongside your Plaud recordings (with a `Plaud`/`Wispr` provider column), and processing classifies, summarizes, and routes each one into the right project repo.
+
+Because Wispr already produced the transcript, the Wispr path **skips the audio download and ElevenLabs entirely** — there's no per-meeting transcription cost, only the Claude summarization step. (This also means it works even before Wispr has finished generating its own summary.)
+
+**What you get per meeting:**
+
+- `summary.md`, `transcript.md`, `metadata.json` — exactly like a Plaud recording (`source: wispr` in the front matter)
+- `wispr-summary.md` — **Wispr's own summary**, preserved next to yours so you can compare them (or switch to Wispr's later) without re-running anything. Turn it off with `"keep_wispr_summary": false`.
+
+**Opt-in.** Off by default. Enable it in `~/.plaud-sync/config.json`:
+
+```json
+{
+  "wispr": {
+    "enabled": true,
+    "data_dir": "~/Library/Application Support/Wispr Flow",
+    "keep_wispr_summary": true
+  }
+}
+```
+
+It's graceful and read-only: the Wispr SQLite store is opened read-only (safe while the app is running), a Wispr meeting whose transcript isn't on disk yet is simply skipped, and any Wispr read error degrades to "no Wispr meetings" without ever blocking the Plaud pipeline. `data_dir` only needs setting if your Wispr Flow store isn't at the macOS default shown above.
+
+> **Note:** the Plaud token is still required — Wispr meetings are merged *into* the Plaud listing, not a standalone mode. If you only use Wispr, you still need a valid Plaud token for the list step to succeed.
+
+---
+
 ## State & incremental sync
 
 State lives in `~/.plaud-sync/state.json` and is what makes sync idempotent:
@@ -290,6 +319,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 | `elevenlabs_model` | transcribe | ElevenLabs model id (default `scribe_v2`) |
 | `fernet_key` | transcribe | Override Plaud's audio-URL decryption key if they rotate it |
 | `process_bookmarks` | transcribe | `true` to inline device bookmarks into the transcript (default off — see [Bookmarks](#bookmarks-device-marks)) |
+| `wispr` | transcribe | Ingest local [Wispr Flow](#wispr-flow-meetings) meetings: `{ "enabled": true, "data_dir": "~/…/Wispr Flow", "keep_wispr_summary": true }` (default off) |
 | `timezone` | both | IANA tz for the Plaud API (default `Europe/Prague`) |
 | `token` | both | Optional: Plaud token here instead of the env var |
 

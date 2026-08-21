@@ -22,16 +22,24 @@ You are processing a transcribed recording. Analyze it and produce a JSON respon
 
 3. **Clean transcript**: produce a cleaned version that removes filler words (eh, mhm, no, jo used as pure filler) and irrelevant passages (background noise, phone interruptions) ONLY with high confidence. Keep all substantive content, speaker labels, and timestamps.
 
-Respond with ONLY valid JSON, no markdown fences, no explanation:
+## Output format
+
+Respond in EXACTLY this structure — a small JSON object, then the free-text
+sections after their sentinel lines. No markdown fences, no explanation. Keeping
+the summary and transcript OUT of the JSON is deliberate: it lets you use quotes,
+newlines and any punctuation freely without breaking the JSON.
+
 {
-  "name": "short descriptive name in recording language",
+  "name": "short descriptive name in recording language (no double quotes inside)",
   "type": "meeting|developer-sync|lecture|interview|brainstorm|call|other",
   "tags": ["tag1", "tag2"],
   "project": "project-key-from-list or default",
-  "language": "cs|en",
-  "summary": "full markdown summary",
-  "clean_transcript": "cleaned transcript text"
+  "language": "cs|en"
 }
+===SUMMARY===
+<the full markdown summary from task 2 — write freely; quotes and newlines are fine>
+===TRANSCRIPT===
+<the cleaned transcript from task 3>
 
 ## Transcript
 

@@ -7,5 +7,10 @@
   "timezone": "Europe/Prague",
   "language": "en",
   "auto_commit": false,
-  "process_bookmarks": false
+  "process_bookmarks": false,
+  "wispr": {
+    "enabled": false,
+    "data_dir": "~/Library/Application Support/Wispr Flow",
+    "keep_wispr_summary": true
+  }
 }

@@ -36,6 +36,8 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import wispr_flow
+
 API_BASE_DEFAULT = "https://api.plaud.ai"
 ELEVENLABS_API = "https://api.elevenlabs.io/v1/speech-to-text"
 CONFIG_DIR = Path.home() / ".plaud-sync"
@@ -79,6 +81,15 @@ def load_state():
 
 def save_state(state):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Roll a one-generation backup before overwriting. state.json is the only
+    # record of what's been processed and lives in a single place, so an
+    # accidental clobber (a bad run, a stray test) would otherwise re-expose
+    # every processed recording as "pending". The .bak makes that recoverable.
+    if STATE_FILE.exists():
+        try:
+            shutil.copy2(STATE_FILE, STATE_FILE.parent / (STATE_FILE.name + ".bak"))
+        except OSError:
+            pass
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
@@ -181,7 +192,25 @@ def list_recordings(token, config, days):
         token, config,
     )
     recordings = data.get("data_file_list", [])
+    for r in recordings:
+        r.setdefault("source", "plaud")
     return [r for r in recordings if r.get("start_time", 0) >= cutoff_ms]
+
+
+def list_all_recordings(token, config, days):
+    """Plaud recordings plus (if enabled) local Wispr Flow meetings, merged into
+    one newest-first list. Both sources share the same recording shape, so the
+    rest of the pipeline treats them uniformly. Wispr reads are best-effort and
+    never block the Plaud path."""
+    recordings = list_recordings(token, config, days)
+    recordings += wispr_flow.list_meetings(config, days)
+    recordings.sort(key=lambda r: r.get("start_time", 0), reverse=True)
+    return recordings
+
+
+def source_label(recording):
+    """Provider name, shown as its own column in list output."""
+    return "Wispr" if recording.get("source") == "wispr" else "Plaud"
 
 
 def fetch_folders(token, config):
@@ -375,7 +404,68 @@ def load_prompt_template(language):
     return path.read_text(encoding="utf-8")
 
 
-def claude_summarize(transcript_text, recording_meta, projects, language="en"):
+SUMMARY_SENTINEL = "===SUMMARY==="
+TRANSCRIPT_SENTINEL = "===TRANSCRIPT==="
+
+
+def _strip_fences(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```\w*\n?", "", s)
+        s = re.sub(r"\n?```$", "", s)
+    return s.strip()
+
+
+def _parse_claude_json(text):
+    """Parse a JSON object tolerantly.
+
+    Two failure modes to survive: (1) literal newlines/tabs inside string values,
+    which strict JSON rejects — so we retry with strict=False; (2) stray prose
+    around the object — so we also try a slice from the first '{' to the last
+    '}'."""
+    candidates = [text]
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        for strict in (True, False):
+            try:
+                return json.loads(candidate, strict=strict)
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return None
+
+
+def _parse_summary_response(text):
+    """Parse the model's reply into a classification dict.
+
+    Preferred format is a small JSON metadata object followed by sentinel-
+    delimited free-text sections:
+
+        {..name/type/tags/project/language..}
+        ===SUMMARY===
+        <markdown summary>
+        ===TRANSCRIPT===
+        <cleaned transcript>
+
+    Keeping the free text OUT of the JSON is what makes this robust: summaries
+    routinely contain double quotes (e.g. a repo name) and newlines, which would
+    otherwise break a single all-in-one JSON object. Falls back to the legacy
+    all-in-one JSON object when no sentinel is present."""
+    if SUMMARY_SENTINEL in text:
+        head, _, rest = text.partition(SUMMARY_SENTINEL)
+        summary_part, sep, transcript_part = rest.partition(TRANSCRIPT_SENTINEL)
+        meta = _parse_claude_json(_strip_fences(head))
+        if meta is None:
+            return None
+        meta["summary"] = summary_part.strip()
+        if sep:  # the transcript section is optional (omitted for clean sources)
+            meta["clean_transcript"] = transcript_part.strip()
+        return meta
+    return _parse_claude_json(_strip_fences(text))
+
+
+def claude_summarize(transcript_text, recording_meta, projects, language="en", want_clean=True):
     project_list = "\n".join(f"- {name}: {path}" for name, path in projects.items()) or "(none configured)"
     duration_min = recording_meta.get("duration", 0) // 60000
 
@@ -388,6 +478,18 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en"):
         .replace("{{PROJECT_LIST}}", project_list)
         .replace("{{TRANSCRIPT}}", transcript_text)
     )
+
+    # When the transcript is already clean (e.g. Wispr Flow's refined output),
+    # don't make the model echo the whole thing back inside the JSON — that bloats
+    # the response and, on long meetings, truncates it into invalid JSON. We keep
+    # the original transcript and only ask for classification + summary.
+    if not want_clean:
+        prompt += (
+            '\n\n## Override\n'
+            'The transcript above is already cleaned and diarized — do NOT echo or '
+            're-clean it. Omit the ===TRANSCRIPT=== section entirely. Still return '
+            'the JSON metadata and the ===SUMMARY=== section as specified.'
+        )
 
     timeout = max(300, duration_min * 30)
     try:
@@ -413,16 +515,16 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en"):
         return None
 
     text = result.stdout.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```\w*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"Error: Could not parse Claude response as JSON", file=sys.stderr)
-        print(f"Response: {text[:500]}", file=sys.stderr)
-        return None
+    WORKING_DIR.mkdir(parents=True, exist_ok=True)
+    (WORKING_DIR / "last_claude_response.txt").write_text(text, encoding="utf-8")
+    parsed = _parse_summary_response(text)
+    if parsed is None:
+        print("Error: Could not parse Claude response", file=sys.stderr)
+        # Show the tail too: truncated output (a failure mode on long
+        # transcripts) is only visible at the end, not the head.
+        print(f"Response ({len(text)} chars) head: {text[:300]}", file=sys.stderr)
+        print(f"…tail: {text[-300:]}", file=sys.stderr)
+    return parsed
 
 
 # --- Helpers ---
@@ -475,6 +577,7 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
 
     date = recording_meta.get("date", "unknown")
     name = classification.get("name", recording_meta.get("filename", "untitled"))
+    source = recording_meta.get("source", "plaud")
 
     front_matter = {
         "title": name,
@@ -484,8 +587,10 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
         "project": classification.get("project", "default"),
         "language": classification.get("language", "cs"),
         "duration": format_duration(recording_meta.get("duration", 0)),
-        "plaud_id": recording_meta.get("file_id"),
+        "source": source,
     }
+    # Keep the source's native id under a source-specific key.
+    front_matter["wispr_id" if source == "wispr" else "plaud_id"] = recording_meta.get("file_id")
 
     fm = yaml_front_matter(front_matter)
 
@@ -493,7 +598,9 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     summary_path.write_text(f"{fm}\n\n# {name}\n\n{classification.get('summary', '')}\n", encoding="utf-8")
 
     transcript_path = output_dir / "transcript.md"
-    clean = classification.get("clean_transcript", raw_transcript_text)
+    # Fall back to the raw transcript when the model returns no cleaned version
+    # (missing or deliberately empty, e.g. Wispr's already-clean transcript).
+    clean = classification.get("clean_transcript") or raw_transcript_text
     transcript_path.write_text(f"{fm}\n\n# Transcript: {name}\n\n{clean}\n", encoding="utf-8")
 
     meta_path = output_dir / "metadata.json"
@@ -505,19 +612,59 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     return summary_path, transcript_path
 
 
+def write_wispr_summary(wispr_info, recording_meta, output_dir, config):
+    """Preserve Wispr Flow's own summary next to ours as `wispr-summary.md`, so
+    you can compare the two — or switch to Wispr's later — without re-running
+    anything. Opt out with "keep_wispr_summary": false in the wispr config."""
+    if not wispr_flow.keep_wispr_summary(config):
+        return
+    summary = (wispr_info or {}).get("summary")
+    if not summary or not summary.strip():
+        return
+    title = recording_meta.get("filename", "Meeting")
+    header = (
+        f"# {title} — Wispr Flow summary\n\n"
+        "> Generated by Wispr Flow, not by this pipeline. Kept for comparison.\n\n"
+    )
+    (output_dir / "wispr-summary.md").write_text(
+        header + summary.strip() + "\n", encoding="utf-8"
+    )
+
+
 # --- Main Pipeline ---
+
+def wispr_raw_text_cached(recording, work_dir):
+    """Read (and cache) a Wispr meeting's diarized transcript. Returns the text,
+    or None if it can't be read. Wispr already produced the transcript locally,
+    so this replaces Plaud's download + ElevenLabs steps entirely."""
+    transcript_path = work_dir / "transcript.txt"
+    if transcript_path.exists():
+        return transcript_path.read_text(encoding="utf-8")
+    try:
+        raw_text = wispr_flow.transcript_text(recording)
+    except OSError as e:
+        print(f"\n  Error reading Wispr transcript: {e}", file=sys.stderr)
+        return None
+    if not raw_text:
+        return None
+    transcript_path.write_text(raw_text, encoding="utf-8")
+    return raw_text
+
 
 def process_recording(recording, token, config, folders, projects, state, language):
     file_id = recording["id"]
+    source = recording.get("source", "plaud")
     filename = recording.get("filename", "untitled")
     start_ms = recording.get("start_time", 0)
     dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
     date_str = dt.strftime("%Y-%m-%d")
     duration = recording.get("duration", 0)
-    folder_name = get_folder_name(recording, folders)
+    folder_name = None if source == "wispr" else get_folder_name(recording, folders)
+    wispr_info = recording.get("_wispr", {}) if source == "wispr" else {}
 
     recording_meta = {
-        "file_id": file_id,
+        "file_id": wispr_info.get("uuid", file_id),
+        "source": source,
         "filename": filename,
         "date": date_str,
         "duration": duration,
@@ -525,50 +672,65 @@ def process_recording(recording, token, config, folders, projects, state, langua
         "start_time": start_ms,
     }
 
+    origin = "Wispr Flow" if source == "wispr" else (folder_name or "—")
     print(f"\n{'='*60}")
     print(f"  {filename}")
-    print(f"  {date_str} · {format_duration(duration)} · folder: {folder_name or '—'}")
+    print(f"  {date_str} · {format_duration(duration)} · {origin}")
     print(f"{'='*60}")
 
-    work_dir = WORKING_DIR / file_id
+    work_dir = WORKING_DIR / file_id.replace(":", "_")
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Download audio (skip if already downloaded)
-    cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
-    if cached:
-        audio_path = cached[0]
-        size_mb = audio_path.stat().st_size / 1024 / 1024
-        print(f"  [1/4] Audio cached ({size_mb:.1f} MB)")
+    # Steps 1-2: obtain the diarized transcript. Plaud downloads audio and
+    # transcribes it via ElevenLabs; Wispr already produced a local transcript,
+    # so we just read it (no audio download, no re-transcription cost).
+    nsteps = 3 if source == "wispr" else 4
+    if source == "wispr":
+        print(f"  [1/{nsteps}] Reading Wispr Flow transcript...", end=" ", flush=True)
+        raw_text = wispr_raw_text_cached(recording, work_dir)
+        if not raw_text:
+            print("FAILED (no transcript)")
+            return None
+        turns = raw_text.count("\n\n") + 1
+        print(f"{turns} turns")
     else:
-        print(f"  [1/4] Downloading audio...", end=" ", flush=True)
-        audio_path = download_audio(file_id, token, config)
-        size_mb = audio_path.stat().st_size / 1024 / 1024
-        print(f"{size_mb:.1f} MB")
+        # 1. Download audio (skip if already downloaded)
+        cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
+        if cached:
+            audio_path = cached[0]
+            size_mb = audio_path.stat().st_size / 1024 / 1024
+            print(f"  [1/{nsteps}] Audio cached ({size_mb:.1f} MB)")
+        else:
+            print(f"  [1/{nsteps}] Downloading audio...", end=" ", flush=True)
+            audio_path = download_audio(file_id, token, config)
+            size_mb = audio_path.stat().st_size / 1024 / 1024
+            print(f"{size_mb:.1f} MB")
 
-    # 2. Transcribe (skip if already done)
-    transcript_path = work_dir / "transcript.txt"
-    if transcript_path.exists():
-        print(f"  [2/4] Transcript cached")
-        raw_text = transcript_path.read_text(encoding="utf-8")
-    else:
-        print(f"  [2/4] Transcribing via ElevenLabs...", end=" ", flush=True)
-        transcription = transcribe_audio(audio_path, language, config)
-        bookmarks = fetch_bookmarks(recording, token, config)
-        raw_text = format_diarized_transcript(transcription, bookmarks)
+        # 2. Transcribe (skip if already done)
+        transcript_path = work_dir / "transcript.txt"
+        if transcript_path.exists():
+            print(f"  [2/{nsteps}] Transcript cached")
+            raw_text = transcript_path.read_text(encoding="utf-8")
+        else:
+            print(f"  [2/{nsteps}] Transcribing via ElevenLabs...", end=" ", flush=True)
+            transcription = transcribe_audio(audio_path, language, config)
+            bookmarks = fetch_bookmarks(recording, token, config)
+            raw_text = format_diarized_transcript(transcription, bookmarks)
 
-        word_count = len([w for w in transcription.get("words", []) if w["type"] == "word"])
-        speakers = len(set(w.get("speaker_id") for w in transcription.get("words", []) if w["type"] == "word"))
-        mark_note = f", {len(bookmarks)} bookmark(s)" if bookmarks else ""
-        print(f"{word_count} words, {speakers} speakers{mark_note}")
+            word_count = len([w for w in transcription.get("words", []) if w["type"] == "word"])
+            speakers = len(set(w.get("speaker_id") for w in transcription.get("words", []) if w["type"] == "word"))
+            mark_note = f", {len(bookmarks)} bookmark(s)" if bookmarks else ""
+            print(f"{word_count} words, {speakers} speakers{mark_note}")
 
-        (work_dir / "elevenlabs_raw.json").write_text(
-            json.dumps(transcription, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        transcript_path.write_text(raw_text, encoding="utf-8")
+            (work_dir / "elevenlabs_raw.json").write_text(
+                json.dumps(transcription, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            transcript_path.write_text(raw_text, encoding="utf-8")
 
     # 3. Classify & summarize via Claude
-    print(f"  [3/4] Classifying & summarizing via Claude...", end=" ", flush=True)
-    classification = claude_summarize(raw_text, recording_meta, projects, language)
+    print(f"  [{nsteps - 1}/{nsteps}] Classifying & summarizing via Claude...", end=" ", flush=True)
+    classification = claude_summarize(raw_text, recording_meta, projects, language,
+                                      want_clean=(source != "wispr"))
     if not classification:
         print("FAILED")
         state.setdefault("transcribed", {})[file_id] = {
@@ -594,7 +756,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
     )
 
     # 4. Write outputs to target directory
-    print(f"  [4/4] Writing outputs...", end=" ", flush=True)
+    print(f"  [{nsteps}/{nsteps}] Writing outputs...", end=" ", flush=True)
     slug = slugify(rec_name)
     time_str = dt.strftime("%H-%M")
     dir_name = f"{date_str}-{time_str}-{slug}"
@@ -606,6 +768,8 @@ def process_recording(recording, token, config, folders, projects, state, langua
 
     output_dir = target_base / dir_name
     write_outputs(classification, recording_meta, raw_text, output_dir)
+    if source == "wispr":
+        write_wispr_summary(wispr_info, recording_meta, output_dir, config)
     print(f"→ {output_dir}")
 
     # Update state
@@ -642,7 +806,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     print(f"  Total: {format_duration(total_duration)}")
     print(f"{'='*60}")
 
-    merged_work_dir = WORKING_DIR / f"merged_{'_'.join(fid[:8] for fid in file_ids)}"
+    merged_work_dir = WORKING_DIR / f"merged_{'_'.join(fid.replace(':', '_')[:12] for fid in file_ids)}"
     merged_work_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_parts = []
@@ -651,42 +815,56 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
 
     for i, rec in enumerate(recordings):
         file_id = rec["id"]
+        rec_source = rec.get("source", "plaud")
         part_label = f"part {i+1}/{len(recordings)}"
-
-        # Download audio
-        step += 1
-        cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
-        if cached:
-            audio_path = cached[0]
-            size_mb = audio_path.stat().st_size / 1024 / 1024
-            print(f"  [{step}/{step_total}] Audio cached {part_label} ({size_mb:.1f} MB)")
-        else:
-            print(f"  [{step}/{step_total}] Downloading audio {part_label}...", end=" ", flush=True)
-            audio_path = download_audio(file_id, token, config)
-            size_mb = audio_path.stat().st_size / 1024 / 1024
-            print(f"{size_mb:.1f} MB")
-
-        # Transcribe
-        step += 1
-        work_dir = WORKING_DIR / file_id
+        work_dir = WORKING_DIR / file_id.replace(":", "_")
         work_dir.mkdir(parents=True, exist_ok=True)
-        transcript_path = work_dir / "transcript.txt"
-        if transcript_path.exists():
-            print(f"  [{step}/{step_total}] Transcript cached {part_label}")
-            raw_text = transcript_path.read_text(encoding="utf-8")
+
+        if rec_source == "wispr":
+            # Wispr already has the transcript locally — read it in place of the
+            # download + transcribe steps (bump step twice to keep the counter
+            # aligned with the 2-per-part budget).
+            step += 1
+            print(f"  [{step}/{step_total}] Reading Wispr transcript {part_label}...", end=" ", flush=True)
+            raw_text = wispr_raw_text_cached(rec, work_dir)
+            if not raw_text:
+                print("FAILED (no transcript)")
+                return None
+            print(f"{raw_text.count(chr(10) + chr(10)) + 1} turns")
+            step += 1
         else:
-            print(f"  [{step}/{step_total}] Transcribing {part_label}...", end=" ", flush=True)
-            transcription = transcribe_audio(audio_path, language, config)
-            bookmarks = fetch_bookmarks(rec, token, config)
-            raw_text = format_diarized_transcript(transcription, bookmarks)
-            word_count = len([w for w in transcription.get("words", []) if w["type"] == "word"])
-            speakers = len(set(w.get("speaker_id") for w in transcription.get("words", []) if w["type"] == "word"))
-            mark_note = f", {len(bookmarks)} bookmark(s)" if bookmarks else ""
-            print(f"{word_count} words, {speakers} speakers{mark_note}")
-            (work_dir / "elevenlabs_raw.json").write_text(
-                json.dumps(transcription, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            transcript_path.write_text(raw_text, encoding="utf-8")
+            # Download audio
+            step += 1
+            cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
+            if cached:
+                audio_path = cached[0]
+                size_mb = audio_path.stat().st_size / 1024 / 1024
+                print(f"  [{step}/{step_total}] Audio cached {part_label} ({size_mb:.1f} MB)")
+            else:
+                print(f"  [{step}/{step_total}] Downloading audio {part_label}...", end=" ", flush=True)
+                audio_path = download_audio(file_id, token, config)
+                size_mb = audio_path.stat().st_size / 1024 / 1024
+                print(f"{size_mb:.1f} MB")
+
+            # Transcribe
+            step += 1
+            transcript_path = work_dir / "transcript.txt"
+            if transcript_path.exists():
+                print(f"  [{step}/{step_total}] Transcript cached {part_label}")
+                raw_text = transcript_path.read_text(encoding="utf-8")
+            else:
+                print(f"  [{step}/{step_total}] Transcribing {part_label}...", end=" ", flush=True)
+                transcription = transcribe_audio(audio_path, language, config)
+                bookmarks = fetch_bookmarks(rec, token, config)
+                raw_text = format_diarized_transcript(transcription, bookmarks)
+                word_count = len([w for w in transcription.get("words", []) if w["type"] == "word"])
+                speakers = len(set(w.get("speaker_id") for w in transcription.get("words", []) if w["type"] == "word"))
+                mark_note = f", {len(bookmarks)} bookmark(s)" if bookmarks else ""
+                print(f"{word_count} words, {speakers} speakers{mark_note}")
+                (work_dir / "elevenlabs_raw.json").write_text(
+                    json.dumps(transcription, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                transcript_path.write_text(raw_text, encoding="utf-8")
 
         dt = datetime.fromtimestamp(rec.get("start_time", 0) / 1000, tz=timezone.utc)
         header = f"--- Part {i+1} ({dt.strftime('%H:%M')}, {format_duration(rec.get('duration', 0))}) ---"
@@ -696,8 +874,10 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     (merged_work_dir / "merged_transcript.txt").write_text(combined_transcript, encoding="utf-8")
 
     folder_name = get_folder_name(first, folders)
+    merged_source = "wispr" if all(r.get("source") == "wispr" for r in recordings) else "plaud"
     recording_meta = {
-        "file_id": file_ids[0],
+        "file_id": file_ids[0].split(":", 1)[-1],
+        "source": merged_source,
         "merged_ids": file_ids,
         "filename": first.get("filename", "untitled"),
         "date": date_str,
@@ -711,7 +891,8 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     # Classify & summarize
     step += 1
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
-    classification = claude_summarize(combined_transcript, recording_meta, projects, language)
+    classification = claude_summarize(combined_transcript, recording_meta, projects, language,
+                                      want_clean=(merged_source != "wispr"))
     if not classification:
         print("FAILED")
         for fid in file_ids:
@@ -838,7 +1019,7 @@ def show_pending(recordings, folders, state):
         folder = get_folder_name(r, folders)
         folder_str = f" ({folder})" if folder else ""
         tag = " [incomplete]" if r in incomplete else ""
-        print(f"  [{i+1}] {date_str}  {dur:>6}  {fname}{folder_str}{tag}")
+        print(f"  [{i+1}] {date_str}  {dur:>6}  {source_label(r):<5}  {fname}{folder_str}{tag}")
 
     return pending, incomplete
 
@@ -871,7 +1052,7 @@ def prompt_selection(pending):
 
 
 def cmd_list(args, token, config, state, folders):
-    recordings = list_recordings(token, config, args.days)
+    recordings = list_all_recordings(token, config, args.days)
     transcribed = state.get("transcribed", {})
 
     auto_skip_short(recordings, state)
@@ -908,7 +1089,7 @@ def cmd_list(args, token, config, state, folders):
         else:
             status = " "
 
-        print(f"  {status} {date_str}  {dur:>6}  {fname}{folder_str}")
+        print(f"  {status} {date_str}  {dur:>6}  {source_label(r):<5}  {fname}{folder_str}")
 
         # Overlay where the outputs landed, so `list` doubles as a "where is it?"
         if entry_status == "done" and entry.get("output_dir"):
@@ -1171,7 +1352,7 @@ def cmd_move(args, config, state):
 
 def cmd_process(args, token, config, state, folders):
     projects = get_projects(config)
-    recordings = list_recordings(token, config, args.days)
+    recordings = list_all_recordings(token, config, args.days)
 
     auto_skip_short(recordings, state)
 
@@ -1214,6 +1395,11 @@ EXAMPLE_CONFIG = {
     "language": "en",
     "auto_commit": False,
     "process_bookmarks": False,
+    "wispr": {
+        "enabled": False,
+        "data_dir": "~/Library/Application Support/Wispr Flow",
+        "keep_wispr_summary": True,
+    },
 }
 
 

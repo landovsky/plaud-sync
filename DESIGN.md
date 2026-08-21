@@ -500,6 +500,94 @@ Every 15 minutes (cron):
 
 The folder-to-repo mapping config is the routing table. Recordings without a folder go to a default repo or are skipped.
 
+## Wispr Flow — Local Meeting Store
+
+A second capture source: [Wispr Flow](https://wisprflow.ai) records meetings and
+transcribes them **locally**, so — unlike Plaud — there is no cloud API to call
+and no audio to download. Everything needed is already on disk, which is why the
+Wispr path in `plaud_transcribe.py` skips the download + ElevenLabs steps and
+goes straight to classify/summarize/route.
+
+### Location (macOS)
+
+```
+~/Library/Application Support/Wispr Flow/
+    flow.sqlite                       # main store (Meetings table, etc.)
+    meetings/<uuid>/
+        refined.ndjson                # cleaned, diarized transcript (the one we read)
+        live.ndjson                   # real-time transcript (epoch-stamped; unused)
+        speakers.observations.ndjson  # diarization observations (unused)
+        upload.ogg                    # source audio (unused — transcript already exists)
+```
+
+Read **read-only** (`sqlite3` URI `?mode=ro`), which is safe alongside the running
+app's WAL. We never write to Wispr's store.
+
+### `Meetings` table (relevant columns)
+
+| Column | Meaning |
+|--------|---------|
+| `id` | Meeting UUID — also the `meetings/<uuid>/` dir name. Namespaced as `wispr:<uuid>` in our state to avoid colliding with Plaud's hex ids |
+| `title` | Meeting title — used as the "filename" / classification hint |
+| `summary` | Wispr's own Markdown summary (may be `NULL` until Wispr finishes). Preserved as `wispr-summary.md` |
+| `speakerMap` | JSON mapping numeric speaker id → person → display name (see below) |
+| `participantNames` | Free-text participant list |
+| `createdAt` | Start time, e.g. `2026-08-18 12:10:03.267 +00:00` |
+| `endedAt` | End time (unix ms). `endedAt − createdAt` gives duration |
+| `finalized`, `isDeleted` | We list only `finalized = 1 AND isDeleted = 0` |
+
+### `refined.ndjson` — the transcript
+
+One JSON object per line:
+
+```json
+{
+  "id": "b7777c04-...",
+  "timestamp": "114:58",
+  "text": " Můžeš si udělat vlastního…",
+  "speaker": { "id": 2, "source": "refined", "name": null }
+}
+```
+
+- `timestamp` is `MIN:SS` with **minutes uncapped** (`114:58` = 114 min 58 s), so a naïve `MM:SS` parse is wrong for long meetings.
+- `speaker.name` is usually `null`; the real name comes from `speakerMap`.
+
+### `speakerMap` — resolving speaker names
+
+```json
+{
+  "people": {
+    "8233ad4a-…": { "name": "Tomáš Landovský", "origin": "self" },
+    "466c1e04-…": { "name": "Petr Radouš",     "origin": "platform" }
+  },
+  "assignments": {
+    "1": { "consensus": "8233ad4a-…", "dom": "8233ad4a-…" },
+    "2": { "consensus": "466c1e04-…", "dom": "466c1e04-…" }
+  }
+}
+```
+
+Map a transcript line's `speaker.id` → `assignments[id].consensus` (fallback `dom`
+/ `user` / `llm`) → `people[personId].name`. Unmapped ids fall back to `Speaker N`.
+When `speakerMap` is `NULL` (Wispr hasn't diarized yet), every line is `Speaker N`.
+
+### Normalization
+
+Each meeting is normalized into the same recording shape Plaud uses (`id`,
+`source: "wispr"`, `filename`, `start_time`, `duration`, `filetag_id_list: []`,
+plus a `_wispr` payload with the transcript path, resolved speaker names, and the
+Wispr summary), so the rest of the pipeline treats both sources uniformly.
+
+### Open items / follow-ups
+
+- **Plaud token still required.** Wispr meetings are merged *into* the Plaud
+  listing; a Wispr-only mode (no Plaud token) would need `main()` to make the
+  Plaud fetch optional. Deferred.
+- **Speaker mapping.** Wispr already resolves real names, unlike Plaud's
+  `Speaker N` — see the Plaud "Speaker name mapping" open question below.
+- **Non-macOS paths.** Only the macOS store location is wired up; `data_dir` in
+  config overrides it if needed.
+
 ## Technical Decisions
 
 ### Language
