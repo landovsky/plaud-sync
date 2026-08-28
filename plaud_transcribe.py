@@ -1284,6 +1284,18 @@ def do_move(file_id, entry, project_name, config, state):
     new_dir = target_base / old_dir.name
 
     if old_dir.resolve() == new_dir.resolve():
+        # Files are already in the right place, but the state label can lag behind
+        # (e.g. the directory was written before the project existed in config, so
+        # the entry is still tagged "default"). Re-tag it instead of bailing out.
+        if entry.get("project") != project_key:
+            was = entry.get("project")
+            entry["project"] = project_key
+            entry["output_dir"] = str(new_dir)
+            save_state(state)
+            print(f"\nRe-tagged {file_id} (files already in place)")
+            print(f"  project: {was!r} → {project_key!r}")
+            print(f"  {new_dir}")
+            return True
         print(f"Already in '{project_key}': {old_dir}")
         return False
 
