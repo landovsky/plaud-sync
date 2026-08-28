@@ -465,8 +465,58 @@ def _parse_summary_response(text):
     return _parse_claude_json(_strip_fences(text))
 
 
-def claude_summarize(transcript_text, recording_meta, projects, language="en", want_clean=True):
-    project_list = "\n".join(f"- {name}: {path}" for name, path in projects.items()) or "(none configured)"
+def project_hints(config):
+    """Optional per-project keywords from config, e.g.
+
+        "project_hints": {"Hriste Hrou": "playground BOM, manufacturing, pricing"}
+
+    Purely additive — projects without hints still work off their name, path and
+    recent-recording history."""
+    hints = config.get("project_hints") or {}
+    return {k: v for k, v in hints.items() if isinstance(v, str) and v.strip()}
+
+
+def recent_examples(state, limit=4):
+    """The names of recently classified recordings, grouped by project.
+
+    Classification kept falling back to "default" for meetings that never say
+    the project name out loud — a BOM design sync is only recognisable as
+    "Hriste Hrou" if you know the three previous BOM syncs went there. That
+    history is already in state.json; this hands it to the model as evidence
+    instead of expecting it to guess from a bare project key."""
+    by_project = {}
+    entries = [e for e in state.get("transcribed", {}).values()
+               if e.get("status") == "done" and e.get("name")
+               and e.get("project") and e.get("project") != "default"]
+    # Newest first, so a project that has drifted in topic is represented by
+    # what it is now rather than what it was a year ago.
+    entries.sort(key=lambda e: e.get("transcribed_at") or e.get("date") or "", reverse=True)
+    for e in entries:
+        names = by_project.setdefault(e["project"], [])
+        if len(names) < limit and e["name"] not in names:
+            names.append(e["name"])
+    return by_project
+
+
+def format_project_list(projects, config, state):
+    """One block per project: key, output path, optional hints, recent recordings."""
+    if not projects:
+        return "(none configured)"
+    hints = project_hints(config)
+    examples = recent_examples(state or {})
+    lines = []
+    for name, path in projects.items():
+        lines.append(f"- {name}: {path}")
+        if hints.get(name):
+            lines.append(f"    topics: {hints[name]}")
+        if examples.get(name):
+            lines.append(f"    recent recordings: {'; '.join(examples[name])}")
+    return "\n".join(lines)
+
+
+def claude_summarize(transcript_text, recording_meta, projects, language="en", want_clean=True,
+                     extra_instructions=None, config=None, state=None):
+    project_list = format_project_list(projects, config or {}, state or {})
     duration_min = recording_meta.get("duration", 0) // 60000
 
     prompt = (
@@ -489,6 +539,19 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
             'The transcript above is already cleaned and diarized — do NOT echo or '
             're-clean it. Omit the ===TRANSCRIPT=== section entirely. Still return '
             'the JSON metadata and the ===SUMMARY=== section as specified.'
+        )
+
+    # Per-run steering typed by the user at selection time. Appended last so it
+    # is the most recent instruction the model sees, but explicitly framed as an
+    # addition — it must not replace the output contract above, or the response
+    # stops parsing.
+    if extra_instructions:
+        prompt += (
+            '\n\n## Additional instructions from the user\n'
+            'These refine the summary — emphasis, level of detail, what to pull out. '
+            'They do NOT replace anything above: keep the same output format, '
+            'sentinels, JSON metadata and section structure.\n\n'
+            f'{extra_instructions.strip()}\n'
         )
 
     timeout = max(300, duration_min * 30)
@@ -563,7 +626,13 @@ def yaml_front_matter(meta):
         if isinstance(v, list):
             lines.append(f"{k}: [{', '.join(str(x) for x in v)}]")
         elif isinstance(v, str) and (":" in v or '"' in v or "\n" in v):
-            lines.append(f'{k}: "{v}"')
+            # Free-text values (custom instructions above all) can contain the
+            # very characters that make YAML ambiguous, so escape rather than
+            # just wrap: an unescaped quote would silently break the block for
+            # every downstream reader.
+            escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+            escaped = escaped.replace("\n", " ").replace("\r", " ")
+            lines.append(f'{k}: "{escaped}"')
         else:
             lines.append(f"{k}: {v}")
     lines.append("---")
@@ -572,7 +641,8 @@ def yaml_front_matter(meta):
 
 # --- File Output ---
 
-def write_outputs(classification, recording_meta, raw_transcript_text, output_dir):
+def write_outputs(classification, recording_meta, raw_transcript_text, output_dir,
+                  extra_instructions=None):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     date = recording_meta.get("date", "unknown")
@@ -591,6 +661,10 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     }
     # Keep the source's native id under a source-specific key.
     front_matter["wispr_id" if source == "wispr" else "plaud_id"] = recording_meta.get("file_id")
+    # Surface the one-off steering in the document itself: reading a summary
+    # months later, "why is this so BOM-heavy?" should be answerable in place.
+    if extra_instructions:
+        front_matter["instructions"] = extra_instructions
 
     fm = yaml_front_matter(front_matter)
 
@@ -651,7 +725,8 @@ def wispr_raw_text_cached(recording, work_dir):
     return raw_text
 
 
-def process_recording(recording, token, config, folders, projects, state, language):
+def process_recording(recording, token, config, folders, projects, state, language,
+                      extra_instructions=None):
     file_id = recording["id"]
     source = recording.get("source", "plaud")
     filename = recording.get("filename", "untitled")
@@ -730,7 +805,9 @@ def process_recording(recording, token, config, folders, projects, state, langua
     # 3. Classify & summarize via Claude
     print(f"  [{nsteps - 1}/{nsteps}] Classifying & summarizing via Claude...", end=" ", flush=True)
     classification = claude_summarize(raw_text, recording_meta, projects, language,
-                                      want_clean=(source != "wispr"))
+                                      want_clean=(source != "wispr"),
+                                      extra_instructions=extra_instructions,
+                                      config=config, state=state)
     if not classification:
         print("FAILED")
         state.setdefault("transcribed", {})[file_id] = {
@@ -767,7 +844,8 @@ def process_recording(recording, token, config, folders, projects, state, langua
         target_base = default_output_dir(config)
 
     output_dir = target_base / dir_name
-    write_outputs(classification, recording_meta, raw_text, output_dir)
+    write_outputs(classification, recording_meta, raw_text, output_dir,
+                  extra_instructions=extra_instructions)
     if source == "wispr":
         write_wispr_summary(wispr_info, recording_meta, output_dir, config)
     print(f"→ {output_dir}")
@@ -781,13 +859,17 @@ def process_recording(recording, token, config, folders, projects, state, langua
         "output_dir": str(output_dir),
         "status": "done",
         "transcribed_at": datetime.now(timezone.utc).isoformat(),
+        # Keep the one-off steering with the entry: a re-read of a summary later
+        # is confusing without knowing what the user asked it to emphasize.
+        **({"instructions": extra_instructions} if extra_instructions else {}),
     }
     save_state(state)
 
     return {"file_id": file_id, "name": rec_name, "project": project_key, "output_dir": str(output_dir)}
 
 
-def process_merged_recordings(recordings, token, config, folders, projects, state, language):
+def process_merged_recordings(recordings, token, config, folders, projects, state, language,
+                              extra_instructions=None):
     """Process multiple recordings as a single merged session."""
     recordings = sorted(recordings, key=lambda r: r.get("start_time", 0))
 
@@ -892,7 +974,9 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     step += 1
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
     classification = claude_summarize(combined_transcript, recording_meta, projects, language,
-                                      want_clean=(merged_source != "wispr"))
+                                      want_clean=(merged_source != "wispr"),
+                                      extra_instructions=extra_instructions,
+                                      config=config, state=state)
     if not classification:
         print("FAILED")
         for fid in file_ids:
@@ -930,7 +1014,8 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
         target_base = default_output_dir(config)
 
     output_dir = target_base / dir_name
-    write_outputs(classification, recording_meta, combined_transcript, output_dir)
+    write_outputs(classification, recording_meta, combined_transcript, output_dir,
+                  extra_instructions=extra_instructions)
     print(f"→ {output_dir}")
 
     # Mark all parts as done
@@ -945,6 +1030,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
             "status": "done",
             "merged_with": [f for f in file_ids if f != fid],
             "transcribed_at": now,
+            **({"instructions": extra_instructions} if extra_instructions else {}),
         }
     save_state(state)
 
@@ -1051,6 +1137,20 @@ def prompt_selection(pending):
     return [pending[i] for i in indices], False, False
 
 
+def prompt_custom_instructions():
+    """Ask for one-off summarization steering after a selection is made.
+
+    These are additive hints ("focus on the BOM versioning discussion"), not a
+    replacement prompt — blank is the normal answer, so keep it a single line
+    the user can just Enter past. EOF (piped stdin) means "none"."""
+    print()
+    print("  Custom summarization instructions (optional) — Enter = none.")
+    try:
+        return input("instructions> ").strip()
+    except EOFError:
+        return ""
+
+
 def cmd_list(args, token, config, state, folders):
     recordings = list_all_recordings(token, config, args.days)
     transcribed = state.get("transcribed", {})
@@ -1145,17 +1245,22 @@ def git_commit_working(results, config):
             pass
 
 
-def execute_selection(selected, merge, token, config, folders, projects, state, language):
+def execute_selection(selected, merge, token, config, folders, projects, state, language,
+                      extra_instructions=None):
     results = []
+    if extra_instructions:
+        print(f"\n  Custom instructions: {extra_instructions}")
     if merge:
         print(f"\nMerging & processing {len(selected)} recording(s)...")
-        result = process_merged_recordings(selected, token, config, folders, projects, state, language)
+        result = process_merged_recordings(selected, token, config, folders, projects, state, language,
+                                           extra_instructions=extra_instructions)
         if result:
             results.append(result)
     else:
         print(f"\nProcessing {len(selected)} recording(s)...")
         for rec in selected:
-            result = process_recording(rec, token, config, folders, projects, state, language)
+            result = process_recording(rec, token, config, folders, projects, state, language,
+                                       extra_instructions=extra_instructions)
             if result:
                 results.append(result)
 
@@ -1394,13 +1499,22 @@ def cmd_process(args, token, config, state, folders):
         if not selected:
             continue
 
-        execute_selection(selected, merge, token, config, folders, projects, state, args.language)
+        instructions = prompt_custom_instructions()
+
+        execute_selection(selected, merge, token, config, folders, projects, state, args.language,
+                          extra_instructions=instructions)
 
 
 EXAMPLE_CONFIG = {
     "projects": {
         "project-a": "~/git/project-a/docs/transcripts",
         "project-b": "~/git/project-b/docs/transcripts",
+    },
+    # Optional per-project topic keywords. Classification also learns from the
+    # names of recordings already filed under each project, so this is only
+    # needed for projects with little or no history.
+    "project_hints": {
+        "project-a": "keywords, systems or people that identify this project",
     },
     "default_output": str(DEFAULT_OUTPUT_DIR),
     "timezone": "Europe/Prague",

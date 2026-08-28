@@ -110,6 +110,20 @@ Then edit `~/.plaud-sync/config.json` — `projects` maps a classification label
 
 `default_output` (where unmatched recordings go) is optional — it defaults to this tool's own `docs/transcripts/`.
 
+**How a recording finds its project.** Meetings rarely say the project name out
+loud, so classification also gets the names of recordings already filed under
+each project — a BOM design sync matches `playgrove` because the last three BOM
+syncs went there. That history builds itself as you process recordings; for a
+project with little of it, `project_hints` gives the classifier something to
+match on:
+
+```json
+"project_hints": {
+  "playgrove": "BOM, kusovníky, manufacturing, pricing engine",
+  "medovia":   "patient portal, pharmacy reservations"
+}
+```
+
 ### 5. Run it
 
 ```bash
@@ -161,6 +175,20 @@ q        quit
 ```
 
 **Merging** is handy when one meeting spans several recordings — they're concatenated and summarized as a single session.
+
+**Custom summarization instructions.** After a selection, `process` asks for one-off
+instructions for that batch:
+
+```
+instructions> put most focus on the BOM versioning, pick interesting remarks from the rest
+```
+
+They're *appended* to the prompt template, not a replacement — the output format,
+classification and section structure stay the same; you're only steering emphasis
+and level of detail. Press Enter to skip. They apply to every recording in that
+selection (or to the merged session) and are recorded in `state.json` alongside
+the entry, so you can later see what a summary was steered toward. `--all` runs
+without prompting and uses no custom instructions.
 
 **Moving** a recording after the fact:
 
@@ -313,6 +341,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 |-----|---------|-------------|
 | `projects` | transcribe | `{ "label": "~/path" }` — classification targets. Claude picks the best-matching label; unknown → `default` |
 | `folder_mapping` | sync | `{ "Plaud Folder": "~/path" }` — routes by exact Plaud folder name (use `null` to skip). Also used as a fallback source of `projects` by transcribe |
+| `project_hints` | transcribe | `{ "label": "topics, systems, people" }` — extra evidence for classification. Optional; recent recordings per project are used regardless |
 | `default_output` | both | Where unmatched recordings go (defaults to this tool's `docs/transcripts/`) |
 | `language` | transcribe | Default language / prompt template (`cs`, `en`) when `--language` isn't passed |
 | `auto_commit` | transcribe | `true` to git-commit each output into its destination repo (default off) |

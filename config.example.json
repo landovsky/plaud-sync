@@ -3,6 +3,9 @@
     "project-a": "~/git/project-a/docs/transcripts",
     "project-b": "~/git/project-b/docs/transcripts"
   },
+  "project_hints": {
+    "project-a": "keywords, systems or people that identify this project"
+  },
   "default_output": "~/git/plaud-sync/docs/transcripts",
   "timezone": "Europe/Prague",
   "language": "en",
