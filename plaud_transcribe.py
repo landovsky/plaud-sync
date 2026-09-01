@@ -1140,15 +1140,28 @@ def prompt_selection(pending):
 def prompt_custom_instructions():
     """Ask for one-off summarization steering after a selection is made.
 
-    These are additive hints ("focus on the BOM versioning discussion"), not a
-    replacement prompt — blank is the normal answer, so keep it a single line
-    the user can just Enter past. EOF (piped stdin) means "none"."""
+    Read line by line until an explicit terminator rather than taking a single
+    input(): these are usually pasted paragraphs, and a one-line read both
+    silently truncated the instructions and left the remaining lines in stdin,
+    where the next prompt would have consumed them as selection commands.
+    Blank first line means "none"; EOF (piped stdin) ends the read."""
     print()
     print("  Custom summarization instructions (optional) — Enter = none.")
-    try:
-        return input("instructions> ").strip()
-    except EOFError:
-        return ""
+    print("  Multi-line: paste freely, then finish with a line containing only '.'")
+    lines = []
+    while True:
+        try:
+            # No continuation prompt: it would interleave with pasted lines and
+            # make the paste unreadable as it echoes.
+            line = input("instructions> " if not lines else "")
+        except EOFError:
+            break
+        if line.strip() == ".":
+            break
+        if not lines and not line.strip():
+            return ""
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def cmd_list(args, token, config, state, folders):
@@ -1581,4 +1594,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal way out of a long transcription — report it as one
+        # rather than dumping a traceback over the progress output.
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
