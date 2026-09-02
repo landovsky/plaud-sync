@@ -641,6 +641,20 @@ def yaml_front_matter(meta):
 
 # --- File Output ---
 
+def strip_leading_h1(summary):
+    """Drop a title the model wrote itself.
+
+    The summary is always written under `# {name}`, so a model-authored H1 lands
+    directly beneath it as a second title. That mostly happens when custom
+    instructions ask for a piece of prose rather than notes — the model titles
+    its own essay."""
+    stripped = summary.lstrip()
+    if not stripped.startswith("# "):
+        return summary
+    _, _, rest = stripped.partition("\n")
+    return rest.lstrip("\n")
+
+
 def write_outputs(classification, recording_meta, raw_transcript_text, output_dir,
                   extra_instructions=None):
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -669,7 +683,10 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     fm = yaml_front_matter(front_matter)
 
     summary_path = output_dir / "summary.md"
-    summary_path.write_text(f"{fm}\n\n# {name}\n\n{classification.get('summary', '')}\n", encoding="utf-8")
+    summary_path.write_text(
+        f"{fm}\n\n# {name}\n\n{strip_leading_h1(classification.get('summary', ''))}\n",
+        encoding="utf-8",
+    )
 
     transcript_path = output_dir / "transcript.md"
     # Fall back to the raw transcript when the model returns no cleaned version
