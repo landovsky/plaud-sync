@@ -35,6 +35,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import wispr_flow
 
@@ -592,6 +593,28 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
 
 # --- Helpers ---
 
+def local_tz(config):
+    """The zone recordings are displayed and named in.
+
+    Both sources stamp a recording with an absolute epoch, so rendering it in UTC
+    silently shifts every label: a meeting that started 13:13 in Prague was listed
+    as 11:13 and landed on disk as `...-11-13-...`. Anything before 02:00 local
+    also lands on the previous day. Config key "timezone"; system zone otherwise.
+    """
+    name = (config or {}).get("timezone")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            print(f"  Warning: unknown timezone {name!r} in config, using system zone",
+                  file=sys.stderr)
+    return datetime.now().astimezone().tzinfo
+
+
+def local_dt(ms, config):
+    """Epoch milliseconds -> aware datetime in the configured local zone."""
+    return datetime.fromtimestamp((ms or 0) / 1000, tz=local_tz(config))
+
 def slugify(text):
     tr = str.maketrans(
         "áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ",
@@ -748,7 +771,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
     source = recording.get("source", "plaud")
     filename = recording.get("filename", "untitled")
     start_ms = recording.get("start_time", 0)
-    dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    dt = local_dt(start_ms, config)
     date_str = dt.strftime("%Y-%m-%d")
     duration = recording.get("duration", 0)
     folder_name = None if source == "wispr" else get_folder_name(recording, folders)
@@ -892,7 +915,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
 
     first = recordings[0]
     first_ms = first.get("start_time", 0)
-    dt_first = datetime.fromtimestamp(first_ms / 1000, tz=timezone.utc)
+    dt_first = local_dt(first_ms, config)
     date_str = dt_first.strftime("%Y-%m-%d")
     total_duration = sum(r.get("duration", 0) for r in recordings)
     file_ids = [r["id"] for r in recordings]
@@ -900,7 +923,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     print(f"\n{'='*60}")
     print(f"  MERGED SESSION ({len(recordings)} parts)")
     for r in recordings:
-        dt = datetime.fromtimestamp(r.get("start_time", 0) / 1000, tz=timezone.utc)
+        dt = local_dt(r.get("start_time", 0), config)
         print(f"    {dt.strftime('%H:%M')} · {format_duration(r.get('duration', 0))} · {r.get('filename', 'untitled')}")
     print(f"  Total: {format_duration(total_duration)}")
     print(f"{'='*60}")
@@ -965,7 +988,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
                 )
                 transcript_path.write_text(raw_text, encoding="utf-8")
 
-        dt = datetime.fromtimestamp(rec.get("start_time", 0) / 1000, tz=timezone.utc)
+        dt = local_dt(rec.get("start_time", 0), config)
         header = f"--- Part {i+1} ({dt.strftime('%H:%M')}, {format_duration(rec.get('duration', 0))}) ---"
         transcript_parts.append(f"{header}\n\n{raw_text}")
 
@@ -1098,7 +1121,7 @@ def parse_indices(text, max_len):
     return indices
 
 
-def show_pending(recordings, folders, state):
+def show_pending(recordings, folders, state, config):
     """Show pending recordings list. Returns (pending, incomplete) lists."""
     transcribed = state.get("transcribed", {})
     incomplete = [r for r in recordings
@@ -1115,7 +1138,7 @@ def show_pending(recordings, folders, state):
     else:
         print(f"\n{len(pending)} unprocessed recording(s):\n")
     for i, r in enumerate(pending):
-        dt = datetime.fromtimestamp(r.get("start_time", 0) / 1000, tz=timezone.utc)
+        dt = local_dt(r.get("start_time", 0), config)
         date_str = dt.strftime("%Y-%m-%d %H:%M")
         dur = format_duration(r.get("duration", 0))
         fname = r.get("filename", "untitled")
@@ -1201,7 +1224,7 @@ def cmd_list(args, token, config, state, folders):
             return str(path)
 
     for r in recordings:
-        dt = datetime.fromtimestamp(r.get("start_time", 0) / 1000, tz=timezone.utc)
+        dt = local_dt(r.get("start_time", 0), config)
         date_str = dt.strftime("%Y-%m-%d %H:%M")
         dur = format_duration(r.get("duration", 0))
         fname = r.get("filename", "untitled")
@@ -1513,7 +1536,7 @@ def cmd_process(args, token, config, state, folders):
         return
 
     while True:
-        pending, _ = show_pending(recordings, folders, state)
+        pending, _ = show_pending(recordings, folders, state, config)
         if not pending:
             break
 

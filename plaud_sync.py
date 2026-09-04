@@ -11,6 +11,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 
 API_BASE_DEFAULT = "https://api.plaud.ai"
@@ -257,6 +258,25 @@ def format_summary_md(summary_data):
     return str(summary_data)
 
 
+def local_tz(config):
+    """The zone recordings are displayed and named in — see the same helper in
+    plaud_transcribe.py. Recordings carry an absolute epoch, so rendering them in
+    UTC shifts every label (a 13:13 Prague meeting listed as 11:13)."""
+    name = (config or {}).get("timezone")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            print(f"  Warning: unknown timezone {name!r} in config, using system zone",
+                  file=sys.stderr)
+    return datetime.now().astimezone().tzinfo
+
+
+def local_dt(ms, config):
+    """Epoch milliseconds -> aware datetime in the configured local zone."""
+    return datetime.fromtimestamp((ms or 0) / 1000, tz=local_tz(config))
+
+
 def resolve_output_dir(recording, folder_map, folders, config):
     """Determine output directory for a recording based on folder mapping."""
     folder_name = None
@@ -278,7 +298,7 @@ def resolve_output_dir(recording, folder_map, folders, config):
 
     # Build subdirectory name: YYYY-MM-DD-slug
     start_ms = recording.get("start_time", 0)
-    dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    dt = local_dt(start_ms, config)
     date_prefix = dt.strftime("%Y-%m-%d")
     title = recording.get("filename", "untitled")
     # Strip leading date pattern like "03-24 " from filename
@@ -316,7 +336,7 @@ def sync_recording(recording, token, config, folders, folder_map, state, dry_run
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_ms = recording.get("start_time", 0)
-    dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    dt = local_dt(start_ms, config)
     recording_date = dt.strftime("%Y-%m-%d")
     title = recording.get("filename", "untitled")
 
@@ -427,7 +447,7 @@ def cmd_list(args, token, config):
         file_id = r["id"]
         title = r.get("filename", "untitled")
         start_ms = r.get("start_time", 0)
-        dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+        dt = local_dt(start_ms, config)
         date_str = dt.strftime("%Y-%m-%d %H:%M")
         duration = format_duration(r.get("duration", 0))
         is_trans = r.get("is_trans", False)
