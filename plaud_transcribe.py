@@ -38,6 +38,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import wispr_flow
+import visuals
 
 API_BASE_DEFAULT = "https://api.plaud.ai"
 ELEVENLABS_API = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -679,7 +680,7 @@ def strip_leading_h1(summary):
 
 
 def write_outputs(classification, recording_meta, raw_transcript_text, output_dir,
-                  extra_instructions=None):
+                  extra_instructions=None, visual_records=None, visual_context=None):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     date = recording_meta.get("date", "unknown")
@@ -715,7 +716,17 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     # Fall back to the raw transcript when the model returns no cleaned version
     # (missing or deliberately empty, e.g. Wispr's already-clean transcript).
     clean = classification.get("clean_transcript") or raw_transcript_text
+    # Markers go into whichever transcript is actually written, so they line up
+    # with the timestamps the reader sees.
+    if visual_records:
+        clean = visuals.interleave(clean, visual_records)
     transcript_path.write_text(f"{fm}\n\n# Transcript: {name}\n\n{clean}\n", encoding="utf-8")
+
+    # The captions are kept as their own document: if the model misread a screen,
+    # that must be visible here rather than buried inside the summary.
+    if visual_context:
+        (output_dir / "visual-context.md").write_text(
+            f"{fm}\n\n{visual_context}", encoding="utf-8")
 
     meta_path = output_dir / "metadata.json"
     meta_path.write_text(
@@ -743,6 +754,57 @@ def write_wispr_summary(wispr_info, recording_meta, output_dir, config):
     (output_dir / "wispr-summary.md").write_text(
         header + summary.strip() + "\n", encoding="utf-8"
     )
+
+
+# --- Visual enrichment ---
+
+def prepare_visuals(recordings, config, work_dir, step_label=""):
+    """Collect, stage and caption images captured while the recording ran.
+
+    Runs before summarization because the captions feed it, but the output
+    directory is only known after classification — so images stage into the work
+    directory and are copied across at write time. Returns (records, context).
+    """
+    if not visuals.enabled(config):
+        return [], ""
+    try:
+        records = visuals.collect(recordings, config, work_dir / "phone")
+    except Exception as e:  # never let an image break a transcript
+        print(f"  Warning: visual collection failed: {e}", file=sys.stderr)
+        return [], ""
+    if not records:
+        return [], ""
+    anchored = sum(1 for r in records if r["klass"] == "anchored")
+    print(f"  {step_label}Visuals: {len(records)} image(s) "
+          f"({anchored} anchored, {len(records) - anchored} associated)...", end=" ", flush=True)
+    records = visuals.stage(records, work_dir, config)
+    records = visuals.caption(records, work_dir, config)
+    captioned = sum(1 for r in records if r.get("caption"))
+    print(f"{captioned} captioned")
+    return records, visuals.visual_context(records, config)
+
+
+def copy_visuals(work_dir, output_dir):
+    """Move the staged images next to the document that references them."""
+    src = work_dir / "screenshots"
+    if not src.is_dir():
+        return
+    dst = output_dir / "screenshots"
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in src.iterdir():
+        if p.is_file():
+            try:
+                shutil.copy2(p, dst / p.name)
+            except OSError as e:
+                print(f"  Warning: could not copy {p.name}: {e}", file=sys.stderr)
+
+
+def with_visual_instructions(extra_instructions, visual_context):
+    if not visual_context:
+        return extra_instructions
+    if not extra_instructions:
+        return visuals.SUMMARY_INSTRUCTIONS
+    return f"{extra_instructions}\n\n{visuals.SUMMARY_INSTRUCTIONS}"
 
 
 # --- Main Pipeline ---
@@ -842,11 +904,16 @@ def process_recording(recording, token, config, folders, projects, state, langua
             )
             transcript_path.write_text(raw_text, encoding="utf-8")
 
+    # 2b. Visual enrichment (opt-in): images captured while the recording ran.
+    visual_records, visual_ctx = prepare_visuals([recording], config, work_dir)
+
     # 3. Classify & summarize via Claude
     print(f"  [{nsteps - 1}/{nsteps}] Classifying & summarizing via Claude...", end=" ", flush=True)
-    classification = claude_summarize(raw_text, recording_meta, projects, language,
+    summarize_input = f"{raw_text}\n\n{visual_ctx}" if visual_ctx else raw_text
+    classification = claude_summarize(summarize_input, recording_meta, projects, language,
                                       want_clean=(source != "wispr"),
-                                      extra_instructions=extra_instructions,
+                                      extra_instructions=with_visual_instructions(
+                                          extra_instructions, visual_ctx),
                                       config=config, state=state)
     if not classification:
         print("FAILED")
@@ -885,7 +952,10 @@ def process_recording(recording, token, config, folders, projects, state, langua
 
     output_dir = target_base / dir_name
     write_outputs(classification, recording_meta, raw_text, output_dir,
-                  extra_instructions=extra_instructions)
+                  extra_instructions=extra_instructions,
+                  visual_records=visual_records, visual_context=visual_ctx)
+    if visual_records:
+        copy_visuals(work_dir, output_dir)
     if source == "wispr":
         write_wispr_summary(wispr_info, recording_meta, output_dir, config)
     print(f"→ {output_dir}")
@@ -1013,9 +1083,15 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     # Classify & summarize
     step += 1
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
-    classification = claude_summarize(combined_transcript, recording_meta, projects, language,
+    # Visual enrichment (opt-in) across every part of the merged session.
+    visual_records, visual_ctx = prepare_visuals(recordings, config, merged_work_dir)
+    summarize_input = (f"{combined_transcript}\n\n{visual_ctx}" if visual_ctx
+                       else combined_transcript)
+
+    classification = claude_summarize(summarize_input, recording_meta, projects, language,
                                       want_clean=(merged_source != "wispr"),
-                                      extra_instructions=extra_instructions,
+                                      extra_instructions=with_visual_instructions(
+                                          extra_instructions, visual_ctx),
                                       config=config, state=state)
     if not classification:
         print("FAILED")
@@ -1055,7 +1131,10 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
 
     output_dir = target_base / dir_name
     write_outputs(classification, recording_meta, combined_transcript, output_dir,
-                  extra_instructions=extra_instructions)
+                  extra_instructions=extra_instructions,
+                  visual_records=visual_records, visual_context=visual_ctx)
+    if visual_records:
+        copy_visuals(merged_work_dir, output_dir)
     print(f"→ {output_dir}")
 
     # Mark all parts as done

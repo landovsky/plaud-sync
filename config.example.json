@@ -15,5 +15,18 @@
     "enabled": false,
     "data_dir": "~/Library/Application Support/Wispr Flow",
     "keep_wispr_summary": true
+  },
+  "visuals": {
+    "enabled": false,
+    "screenshot_dirs": [
+      "~/Desktop"
+    ],
+    "phone_dirs": [
+      "/sdcard/DCIM/Camera",
+      "/sdcard/Pictures/Screenshots"
+    ],
+    "tail_minutes": 30,
+    "max_width": 1600,
+    "adb": "adb"
   }
 }

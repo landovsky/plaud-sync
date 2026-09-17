@@ -2,6 +2,9 @@ api-reference/
 *.har
 .DS_Store
 .envrc
+.envrc.bak
+.env
+.env.*.local
 __pycache__/
 *.pyc
 docs/audio/

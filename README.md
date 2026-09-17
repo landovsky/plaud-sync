@@ -319,6 +319,63 @@ It's graceful and read-only: the Wispr SQLite store is opened read-only (safe wh
 
 ---
 
+## Meeting visuals
+
+Working meetings are full of pointing: *"tady je chyba"*, *"tohle přesuň"*. Measured on one
+2.5-hour meeting, **31% of turns contain a word whose referent is on screen and nowhere in
+the audio**. Text-only, the summarizer drops those passages or guesses at them.
+
+With `visuals.enabled`, the pipeline collects images captured while the recording was
+running, captions each one, and uses them for both the transcript and the summary:
+
+```json
+"visuals": {
+  "enabled": true,
+  "screenshot_dirs": ["~/Desktop"],
+  "phone_dirs": ["/sdcard/DCIM/Camera", "/sdcard/Pictures/Screenshots"],
+  "tail_minutes": 30,
+  "max_width": 1600
+}
+```
+
+Phone photos are pulled over `adb` (accept the USB-debugging prompt on the device). No
+device, no `adb`, or an unauthorised phone is a warning, never a failure.
+
+**Two placement classes, deliberately different.** Images captured *inside a recording
+segment* are **anchored**: their time is exact, so they are interleaved into the transcript
+as markers.
+
+```
+[07:01] speaker_0: Aha, tak tady je chyba.
+
+🖼 ——— SNÍMEK @ 7:14 (obrazovka) → screenshots/p1_007m14s_screen.jpg ———
+```
+
+Everything else — captured during a pause, or within `tail_minutes` after the recording
+stopped — is **associated**: listed, but never asserted to belong at a particular moment.
+Photographing a whiteboard happens *after* the discussion, so the clock cannot place it.
+
+This split is not fussiness. A meeting's wall-clock span includes its pauses, and one
+observed pause contained an entirely different recorded meeting — matching on the span
+rather than the segments files those images under the wrong meeting.
+
+**Outputs.** Images land in `screenshots/` (downscaled to `max_width`), captions in
+`visual-context.md` next to the summary, and a `captions.json` cache in the working
+directory so re-runs cost nothing.
+
+Captions are written as their own document on purpose: if the model misreads a screen, that
+must be visible to you rather than buried inside a summary. The summarizer is told to use
+them for resolving references and reading identifiers — **never as evidence of what was
+decided**. Decisions come from what people said.
+
+**What to expect.** In an A/B on one meeting, aggregate similarity could not distinguish
+with-images from without: two runs on *identical* input differed as much as with-vs-without
+(0.32 vs 0.31 token similarity). The gain shows up in specific facts — duplicate record
+numbers, customer IDs, screen names — that appeared only in the with-images summary. If you
+evaluate this yourself, compare facts, not prose, and generate the baseline twice.
+
+---
+
 ## State & incremental sync
 
 State lives in `~/.plaud-sync/state.json` and is what makes sync idempotent:
@@ -349,6 +406,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 | `fernet_key` | transcribe | Override Plaud's audio-URL decryption key if they rotate it |
 | `process_bookmarks` | transcribe | `true` to inline device bookmarks into the transcript (default off — see [Bookmarks](#bookmarks-device-marks)) |
 | `wispr` | transcribe | Ingest local [Wispr Flow](#wispr-flow-meetings) meetings: `{ "enabled": true, "data_dir": "~/…/Wispr Flow", "keep_wispr_summary": true }` (default off) |
+| `visuals` | transcribe | Attach screenshots and phone photos taken during the recording — see [Meeting visuals](#meeting-visuals) (default off) |
 | `timezone` | both | IANA tz for the Plaud API (default `Europe/Prague`) |
 | `token` | both | Optional: Plaud token here instead of the env var |
 
