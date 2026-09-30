@@ -27,6 +27,7 @@ each is a warning and an empty result, never a blocked transcript.
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,7 @@ DEFAULT_PHONE_DIRS = ["/sdcard/DCIM/Camera", "/sdcard/Pictures/Screenshots"]
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".heic")
 DEFAULT_TAIL_MIN = 30      # a whiteboard photo taken after the meeting still belongs to it
 DEFAULT_MAX_WIDTH = 1600   # UI text stays legible; 31 MB of originals became 4.4 MB
+PHONE_PROMPT_TIMEOUT_S = 60  # an unattended run must not hang on the prompt forever
 
 
 def _cfg(config):
@@ -168,6 +170,18 @@ def _device_state(adb):
     return "absent"
 
 
+def _timed_input(prompt, timeout):
+    """input() that returns None if nothing is entered within `timeout` seconds."""
+    print(prompt, end="", flush=True)
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        return None
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\n")
+
+
 def _await_phone(adb):
     """Ask the user to plug the phone in, and retry until they decline.
 
@@ -192,10 +206,14 @@ def _await_phone(adb):
             print("\n  No phone detected. Connect it to include photos taken during "
                   "the meeting.")
         try:
-            answer = input("  Retry? [Y/n] ").strip().lower()
+            answer = _timed_input("  Retry? [Y/n] ", PHONE_PROMPT_TIMEOUT_S)
         except (EOFError, KeyboardInterrupt):
             print()
             return False
+        if answer is None:
+            print(f"\n  No answer in {PHONE_PROMPT_TIMEOUT_S}s — skipping phone photos.")
+            return False
+        answer = answer.strip().lower()
         if answer in ("n", "no", "s", "skip"):
             print("  Skipping phone photos.")
             return False
