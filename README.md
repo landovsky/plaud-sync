@@ -151,8 +151,9 @@ That's it. Transcripts and summaries appear under the mapped project directory. 
 | Command | Description |
 |---------|-------------|
 | `process` *(default)* | Interactively select and process recordings |
-| `list` | Show recordings, their status (✓ done · ~ incomplete · – skipped · blank pending), and where each processed recording's output landed. Local [Wispr Flow](#wispr-flow-meetings) meetings appear here too, in a `Plaud`/`Wispr` provider column |
+| `list` | Show recordings, their status (✓ done · ~ incomplete · – skipped · blank pending), and where each processed recording's output landed. Local [Wispr Flow](#wispr-flow-meetings) meetings and [Google Recorder](#google-recorder-pixel-phone) recordings appear here too, in a `Plaud`/`Wispr`/`Phone` provider column |
 | `move <ref> <project>` | Move an already-processed recording to a different project |
+| `file <audio> …` | Process [local audio files](#local-audio-files) (no Plaud account needed) |
 | `init` | Write a starter config to `~/.plaud-sync/config.json` |
 
 **Options**
@@ -290,6 +291,41 @@ It's graceful: recordings without marks are untouched (output is byte-identical 
 
 ---
 
+## Local audio files
+
+Any audio file on disk (a phone recording, a Zoom/Teams export, a voice memo) can go through the same pipeline: ElevenLabs transcription, Claude classification and summary, routing into the matching project repo.
+
+```bash
+./plaud_transcribe.py file ~/Downloads/call.m4a
+./plaud_transcribe.py file call.m4a --title "Supplier call" --date "2026-10-01 14:30"
+./plaud_transcribe.py file part1.mp3 part2.mp3 --merge --instructions "focus on pricing"
+```
+
+- No Plaud token is needed, only `ELEVENLABS_API_KEY` and the `claude` CLI.
+- The start time defaults to the file's modification time (in the configured `timezone`). Pass `--date` when that's wrong, for example on a copied file.
+- Files are identified by a content hash, so processing the same file again (even after a rename) is refused with a pointer to the existing output. Use `--force` to re-summarize; the cached transcript is reused.
+- Outputs carry `source: local` and a `local_id` in the front matter, and `metadata.json` records the original `source_path`.
+
+---
+
+## Google Recorder (Pixel phone)
+
+The Pixel **Recorder** app saves every recording to the phone's shared storage (`/sdcard/Recordings/<title>.m4a`) on its own. Nothing has to be exported or shared first. With the phone connected over USB (USB debugging on, this computer authorised), `list` and `process` show those recordings as `Phone` rows next to Plaud and Wispr, and processing pulls the audio over `adb`, transcribes it with ElevenLabs, and summarizes and routes it like any other recording.
+
+```json
+{
+  "recorder": { "enabled": true, "adb": "adb" }
+}
+```
+
+- Listing is one MediaStore query (`owner_package_name=com.google.android.apps.recorder`). Audio is pulled only for recordings you process and is cached in `docs/audio/`.
+- **Start time** comes from Recorder's default title stamp (`Oct 13 at 10_12 …`, `Thursday at 06_53`). Recorder rewrites the file when you edit a recording, so the file's timestamp can't be trusted. A recording retitled without the stamp falls back to MediaStore's `datetaken − duration`.
+- **Title**: the date stamp is dropped (the date is already in the output path), so `Oct 14 at 09_51 hh Šárka obchodní` becomes `hh Šárka obchodní`.
+- **Identity** is MediaStore's `datetaken`, so renaming a recording on the phone doesn't make it look new. Outputs carry `source: recorder`, a `recorder_id`, and the on-phone `source_path`.
+- No phone, no `adb`, or an unauthorised phone just prints a note and lists no `Phone` rows. The other sources are never blocked.
+
+---
+
 ## Wispr Flow meetings
 
 [Wispr Flow](https://wisprflow.ai) records meetings and transcribes them **locally** — so unlike Plaud, the diarized, speaker-named transcript already sits on your disk. When enabled, `plaud_transcribe.py` reads those meetings straight from Wispr's local store and runs them through the *same* pipeline as Plaud recordings: `list` and `process` show them alongside your Plaud recordings (with a `Plaud`/`Wispr` provider column), and processing classifies, summarizes, and routes each one into the right project repo.
@@ -406,6 +442,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 | `fernet_key` | transcribe | Override Plaud's audio-URL decryption key if they rotate it |
 | `process_bookmarks` | transcribe | `true` to inline device bookmarks into the transcript (default off — see [Bookmarks](#bookmarks-device-marks)) |
 | `wispr` | transcribe | Ingest local [Wispr Flow](#wispr-flow-meetings) meetings: `{ "enabled": true, "data_dir": "~/…/Wispr Flow", "keep_wispr_summary": true }` (default off) |
+| `recorder` | transcribe | List and pull [Google Recorder](#google-recorder-pixel-phone) recordings from a USB-connected Pixel: `{ "enabled": true, "adb": "adb" }` (default off) |
 | `visuals` | transcribe | Attach screenshots and phone photos taken during the recording — see [Meeting visuals](#meeting-visuals) (default off) |
 | `timezone` | both | IANA tz for the Plaud API (default `Europe/Prague`) |
 | `token` | both | Optional: Plaud token here instead of the env var |

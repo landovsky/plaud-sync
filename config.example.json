@@ -16,6 +16,10 @@
     "data_dir": "~/Library/Application Support/Wispr Flow",
     "keep_wispr_summary": true
   },
+  "recorder": {
+    "enabled": false,
+    "adb": "adb"
+  },
   "visuals": {
     "enabled": false,
     "screenshot_dirs": [

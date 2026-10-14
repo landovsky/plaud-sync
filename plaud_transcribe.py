@@ -37,6 +37,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import google_recorder
 import wispr_flow
 import visuals
 
@@ -200,19 +201,22 @@ def list_recordings(token, config, days):
 
 
 def list_all_recordings(token, config, days):
-    """Plaud recordings plus (if enabled) local Wispr Flow meetings, merged into
-    one newest-first list. Both sources share the same recording shape, so the
-    rest of the pipeline treats them uniformly. Wispr reads are best-effort and
+    """Plaud recordings plus (if enabled) local Wispr Flow meetings and Google
+    Recorder recordings on a USB-connected phone, merged into one newest-first
+    list. All sources share the same recording shape, so the rest of the
+    pipeline treats them uniformly. Wispr and Recorder reads are best-effort and
     never block the Plaud path."""
     recordings = list_recordings(token, config, days)
     recordings += wispr_flow.list_meetings(config, days)
+    recordings += google_recorder.list_recordings(config, days)
     recordings.sort(key=lambda r: r.get("start_time", 0), reverse=True)
     return recordings
 
 
 def source_label(recording):
     """Provider name, shown as its own column in list output."""
-    return "Wispr" if recording.get("source") == "wispr" else "Plaud"
+    return {"wispr": "Wispr", "local": "Local", "recorder": "Phone"}.get(
+        recording.get("source"), "Plaud")
 
 
 def fetch_folders(token, config):
@@ -250,6 +254,74 @@ def plaud_get_encrypted(path, token, config):
     with urllib.request.urlopen(req, timeout=30) as resp:
         encrypted = resp.read()
     return json.loads(fernet_decrypt(encrypted, config))
+
+
+def local_recording(path, title=None, start=None):
+    """Build a recording dict for an audio file already on disk, in the same shape
+    as a Plaud/Wispr recording so the rest of the pipeline treats it uniformly.
+
+    The id is a content hash: re-running on the same file (even renamed or moved)
+    hits the cached transcript and the existing state entry instead of paying
+    ElevenLabs again. Start time defaults to the file's mtime — for recorder and
+    phone exports that is the end of the recording, close enough for dating."""
+    import hashlib
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"No such file: {path}")
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if start is None:
+        start = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    return {
+        "id": f"local:{h.hexdigest()[:16]}",
+        "source": "local",
+        "filename": title or path.stem,
+        "start_time": int(start.timestamp() * 1000),
+        "duration": probe_duration_ms(path),
+        "_local_path": str(path),
+    }
+
+
+def probe_duration_ms(path):
+    """Audio length via ffprobe (best-effort: 0 just shows as an unknown duration)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return int(float(out) * 1000)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def obtain_audio(recording, token, config, step_prefix):
+    """Return the audio path for a recording: the file itself for local audio,
+    the Recorder file pulled off the phone, otherwise the cached or freshly
+    downloaded Plaud mp3."""
+    if recording.get("source") == "local":
+        audio_path = Path(recording["_local_path"])
+        size_mb = audio_path.stat().st_size / 1024 / 1024
+        print(f"  {step_prefix} Local audio ({size_mb:.1f} MB)")
+        return audio_path
+    if recording.get("source") == "recorder":
+        print(f"  {step_prefix} Pulling audio from phone...", end=" ", flush=True)
+        audio_path = google_recorder.pull(recording, config, AUDIO_DIR)
+        print(f"{audio_path.stat().st_size / 1024 / 1024:.1f} MB")
+        return audio_path
+    file_id = recording["id"]
+    cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
+    if cached:
+        audio_path = cached[0]
+        size_mb = audio_path.stat().st_size / 1024 / 1024
+        print(f"  {step_prefix} Audio cached ({size_mb:.1f} MB)")
+        return audio_path
+    print(f"  {step_prefix} Downloading audio...", end=" ", flush=True)
+    audio_path = download_audio(file_id, token, config)
+    print(f"{audio_path.stat().st_size / 1024 / 1024:.1f} MB")
+    return audio_path
 
 
 def download_audio(file_id, token, config):
@@ -705,7 +777,8 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
         "source": source,
     }
     # Keep the source's native id under a source-specific key.
-    front_matter["wispr_id" if source == "wispr" else "plaud_id"] = recording_meta.get("file_id")
+    id_key = {"wispr": "wispr_id", "local": "local_id", "recorder": "recorder_id"}.get(source, "plaud_id")
+    front_matter[id_key] = recording_meta.get("file_id")
     # Surface the one-off steering in the document itself: reading a summary
     # months later, "why is this so BOM-heavy?" should be answerable in place.
     if extra_instructions:
@@ -858,16 +931,19 @@ def process_recording(recording, token, config, folders, projects, state, langua
     wispr_info = recording.get("_wispr", {}) if source == "wispr" else {}
 
     recording_meta = {
-        "file_id": wispr_info.get("uuid", file_id),
+        "file_id": wispr_info.get("uuid", file_id.split(":", 1)[-1]),
         "source": source,
         "filename": filename,
         "date": date_str,
         "duration": duration,
         "folder": folder_name,
         "start_time": start_ms,
+        **({"source_path": recording["_local_path"]} if source == "local" else {}),
+        **({"source_path": recording["_recorder"]["path"]} if source == "recorder" else {}),
     }
 
-    origin = "Wispr Flow" if source == "wispr" else (folder_name or "—")
+    origin = {"wispr": "Wispr Flow", "local": recording.get("_local_path"),
+              "recorder": "Google Recorder"}.get(source) or folder_name or "—"
     print(f"\n{'='*60}")
     print(f"  {filename}")
     print(f"  {date_str} · {format_duration(duration)} · {origin}")
@@ -889,17 +965,8 @@ def process_recording(recording, token, config, folders, projects, state, langua
         turns = raw_text.count("\n\n") + 1
         print(f"{turns} turns")
     else:
-        # 1. Download audio (skip if already downloaded)
-        cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
-        if cached:
-            audio_path = cached[0]
-            size_mb = audio_path.stat().st_size / 1024 / 1024
-            print(f"  [1/{nsteps}] Audio cached ({size_mb:.1f} MB)")
-        else:
-            print(f"  [1/{nsteps}] Downloading audio...", end=" ", flush=True)
-            audio_path = download_audio(file_id, token, config)
-            size_mb = audio_path.stat().st_size / 1024 / 1024
-            print(f"{size_mb:.1f} MB")
+        # 1. Obtain audio (local file, Plaud cache, or download)
+        audio_path = obtain_audio(recording, token, config, f"[1/{nsteps}]")
 
         # 2. Transcribe (skip if already done)
         transcript_path = work_dir / "transcript.txt"
@@ -1043,18 +1110,9 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
             print(f"{raw_text.count(chr(10) + chr(10)) + 1} turns")
             step += 1
         else:
-            # Download audio
+            # Obtain audio
             step += 1
-            cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
-            if cached:
-                audio_path = cached[0]
-                size_mb = audio_path.stat().st_size / 1024 / 1024
-                print(f"  [{step}/{step_total}] Audio cached {part_label} ({size_mb:.1f} MB)")
-            else:
-                print(f"  [{step}/{step_total}] Downloading audio {part_label}...", end=" ", flush=True)
-                audio_path = download_audio(file_id, token, config)
-                size_mb = audio_path.stat().st_size / 1024 / 1024
-                print(f"{size_mb:.1f} MB")
+            audio_path = obtain_audio(rec, token, config, f"[{step}/{step_total}] {part_label}:")
 
             # Transcribe
             step += 1
@@ -1084,7 +1142,8 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     (merged_work_dir / "merged_transcript.txt").write_text(combined_transcript, encoding="utf-8")
 
     folder_name = get_folder_name(first, folders)
-    merged_source = "wispr" if all(r.get("source") == "wispr" for r in recordings) else "plaud"
+    sources = {r.get("source", "plaud") for r in recordings}
+    merged_source = sources.pop() if len(sources) == 1 else "plaud"
     recording_meta = {
         "file_id": file_ids[0].split(":", 1)[-1],
         "source": merged_source,
@@ -1116,7 +1175,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
         for fid in file_ids:
             state.setdefault("transcribed", {})[fid] = {
                 "date": date_str, "status": "transcribed",
-                "work_dir": str(WORKING_DIR / fid),
+                "work_dir": str(WORKING_DIR / fid.replace(":", "_")),
             }
         save_state(state)
         return None
@@ -1655,6 +1714,46 @@ def cmd_process(args, token, config, state, folders):
                           extra_instructions=instructions)
 
 
+def parse_local_start(text, config):
+    """--date accepts 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (or ISO 'T'), read in
+    the configured local zone — the same zone outputs are dated in."""
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=local_tz(config))
+        except ValueError:
+            continue
+    raise SystemExit(f"Error: --date must be YYYY-MM-DD or 'YYYY-MM-DD HH:MM', got {text!r}")
+
+
+def cmd_file(args, config, state):
+    """Process audio files already on disk (phone recordings, Zoom exports, ...)
+    through the same transcribe → summarize → route pipeline. Needs no Plaud token."""
+    if not args.extra:
+        raise SystemExit("Usage: plaud_transcribe.py file <audio> [<audio> ...] "
+                         "[--title T] [--date D] [--merge] [--instructions I]")
+    start = parse_local_start(args.date, config) if args.date else None
+    if args.title and len(args.extra) > 1 and not args.merge:
+        raise SystemExit("Error: --title with several files needs --merge")
+    try:
+        recordings = [local_recording(p, title=args.title, start=start) for p in args.extra]
+    except FileNotFoundError as e:
+        raise SystemExit(f"Error: {e}")
+
+    transcribed = state.get("transcribed", {})
+    if not args.force:
+        done = [r for r in recordings if transcribed.get(r["id"], {}).get("status") == "done"]
+        for r in done:
+            print(f"Already processed: {r['_local_path']}\n  → {transcribed[r['id']].get('output_dir')}"
+                  "\n  (use --force to redo)")
+        recordings = [r for r in recordings if r not in done]
+        if not recordings:
+            return []
+
+    return execute_selection(recordings, args.merge and len(recordings) > 1, None, config, {},
+                             get_projects(config), state, args.language,
+                             extra_instructions=args.instructions)
+
+
 EXAMPLE_CONFIG = {
     "projects": {
         "project-a": "~/git/project-a/docs/transcripts",
@@ -1676,6 +1775,10 @@ EXAMPLE_CONFIG = {
         "data_dir": "~/Library/Application Support/Wispr Flow",
         "keep_wispr_summary": True,
     },
+    "recorder": {
+        "enabled": False,
+        "adb": "adb",
+    },
 }
 
 
@@ -1696,12 +1799,19 @@ def main():
         prog="plaud-transcribe",
         description="Download, transcribe, classify and summarize Plaud recordings",
     )
-    parser.add_argument("command", nargs="?", default="process", choices=["list", "process", "move", "init"])
-    parser.add_argument("extra", nargs="*", help="For 'move': <file_id|dir-name|path> <project>")
+    parser.add_argument("command", nargs="?", default="process",
+                        choices=["list", "process", "move", "init", "file"])
+    parser.add_argument("extra", nargs="*",
+                        help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--all", action="store_true", help="Process all unprocessed recordings")
     parser.add_argument("--language", default=None, help="Primary language (default: config 'language' or cs)")
-    parser.add_argument("--force", action="store_true", help="For 'init': overwrite an existing config")
+    parser.add_argument("--force", action="store_true",
+                        help="For 'init': overwrite an existing config; for 'file': redo a processed file")
+    parser.add_argument("--title", help="For 'file': recording title (default: file name)")
+    parser.add_argument("--date", help="For 'file': start time, 'YYYY-MM-DD[ HH:MM]' (default: file mtime)")
+    parser.add_argument("--merge", action="store_true", help="For 'file': treat the files as one session")
+    parser.add_argument("--instructions", help="For 'file': one-off summarization steering")
     args = parser.parse_args()
 
     config = load_config()
@@ -1717,6 +1827,10 @@ def main():
 
     if args.command == "move":
         cmd_move(args, config, state)
+        return
+
+    if args.command == "file":
+        cmd_file(args, config, state)
         return
 
     token = get_token()
