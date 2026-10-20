@@ -995,6 +995,15 @@ def process_recording(recording, token, config, folders, projects, state, langua
     # 3. Classify & summarize via Claude
     print(f"  [{nsteps - 1}/{nsteps}] Classifying & summarizing via Claude...", end=" ", flush=True)
     summarize_input = f"{raw_text}\n\n{visual_ctx}" if visual_ctx else raw_text
+    # The user's own "My thoughts" notes from Wispr Flow: first-hand signal on what
+    # mattered (e.g. a bug observed live) that the spoken transcript may not carry.
+    user_notes = (wispr_info.get("notes") or "").strip()
+    if user_notes:
+        summarize_input += (
+            "\n\n## Notes written by the user during the meeting (Wispr Flow \"My thoughts\")\n"
+            "First-hand notes from the recording's owner. Treat as authoritative context "
+            "and reflect them in the summary where relevant.\n\n" + user_notes
+        )
     classification = claude_summarize(summarize_input, recording_meta, projects, language,
                                       want_clean=(source != "wispr"),
                                       extra_instructions=with_visual_instructions(

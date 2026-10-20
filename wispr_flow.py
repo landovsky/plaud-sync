@@ -169,7 +169,7 @@ def list_meetings(config, days):
     try:
         rows = conn.execute(
             """
-            SELECT id, title, summary, speakerMap, participantNames,
+            SELECT id, title, summary, notes, speakerMap, participantNames,
                    createdAt, endedAt
             FROM Meetings
             WHERE isDeleted = 0 AND finalized = 1
@@ -223,6 +223,7 @@ def list_meetings(config, days):
                 "refined_path": str(refined),
                 "audio_path": str(_audio_path(config, uuid)) if _audio_path(config, uuid) else None,
                 "summary": row["summary"],
+                "notes": row["notes"],
                 "speaker_names": _resolve_speakers(row["speakerMap"]),
                 "participant_names": row["participantNames"],
             },
