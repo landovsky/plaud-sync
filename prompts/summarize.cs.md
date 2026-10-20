@@ -16,6 +16,14 @@ a recording that continues the thread of a project's recent recordings belongs
 to that project even if the name is never spoken. Use "default" only when no
 project is a plausible fit, not merely when you are unsure which.
 
+Některé produkty mají sourozenecké projekty — jeden pro vývoj a jeden pro byznys
+stranu (provoz, prodej, marketing, strategie, schůzky se zákazníky). Vývojové nahrávky
+jsou ten vzácný případ: do vývojového projektu patří jen rozhovory o kódu, architektuře,
+chybách, nasazení, testech nebo datových modelech. Hovory se zákazníky, nabídky, ceny,
+partnerství, oslovování, komunikační plány, rebranding a plánování patří do byznys
+sourozence, i když se mimochodem zmíní technické funkce produktu. Pokud řádek témat
+projektu říká, kterou stranu pokrývá, řiď se jím.
+
 ## Tasks
 
 1. **Classify**: determine recording type, assign to a project key from the list above (or "default" if none match — see the guidance under "Known projects"), pick a short descriptive name in the recording's language, add relevant tags.

@@ -16,6 +16,15 @@ a recording that continues the thread of a project's recent recordings belongs
 to that project even if the name is never spoken. Use "default" only when no
 project is a plausible fit, not merely when you are unsure which.
 
+Some products have sibling projects — one for engineering work and one for the
+business side (operations, sales, marketing, strategy, customer meetings). Engineering
+recordings are the rare case: file under the engineering project only when the
+conversation is about code, architecture, bugs, deployments, tests or data models.
+Calls with customers, pitches, pricing, partnerships, outreach, communication plans,
+rebranding and planning belong to the business sibling, even when the product's
+technical features come up in passing. When the project's topics line says which
+side it covers, follow it.
+
 ## Tasks
 
 1. **Classify**: determine recording type, assign to a project key from the list above (or "default" if none match — see the guidance under "Known projects"), pick a short descriptive name in the recording's language, add relevant tags.

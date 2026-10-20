@@ -1538,26 +1538,51 @@ def fuzzy_match(query, text):
     return all(tok in text_s for tok in slugify(query).split("-") if tok)
 
 
+MOVE_PROJECT_LIMIT = 30   # newest transcripts shown that already sit in a project
+MOVE_DEFAULT_LIMIT = 20   # newest transcripts shown that landed in "default"
+MOVE_DEFAULT_MAX_AGE_DAYS = 183  # ~6 months; older default transcripts are not offered
+
+
+def _entry_age_days(entry):
+    try:
+        return (datetime.now().date() - datetime.strptime(entry.get("date", "")[:10], "%Y-%m-%d").date()).days
+    except ValueError:
+        return 0  # unparseable date: keep it visible rather than hide it
+
+
 def select_transcript(state, query=""):
-    """Interactively pick a transcribed recording. Returns (file_id, entry) or (None, None)."""
+    """Interactively pick a transcribed recording. Returns (file_id, entry) or (None, None).
+
+    The list is capped to stay short: the newest MOVE_PROJECT_LIMIT transcripts, plus a
+    separate section of the newest MOVE_DEFAULT_LIMIT unrouted ("default") ones no older
+    than MOVE_DEFAULT_MAX_AGE_DAYS, so a mis-filed recording can still be dragged out.
+    A text filter applies before the caps, so older transcripts stay reachable by search.
+    """
     entries = sorted(
         [kv for kv in state.get("transcribed", {}).items() if kv[1].get("output_dir")],
-        key=lambda kv: kv[1].get("transcribed_at", ""), reverse=True,
+        key=lambda kv: (kv[1].get("date", ""), kv[1].get("transcribed_at", "")), reverse=True,
     )
     if not entries:
         print("No transcribed recordings in state.")
         return None, None
 
+    is_default = lambda e: e.get("project", "default") == "default"
     while True:
         haystack = lambda e: f"{e.get('name','')} {e.get('project','')} {Path(e.get('output_dir','')).name}"
-        matches = [(fid, e) for fid, e in entries if fuzzy_match(query, haystack(e))] if query else entries
+        pool = [(fid, e) for fid, e in entries if fuzzy_match(query, haystack(e))] if query else entries
+        projects_part = [kv for kv in pool if not is_default(kv[1])][:MOVE_PROJECT_LIMIT]
+        default_part = [kv for kv in pool if is_default(kv[1])
+                        and _entry_age_days(kv[1]) <= MOVE_DEFAULT_MAX_AGE_DAYS][:MOVE_DEFAULT_LIMIT]
+        matches = projects_part + default_part
         print()
-        if query:
-            print(f"  Transcripts matching '{query}'  ({len(matches)}):")
-        else:
-            print(f"  Transcripts ({len(matches)}):")
-        for i, (fid, e) in enumerate(matches, 1):
-            print(f"  {i:>2}  {e.get('date','?')}  [{e.get('project','?')}]  {e.get('name','?')}")
+        label = f"matching '{query}'" if query else "latest"
+        n = 0
+        for title, part in ((f"In projects — {label} {len(projects_part)}", projects_part),
+                            (f"In default — {label} {len(default_part)} (max 6 months old)", default_part)):
+            print(f"  {title}:")
+            for fid, e in part:
+                n += 1
+                print(f"  {n:>2}  {e.get('date','?')}  [{e.get('project','?')}]  {e.get('name','?')}")
         print("  Type a number to pick · text to filter · q = cancel")
         sel = input("> ").strip()
         if sel.lower() in ("q", "quit", ""):
