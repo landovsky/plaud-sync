@@ -462,10 +462,13 @@ python3 autocapture.py install-app    # ~/Applications/Plaud Autocapture.app
 python3 autocapture.py start --watch  # launches via the app when it exists
 ```
 
-Known gap: the app's launcher is a shell script that runs Homebrew Python as a child, and
-macOS still charges the grant to Python — the prompt says **"python3.15"**, and allowing it
-lets any script run by that interpreter record the screen. A compiled launcher that stays the
-responsible process would fix this; until then the Python grant is what makes capture work.
+The app's main executable is a small compiled launcher (built with `cc` at install time) that
+spawns Python as a child and stays the responsible process, so the grant belongs to **Plaud
+Autocapture** alone and Python needs none. With only a shell-script launcher, macOS charged
+the grant to Python instead (the prompt said "python3.15"), which let any script run by that
+interpreter record the screen. Re-running `install-app` rebuilds the binary, and macOS then
+treats it as a new app: switch Plaud Autocapture off and on again under Screen & System Audio
+Recording (or remove it and let it ask again), then restart capture.
 
 Frames go to `~/Pictures/plaud-autocapture/<session>/` with a `timeline.jsonl` of which scene
 was on which display when — never to `~/Desktop`, which visuals treats as deliberate

@@ -870,6 +870,50 @@ def select(config, transcript, wins, manual_times, tz):
 
 # --- App bundle ---
 
+_LAUNCHER_C = r"""
+#include <signal.h>
+#include <spawn.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+extern char **environ;
+static pid_t child;
+static void forward(int sig) { if (child > 0) kill(child, sig); }
+int main(int argc, char **argv) {
+    char *args[argc + 3];
+    int n = 0;
+    args[n++] = PYTHON;
+    args[n++] = SCRIPT;
+    if (argc < 2) args[n++] = "watch";
+    for (int i = 1; i < argc; i++) args[n++] = argv[i];
+    args[n] = NULL;
+    signal(SIGTERM, forward);
+    signal(SIGINT, forward);
+    if (posix_spawn(&child, PYTHON, NULL, NULL, args, environ) != 0) return 127;
+    int status;
+    while (waitpid(child, &status, 0) < 0) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+"""
+
+
+def _compile_launcher(dest):
+    """Build the app's main executable: spawns this script under the current
+    Python and waits, forwarding TERM/INT. False when no compiler is around."""
+    def c_str(p):
+        return '"' + str(p).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    src = dest.with_suffix(".c")
+    src.write_text(_LAUNCHER_C, encoding="utf-8")
+    try:
+        ok = subprocess.run(["cc", "-O2", "-o", str(dest), str(src),
+                             f"-DPYTHON={c_str(sys.executable)}",
+                             f"-DSCRIPT={c_str(Path(__file__).resolve())}"],
+                            capture_output=True).returncode == 0
+    except OSError:
+        ok = False
+    src.unlink(missing_ok=True)
+    return ok
+
+
 def install_app():
     """Wrap capture in a tiny .app so macOS asks for — and grants — Screen
     Recording to *it*, by name.
@@ -896,13 +940,19 @@ def install_app():
     launcher = contents / "MacOS" / "autocapture"
     # Python runs as a child, not via exec: exec'ing turns this process into
     # Homebrew's Python.app, and macOS then asks for (and grants to) "Python" —
-    # every Python program — instead of this app.
-    launcher.write_text("#!/bin/bash\n"
-                        f'"{sys.executable}" "{Path(__file__).resolve()}" "${{@:-watch}}" &\n'
-                        'child=$!\n'
-                        'trap \'kill -TERM "$child" 2>/dev/null\' TERM INT\n'
-                        'wait "$child"; wait "$child"\n',
-                        encoding="utf-8")
+    # every Python program — instead of this app. A bash launcher was not
+    # enough either: the prompt still named python3.15, and the grant covered
+    # every script that interpreter runs. A signed Mach-O main executable that
+    # spawns Python without disclaiming responsibility keeps the app the
+    # responsible process.
+    if not _compile_launcher(launcher):
+        launcher.write_text("#!/bin/bash\n"
+                            f'"{sys.executable}" "{Path(__file__).resolve()}" "${{@:-watch}}" &\n'
+                            'child=$!\n'
+                            'trap \'kill -TERM "$child" 2>/dev/null\' TERM INT\n'
+                            'wait "$child"; wait "$child"\n',
+                            encoding="utf-8")
+        print("no C compiler — installed the shell launcher; macOS may charge the grant to Python")
     launcher.chmod(0o755)
     # Ad-hoc signature: TCC keys the grant to a stable identity, not just a path.
     subprocess.run(["codesign", "--force", "--deep", "-s", "-", str(APP_PATH)],
