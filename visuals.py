@@ -131,7 +131,7 @@ def _wispr_segments(rec):
     live = Path(path).parent / "live.ndjson" if path else None
     if not live or not live.exists():
         return None
-    segs = {}
+    segs, ends = {}, {}
     try:
         with open(live, encoding="utf-8") as f:
             for line in f:
@@ -142,6 +142,11 @@ def _wispr_segments(rec):
                     o = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if o.get("marker") in ("paused", "stopped") and o.get("epochMs"):
+                    # Recording runs until the pause, not until the last word —
+                    # a screenshot taken in the silence after it still belongs.
+                    ends[o.get("segment", 0)] = o["epochMs"]
+                    continue
                 if not o.get("startEpochMs"):
                     continue
                 d = segs.setdefault(o.get("segment", 0), {
@@ -151,6 +156,9 @@ def _wispr_segments(rec):
                 d["r0"] = min(d["r0"], o["startRecordingMs"]); d["r1"] = max(d["r1"], o["endRecordingMs"])
     except OSError:
         return None
+    for k, t in ends.items():
+        if k in segs and t > segs[k]["e1"]:
+            segs[k]["e1"] = t
     return [segs[k] for k in sorted(segs)] or None
 
 
@@ -269,12 +277,16 @@ def _pull_phone(config, lo, hi, staging):
     return pulled
 
 
-def collect(recordings, config, staging):
+def collect(recordings, config, staging, transcript=None):
     """Find every image belonging to this session and classify it.
 
     Returns records: {path, part, offset, source, klass, taken}
       klass "anchored"   -> offset is meaningful, image goes inline in the transcript
       klass "associated" -> taken in a pause or the post-meeting tail; listed only
+
+    With a transcript, scenes from autocapture are added too — only those a
+    pointing word landed on (see autocapture.select). Its report of every
+    candidate is written next to the staging dir, for judging the caption cap.
     """
     import plaud_transcribe as pt
     tz = pt.local_tz(config)
@@ -307,6 +319,19 @@ def collect(recordings, config, staging):
         else:
             records.append({"path": p, "part": None, "offset": None,
                             "source": src, "klass": "associated", "taken": t})
+
+    import autocapture
+    manual = [r["taken"].timestamp() for r in records]
+    auto, report = autocapture.select(config, transcript, wins, manual, tz)
+    if report:
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        (staging.parent / "autocapture-selection.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  Autocapture: {report['scenes_on_screen']} scene(s) on screen, "
+              f"{report['pointed_at']} pointed at, {report['selected']} selected"
+              + (f" ({report['over_cap']} over the cap of {report['max_captions']})"
+                 if report["over_cap"] else ""))
+    records += auto
     records.sort(key=lambda r: r["taken"])
     return records
 
@@ -319,12 +344,19 @@ def stage(records, out_dir, config):
     shots = out_dir / "screenshots"
     shots.mkdir(parents=True, exist_ok=True)
     width = max_width(config)
+    used = set()
     for i, r in enumerate(records, start=1):
         if r["klass"] == "anchored":
             o = int(r["offset"])
             base = f"p{r['part']}_{o // 60:03d}m{o % 60:02d}s_{r['source']}"
         else:
             base = f"assoc_{i:02d}_{r['taken']:%H%M}_{r['source']}"
+        # A full-screen screenshot on two displays is two files with the same
+        # timestamp — both need a name. Deterministic, so re-runs hit the cache.
+        stem, n = base, 2
+        while base in used:
+            base, n = f"{stem}_{n}", n + 1
+        used.add(base)
         dest = shots / f"{base}.jpg"
         ok = False
         if shutil.which("sips"):
@@ -366,8 +398,11 @@ def caption(records, out_dir, config):
     )
     for r in records:
         name = r["staged"]
-        if name in cache:
-            r["caption"] = cache[name]
+        # Keyed by source as well: the staged name is a position, and a later
+        # run can put a different image at the same position.
+        key = f"{name}|{Path(r['path']).name}"
+        if key in cache:
+            r["caption"] = cache[key]
             continue
         try:
             res = subprocess.run(
@@ -383,7 +418,7 @@ def caption(records, out_dir, config):
             continue
         text = res.stdout.strip()
         if text:
-            r["caption"] = cache[name] = text
+            r["caption"] = cache[key] = text
     try:
         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
@@ -392,6 +427,10 @@ def caption(records, out_dir, config):
 
 
 # --- Output ---
+
+def _where(r):
+    return {"phone": "mobil", "auto": "obrazovka, auto"}.get(r["source"], "obrazovka")
+
 
 def _stamp(seconds):
     return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
@@ -411,7 +450,7 @@ def visual_context(records, config):
         out.append("## Zařazené podle času")
         out.append("")
         for r in anchored:
-            where = "mobil" if r["source"] == "phone" else "obrazovka"
+            where = _where(r)
             part = f"část {r['part']}, " if r["part"] else ""
             out.append(f"- **[{part}{_stamp(r['offset'])}] {where}** — {r['caption']}")
         out.append("")
@@ -422,7 +461,7 @@ def visual_context(records, config):
                    "spolehlivě přiřadit podle času.")
         out.append("")
         for r in assoc:
-            where = "mobil" if r["source"] == "phone" else "obrazovka"
+            where = _where(r)
             out.append(f"- **[{r['taken']:%H:%M}] {where}** — {r['caption']}")
         out.append("")
     return "\n".join(out)
@@ -455,13 +494,13 @@ def interleave(transcript_text, records):
         if tm:
             t = int(tm.group(1)) * 60 + int(tm.group(2))
             for r in [x for x in pending if (x["part"] or 1) == part and x["offset"] <= t]:
-                where = "mobil" if r["source"] == "phone" else "obrazovka"
+                where = _where(r)
                 out.append(f"🖼 ——— SNÍMEK @ {_stamp(r['offset'])} ({where}) "
                            f"→ screenshots/{r['staged']} ———")
                 pending.remove(r)
         out.append(block)
     for r in pending:  # anything after the last timestamped turn
-        where = "mobil" if r["source"] == "phone" else "obrazovka"
+        where = _where(r)
         out.append(f"🖼 ——— SNÍMEK @ {_stamp(r['offset'])} ({where}) "
                    f"→ screenshots/{r['staged']} ———")
     return "\n\n".join(out)

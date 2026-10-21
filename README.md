@@ -410,6 +410,92 @@ with-images from without: two runs on *identical* input differed as much as with
 numbers, customer IDs, screen names — that appeared only in the with-images summary. If you
 evaluate this yourself, compare facts, not prose, and generate the baseline twice.
 
+### Automatic screen capture
+
+Manual screenshots get forgotten exactly when they matter. `autocapture.py` captures
+continuously during a meeting, and keeps the cost bounded with one filter at each end:
+
+- **At capture time, only screen changes are kept.** Every display is sampled every 3s,
+  but a frame is saved only when the screen *changed and then settled* (a 96×60 grey
+  thumbnail is the whole comparison — no model). Cells still moving — video, a scroll, a
+  terminal streaming output — are left out of the comparison, so a webcam tile doesn't make
+  scenes but highlighting three rows does. Tabbing back to a screen already seen is logged
+  as a revisit, not saved again.
+- **At pipeline time, only pointed-at scenes are captioned.** A scene is captioned only if a
+  turn with a pointing word (*tady*, *tohle*, *koukni*, *look at*…) was spoken while it was
+  on screen. With several displays, the one with the mouse wins (logged as you go), else
+  the one that changed most recently. Pointing words
+  alone are too common to select anything (~20% of turns on three real meetings); pointing
+  *at a scene* is the signal. At most `max_captions` scenes survive, ranked by how often —
+  and how soon after appearing — they were pointed at. A deliberate screenshot within
+  `manual_gap_s` of a scene replaces it.
+
+```bash
+python3 autocapture.py watch          # capture while a Wispr Flow meeting is recording
+python3 autocapture.py run --hours 1  # capture now, until Ctrl-C or the hour is up
+python3 autocapture.py start --watch  # either of the above, in the background
+python3 autocapture.py status
+python3 autocapture.py stop
+```
+
+A macOS notification says when capture turns **on**, when the **first scene is saved** (proof
+that Screen Recording permission works — without it you get a "no frames" notification
+instead), and when it turns **off**.
+
+Screen Recording permission goes to whichever *app* macOS holds responsible for the process.
+From a terminal that is the terminal app; under tmux it has no name, and the prompt says
+**"unknown"** — allowing that grants the screen to everything in tmux. Instead, build a
+dedicated app once and let `start` launch through it, so the prompt names **Plaud
+Autocapture** and the grant covers only it:
+
+```bash
+python3 autocapture.py install-app    # ~/Applications/Plaud Autocapture.app
+python3 autocapture.py start --watch  # launches via the app when it exists
+```
+
+Frames go to `~/Pictures/plaud-autocapture/<session>/` with a `timeline.jsonl` of which scene
+was on which display when — never to `~/Desktop`, which visuals treats as deliberate
+screenshots. Capture pauses while the screen is locked, stops after `max_hours`, and sessions
+older than `retention_days` are deleted. Scenes that nobody pointed at are never captioned or
+copied anywhere.
+
+Each transcription run writes `autocapture-selection.json` to its working directory: every
+pointed-at scene with its score and fate (`selected`, `over-cap`, `manual-nearby`). That is how
+to judge the cap — if `over-cap` scenes keep turning out to matter, raise it.
+
+```json
+"visuals": {
+  "autocapture": {
+    "dir": "~/Pictures/plaud-autocapture",
+    "interval_s": 3,
+    "change": 0.10,
+    "max_hours": 3,
+    "retention_days": 14,
+    "max_captions": 30,
+    "deixis": []
+  }
+}
+```
+
+`change` is the fraction of settled thumbnail cells that must differ for a new scene; `deixis`
+adds pointing words (lowercase, without diacritics) to the built-in Czech and English list.
+
+**Testing phase: raw frames.** Until `keep_raw_until` (default `2026-10-28`), every sampled
+frame is also kept in `<session>/raw/` (roughly 0.5 GB per meeting hour with two displays).
+That makes detection replayable: re-run it with other thresholds and compare what it
+would have kept, without needing the meeting again.
+
+```bash
+python3 autocapture.py replay 2026-10-21_140212 --set change=0.04
+```
+
+The replay goes to `<session>/replay/`; the original capture is untouched.
+
+*Calibration note.* The first version compared 32×20 thumbnails. Measured on real frames,
+replacing a whole page of text in the same layout registered as **0.000** change — text
+averages to the same grey — so a customer list, its detail page and highlighted rows all
+looked like one screen. At 96×60 those register at 4–8%.
+
 ---
 
 ## State & incremental sync

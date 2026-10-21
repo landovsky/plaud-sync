@@ -31,6 +31,13 @@
     ],
     "tail_minutes": 30,
     "max_width": 1600,
-    "adb": "adb"
+    "adb": "adb",
+    "autocapture": {
+      "dir": "~/Pictures/plaud-autocapture",
+      "interval_s": 3,
+      "max_hours": 3,
+      "retention_days": 14,
+      "max_captions": 30
+    }
   }
 }

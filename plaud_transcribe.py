@@ -849,7 +849,7 @@ def write_wispr_summary(wispr_info, recording_meta, output_dir, config):
 
 # --- Visual enrichment ---
 
-def prepare_visuals(recordings, config, work_dir, step_label=""):
+def prepare_visuals(recordings, config, work_dir, step_label="", transcript=None):
     """Collect, stage and caption images captured while the recording ran.
 
     Runs before summarization because the captions feed it, but the output
@@ -859,7 +859,7 @@ def prepare_visuals(recordings, config, work_dir, step_label=""):
     if not visuals.enabled(config):
         return [], ""
     try:
-        records = visuals.collect(recordings, config, work_dir / "phone")
+        records = visuals.collect(recordings, config, work_dir / "phone", transcript)
     except Exception as e:  # never let an image break a transcript
         print(f"  Warning: visual collection failed: {e}", file=sys.stderr)
         return [], ""
@@ -990,7 +990,8 @@ def process_recording(recording, token, config, folders, projects, state, langua
             transcript_path.write_text(raw_text, encoding="utf-8")
 
     # 2b. Visual enrichment (opt-in): images captured while the recording ran.
-    visual_records, visual_ctx = prepare_visuals([recording], config, work_dir)
+    visual_records, visual_ctx = prepare_visuals([recording], config, work_dir,
+                                                 transcript=raw_text)
 
     # 3. Classify & summarize via Claude
     print(f"  [{nsteps - 1}/{nsteps}] Classifying & summarizing via Claude...", end=" ", flush=True)
@@ -1170,7 +1171,8 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     step += 1
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
     # Visual enrichment (opt-in) across every part of the merged session.
-    visual_records, visual_ctx = prepare_visuals(recordings, config, merged_work_dir)
+    visual_records, visual_ctx = prepare_visuals(recordings, config, merged_work_dir,
+                                                 transcript=combined_transcript)
     summarize_input = (f"{combined_transcript}\n\n{visual_ctx}" if visual_ctx
                        else combined_transcript)
 
