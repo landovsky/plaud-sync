@@ -435,6 +435,14 @@ continuously during a meeting, and keeps the cost bounded with one filter at eac
   the visual context get that line, so "staging vs production" or "which order" doesn't
   depend on what is legible in the pixels. Reading Chrome's tab asks macOS for **Automation**
   permission once; `"source_urls": false` skips it, `"source": false` turns this off.
+- **Private screens are never kept.** A display whose front window is a bank or payment
+  site, a sign-in page (`private_hosts`, any subdomain), a password manager or chat app
+  (`private_apps`), a Chrome incognito window, or has a title with *internet banking*,
+  *heslo*, *password*… (`private_words`) is not sampled: no raw frame, no scene, only a bare
+  `private` event in the timeline, which ends that display's scene. Lists set in config are
+  added to the built-in ones; `"private": false` turns this off. It is a heuristic: only the
+  front window per display is judged, URLs come only from Chrome (other browsers fall back
+  to the window title), and when the window can't be looked up the screen is captured.
 
 ```bash
 python3 autocapture.py watch          # capture while a Wispr Flow meeting is recording

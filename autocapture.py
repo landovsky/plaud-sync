@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -73,7 +74,27 @@ DEFAULTS = {
     # and for Chrome the tab title and URL (asks macOS for Automation once).
     "source": True,
     "source_urls": True,
+    # Screens that must never be kept: a display showing one is not sampled at
+    # all (no raw frame, no scene), only a bare `private` event is logged. Judged
+    # from the source above, so only the front window per display counts, and URLs
+    # only from Chrome. Config lists add to these, never replace them.
+    "private": True,
+    "private_hosts": [  # the host itself or any subdomain
+        "fio.cz", "airbank.cz", "csob.cz", "kb.cz", "csas.cz", "moneta.cz", "rb.cz",
+        "unicreditbank.cz", "mbank.cz", "creditas.cz", "revolut.com", "wise.com",
+        "paypal.com", "accounts.google.com", "login.microsoftonline.com",
+        "appleid.apple.com", "identita.gov.cz", "mojedatovaschranka.cz",
+        "1password.com", "bitwarden.com",
+    ],
+    "private_apps": [
+        "1Password", "1Password 7", "Bitwarden", "Keychain Access", "Klíčenka", "Passwords",
+        "Hesla", "Messages", "Zprávy", "WhatsApp", "Signal", "Telegram",
+    ],
+    "private_words": [  # in a window or tab title, diacritics-free lowercase
+        "internet banking", "internetove bankovnictvi", "online banking", "password", "heslo",
+    ],
 }
+PRIVATE_LISTS = ("private_hosts", "private_apps", "private_words")
 # 96x60, not smaller: at 32x20 a whole new page of text in the same layout
 # measured 0.000 change — text averages to the same grey. At 96x60 it is ~5%,
 # highlighted rows ~4%. Calibrated on real frames, see _compare.
@@ -99,7 +120,10 @@ DEIXIS = [
 
 def settings(config):
     s = dict(DEFAULTS)
-    s.update(((config or {}).get("visuals") or {}).get("autocapture") or {})
+    own = ((config or {}).get("visuals") or {}).get("autocapture") or {}
+    s.update(own)
+    for k in PRIVATE_LISTS:  # adding a site must not silently drop the banks
+        s[k] = DEFAULTS[k] + [x for x in own.get(k) or [] if x not in DEFAULTS[k]]
     return s
 
 
@@ -399,6 +423,13 @@ class SceneTracker:
         for d in self.displays.values():
             d["scene"] = None
 
+    def forget(self, idx):
+        """After a private screen: whatever comes next on this display is logged
+        afresh, even the screen that was there before."""
+        d = self.displays.get(idx)
+        if d:
+            d.update(scene=None, prev=None, since=None)
+
     def observe(self, idx, sig, t0, where=None):
         """Returns None, or (event_t, scene_name, is_new).
 
@@ -448,6 +479,21 @@ def _shrink(src, dest, width, quality=None):
         shutil.copy2(src, dest)
 
 
+def _private(src, s):
+    """Whether a display's front window is one that must not be captured. An
+    unknown source is not private: failing closed would lose every meeting the
+    moment the window lookup breaks."""
+    if not src:
+        return False
+    if src.get("app") in s["private_apps"] or src.get("tab") == "(incognito)":
+        return True
+    host = (urllib.parse.urlsplit(src.get("url") or "").hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in s["private_hosts"]):
+        return True
+    title = _norm(f"{src.get('window') or ''} {src.get('tab') or ''}")
+    return any(w in title for w in s["private_words"])
+
+
 def capture(config, should_continue, reason):
     """Capture until should_continue() is false or max_hours passes.
 
@@ -476,6 +522,7 @@ def capture(config, should_continue, reason):
     focus = None
     error_notified = False
     blind, blind_checked, blind_notified = None, 0.0, 0.0  # None: first check always logs
+    private = set()  # displays showing a private screen right now
     stop_reason = "stopped"
     try:
         while True:
@@ -534,13 +581,24 @@ def capture(config, should_continue, reason):
             sources = {}  # looked up once per sample, only when a display has a scene
 
             def source_of(idx):
-                if not s["source"]:
+                if not (s["source"] or s["private"]):
                     return None
                 if "front" not in sources:
                     sources.update(_sources(s["source_urls"]) or {"front": None})
                 return (sources.get("displays") or {}).get(str(idx))
 
             for idx, path in shots:
+                if s["private"] and _private(source_of(idx), s):
+                    path.unlink(missing_ok=True)
+                    if idx not in private:
+                        private.add(idx)
+                        _event(timeline, t=t0, display=idx, event="private")
+                        _log(f"display {idx}: private screen, not capturing")
+                        tracker.forget(idx)
+                    continue
+                if idx in private:
+                    private.discard(idx)
+                    _log(f"display {idx}: capturing again")
                 if raw_dir:
                     _shrink(path, raw_dir / f"{t0:.1f}_d{idx}.jpg", width, quality=70)
                 sig = _thumb(path, tmp)
@@ -555,7 +613,7 @@ def capture(config, should_continue, reason):
                     if tracker.saved == 1:
                         notify("Autocapture working", "First scene saved.")
                 _event(timeline, t=t_event, display=idx, scene=name)
-                src = source_of(idx)
+                src = source_of(idx) if s["source"] else None
                 if src:
                     _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
 
@@ -598,10 +656,13 @@ def replay(session, overrides, config):
         if "scene" not in e:  # keep start/stop/lock/focus as captured
             events.append(e)
     lock_times = sorted(e["t"] for e in events if e.get("event") == "lock")
+    privates = sorted((e["t"], e["display"]) for e in events if e.get("event") == "private")
     for t0 in sorted(frames):
         while lock_times and lock_times[0] <= t0:
             lock_times.pop(0)
             tracker.reset()
+        while privates and privates[0][0] <= t0:
+            tracker.forget(privates.pop(0)[1])
         for idx, p in sorted(frames[t0]):
             sig = _thumb(p, tmp)
             hit = sig and tracker.observe(idx, sig, t0)
@@ -736,9 +797,10 @@ def _intervals(root, lo, hi):
     """([(display, t0, t1, path, source)], [(t, display)]) — when each scene was on
     screen, and which display had the mouse, from every session timeline
     overlapping [lo, hi] (epoch seconds). Lock and stop end every display's
-    scene: capture off means nothing is known to be on screen. A source event
-    belongs to the scene that started on its display just before it (a replay
-    with other thresholds can move scene starts, so only within a few seconds)."""
+    scene: capture off means nothing is known to be on screen; a private screen
+    ends its own display's. A source event belongs to the scene that started on
+    its display just before it (a replay with other thresholds can move scene
+    starts, so only within a few seconds)."""
     out, focus = [], []
     if not root.is_dir():
         return out, focus
@@ -774,6 +836,10 @@ def _intervals(root, lo, hi):
                 c = cur.get(e["display"])
                 if c and 0 <= t - c[0] <= 6:
                     c[2] = e["source"]
+            elif e.get("event") == "private":
+                prev = cur.pop(e.get("display"), None)
+                if prev:
+                    out.append((e["display"], prev[0], t, prev[1], prev[2]))
             elif e.get("event") in ("lock", "stop", "start", "blind"):
                 for disp, (t0, p, src) in cur.items():
                     out.append((disp, t0, t, p, src))
