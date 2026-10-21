@@ -429,6 +429,12 @@ continuously during a meeting, and keeps the cost bounded with one filter at eac
   *at a scene* is the signal. At most `max_captions` scenes survive, ranked by how often —
   and how soon after appearing — they were pointed at. A deliberate screenshot within
   `manual_gap_s` of a scene replaces it.
+- **Each scene remembers where it came from.** When a scene is saved, the app and window in
+  front on that display are logged with it, and for Chrome the tab title and URL (query and
+  fragment dropped — that's where tokens live; incognito tabs log no URL). The caption step and
+  the visual context get that line, so "staging vs production" or "which order" doesn't
+  depend on what is legible in the pixels. Reading Chrome's tab asks macOS for **Automation**
+  permission once; `"source_urls": false` skips it, `"source": false` turns this off.
 
 ```bash
 python3 autocapture.py watch          # capture while a Wispr Flow meeting is recording
@@ -438,20 +444,28 @@ python3 autocapture.py status
 python3 autocapture.py stop
 ```
 
-A macOS notification says when capture turns **on**, when the **first scene is saved** (proof
-that Screen Recording permission works — without it you get a "no frames" notification
-instead), and when it turns **off**.
+A macOS notification says when capture turns **on**, when the **first scene is saved**, and
+when it turns **off**. A saved scene is *not* proof that Screen Recording works: without the
+permission, `screencapture` still succeeds and returns only the wallpaper (a whole two-hour
+meeting was lost that way). So capture asks macOS directly (`CGPreflightScreenCaptureAccess`)
+at start and every minute; while the answer is no it sends an **"Autocapture is blind"**
+notification every 10 minutes and writes `blind` / `sight` events to the timeline, and scene
+selection ignores everything captured blind.
 
 Screen Recording permission goes to whichever *app* macOS holds responsible for the process.
 From a terminal that is the terminal app; under tmux it has no name, and the prompt says
 **"unknown"** — allowing that grants the screen to everything in tmux. Instead, build a
-dedicated app once and let `start` launch through it, so the prompt names **Plaud
-Autocapture** and the grant covers only it:
+dedicated app once and let `start` launch through it:
 
 ```bash
 python3 autocapture.py install-app    # ~/Applications/Plaud Autocapture.app
 python3 autocapture.py start --watch  # launches via the app when it exists
 ```
+
+Known gap: the app's launcher is a shell script that runs Homebrew Python as a child, and
+macOS still charges the grant to Python — the prompt says **"python3.15"**, and allowing it
+lets any script run by that interpreter record the screen. A compiled launcher that stays the
+responsible process would fix this; until then the Python grant is what makes capture work.
 
 Frames go to `~/Pictures/plaud-autocapture/<session>/` with a `timeline.jsonl` of which scene
 was on which display when — never to `~/Desktop`, which visuals treats as deliberate

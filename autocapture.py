@@ -69,6 +69,10 @@ DEFAULTS = {
     "fresh_s": 60,            # pointing within this long after a screen change is the strongest signal
     "wispr_poll_s": 10,
     "deixis": [],             # extra pointing words/phrases, diacritics-free lowercase
+    # Where each scene came from: the app and window in front on that display,
+    # and for Chrome the tab title and URL (asks macOS for Automation once).
+    "source": True,
+    "source_urls": True,
 }
 # 96x60, not smaller: at 32x20 a whole new page of text in the same layout
 # measured 0.000 change — text averages to the same grey. At 96x60 it is ~5%,
@@ -228,6 +232,39 @@ for (let i = 0; i < a.count; i++) { const d = a.objectAtIndex(i);
 named + "/" + total"""
 
 
+# Per display (numbered like screencapture), the frontmost normal window whose
+# centre is on it — skipping small floating ones (a recorder widget over a
+# browser) for the first window that covers 40% of the display. CG window
+# bounds are top-left based, NSScreen frames bottom-left based. Chrome tabs are matched to windows by bounds, because
+# Chrome reports a window's custom name, not its tab, as the title.
+_SOURCES_JXA = """ObjC.import("CoreGraphics"); ObjC.import("AppKit");
+const urls = %s, scr = $.NSScreen.screens, h0 = scr.objectAtIndex(0).frame.size.height;
+const out = {front: $.NSWorkspace.sharedWorkspace.frontmostApplication.localizedName.js, displays: {}};
+const wins = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1 | 16, 0));
+for (let i = 0; i < wins.count; i++) { const w = wins.objectAtIndex(i);
+  if (w.objectForKey("kCGWindowLayer").js !== 0) continue;
+  const b = w.objectForKey("kCGWindowBounds"), x = b.objectForKey("X").js, y = b.objectForKey("Y").js,
+        bw = b.objectForKey("Width").js, bh = b.objectForKey("Height").js;
+  if (bw < 100 || bh < 100) continue;
+  const cx = x + bw / 2, cy = y + bh / 2;
+  for (let k = 0; k < scr.count; k++) { const f = scr.objectAtIndex(k).frame, top = h0 - f.origin.y - f.size.height;
+    const d = out.displays[k + 1];
+    if (cx >= f.origin.x && cx < f.origin.x + f.size.width && cy >= top && cy < top + f.size.height
+        && (!d || (d.small && bw * bh >= 0.4 * f.size.width * f.size.height))) {
+      const n = w.objectForKey("kCGWindowName");
+      out.displays[k + 1] = {app: w.objectForKey("kCGWindowOwnerName").js, window: n.js || "", b: [x, y, bw, bh],
+                             small: bw * bh < 0.4 * f.size.width * f.size.height}; } } }
+if (urls && Object.values(out.displays).some(d => d.app === "Google Chrome")) {
+  try { const cw = Application("Google Chrome").windows();
+    for (const d of Object.values(out.displays)) { if (d.app !== "Google Chrome") continue;
+      for (const w of cw) { const r = w.bounds();
+        if (Math.abs(r.x - d.b[0]) > 4 || Math.abs(r.y - d.b[1]) > 4 || Math.abs(r.width - d.b[2]) > 4) continue;
+        if (w.mode() === "incognito") { d.tab = "(incognito)"; break; }
+        const t = w.activeTab(); d.tab = t.title(); d.url = t.url(); break; } } } catch (e) {} }
+for (const d of Object.values(out.displays)) { delete d.b; delete d.small; }
+JSON.stringify(out)"""
+
+
 def _jxa(script):
     try:
         return subprocess.run(["osascript", "-l", "JavaScript", "-e", script], capture_output=True,
@@ -244,10 +281,34 @@ def _cursor_display():
     return int(out) if out.isdigit() and int(out) > 0 else None
 
 
+def _sources(urls=True):
+    """{display: {app, window, tab?, url?}} for what is in front on each display,
+    plus the frontmost app under "front". {} when it can't tell. URLs lose their
+    query and fragment: those are where tokens and session ids live."""
+    try:
+        out = json.loads(_jxa(_SOURCES_JXA % ("true" if urls else "false")) or "{}")
+    except json.JSONDecodeError:
+        return {}
+    for d in out.get("displays", {}).values():
+        if d.get("url"):
+            d["url"] = re.split(r"[?#]", d["url"], maxsplit=1)[0]
+    return out
+
+
 def _permission_looks_missing():
-    """Without Screen Recording, macOS hides other apps' window titles — and
-    screencapture still succeeds, returning only the wallpaper. So a successful
-    capture proves nothing; this does. Advisory: None when it can't tell."""
+    """Without Screen Recording, screencapture still succeeds — returning only the
+    wallpaper — so a successful capture proves nothing. Ask macOS in-process
+    first: TCC charges the grant to this process (the prompt names Python), the
+    same one screencapture's frames are judged by. The window-title probe ran in
+    an osascript child and answered "fine" through a whole blind meeting, so it
+    is only the fallback. None when neither can tell."""
+    try:
+        import ctypes
+        cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        return not cg.CGPreflightScreenCaptureAccess()
+    except (OSError, AttributeError):
+        pass
     m = re.fullmatch(r"(\d+)/(\d+)", _jxa(_WINDOWS_JXA))
     if not m or int(m.group(2)) == 0:
         return None
@@ -372,17 +433,12 @@ def capture(config, should_continue, reason):
     _log(f"capture started ({reason}) -> {session}" + (f"; pruned {pruned} old session(s)" if pruned else ""))
     notify("Autocapture ON", f"Capturing the screen ({reason}). Auto-stops after {s['max_hours']}h.",
            sound="Glass")
-    if _permission_looks_missing():
-        _log("window titles hidden — Screen Recording permission looks missing")
-        notify("Autocapture: no permission?",
-               "Other apps' windows are hidden from it, so frames will show only the wallpaper. "
-               "Allow Plaud Autocapture in Privacy & Security → Screen Recording.", sound="Basso")
-
     tracker = SceneTracker(s)
     started = time.time()
     locked = False
     focus = None
     error_notified = False
+    blind, blind_checked, blind_notified = False, 0.0, 0.0
     stop_reason = "stopped"
     try:
         while True:
@@ -402,6 +458,24 @@ def capture(config, should_continue, reason):
                 continue
             locked = False
 
+            # Re-checked every minute, not just at start: a 2-hour meeting was
+            # once lost to wallpaper because the grant went away and nothing
+            # said so. Blind stretches are marked so select() skips their scenes.
+            if t0 - blind_checked >= 60:
+                blind_checked = t0
+                missing = _permission_looks_missing() is True
+                if missing != blind:
+                    blind = missing
+                    _event(timeline, t=t0, event="blind" if blind else "sight")
+                    _log("Screen Recording permission " + ("missing — frames show only the wallpaper"
+                                                           if blind else "is back"))
+                if blind and t0 - blind_notified >= 600:
+                    blind_notified = t0
+                    notify("Autocapture is blind",
+                           "No Screen Recording permission: frames show only the wallpaper. "
+                           "Allow it in Privacy & Security → Screen & System Audio Recording, "
+                           "then restart autocapture.", sound="Basso")
+
             shots, err = _grab(tmp)
             if err:
                 _log(f"capture error: {err}")
@@ -420,6 +494,7 @@ def capture(config, should_continue, reason):
                 _event(timeline, t=t0, focus=cur)
                 focus = cur
 
+            sources = None  # looked up once per sample, only when a display has a scene
             for idx, path in shots:
                 if raw_dir:
                     _shrink(path, raw_dir / f"{t0:.1f}_d{idx}.jpg", width, quality=70)
@@ -435,6 +510,12 @@ def capture(config, should_continue, reason):
                     if tracker.saved == 1:
                         notify("Autocapture working", "First scene saved.")
                 _event(timeline, t=t_event, display=idx, scene=name)
+                if s["source"]:
+                    if sources is None:
+                        sources = _sources(s["source_urls"])
+                    src = sources.get("displays", {}).get(str(idx))
+                    if src:
+                        _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
 
             _write_status(state="capturing", session=str(session), reason=reason, started=started,
                           saved=tracker.saved, revisits=tracker.revisits, displays=len(shots),
@@ -610,10 +691,12 @@ def _turns(transcript):
 
 
 def _intervals(root, lo, hi):
-    """([(display, t0, t1, path)], [(t, display)]) — when each scene was on
+    """([(display, t0, t1, path, source)], [(t, display)]) — when each scene was on
     screen, and which display had the mouse, from every session timeline
     overlapping [lo, hi] (epoch seconds). Lock and stop end every display's
-    scene: capture off means nothing is known to be on screen."""
+    scene: capture off means nothing is known to be on screen. A source event
+    belongs to the scene that started on its display just before it (a replay
+    with other thresholds can move scene starts, so only within a few seconds)."""
     out, focus = [], []
     if not root.is_dir():
         return out, focus
@@ -632,22 +715,30 @@ def _intervals(root, lo, hi):
         if not events or events[0].get("t", 0) > hi:
             continue
         cur = {}
+        blind = False  # without Screen Recording every scene is the wallpaper
         for e in events:
             t = e.get("t", 0)
+            if e.get("event") in ("blind", "sight"):
+                blind = e["event"] == "blind"
             if "focus" in e:
                 focus.append((t, e["focus"]))
             elif "scene" in e:
                 prev = cur.pop(e["display"], None)
                 if prev:
-                    out.append((e["display"], prev[0], t, prev[1]))
-                cur[e["display"]] = (t, sess / e["scene"])
-            elif e.get("event") in ("lock", "stop", "start"):
-                for disp, (t0, p) in cur.items():
-                    out.append((disp, t0, t, p))
+                    out.append((e["display"], prev[0], t, prev[1], prev[2]))
+                if not blind:
+                    cur[e["display"]] = [t, sess / e["scene"], None]
+            elif "source" in e:
+                c = cur.get(e["display"])
+                if c and 0 <= t - c[0] <= 6:
+                    c[2] = e["source"]
+            elif e.get("event") in ("lock", "stop", "start", "blind"):
+                for disp, (t0, p, src) in cur.items():
+                    out.append((disp, t0, t, p, src))
                 cur = {}
         end = tl.stat().st_mtime  # a crashed session has no stop event
-        for disp, (t0, p) in cur.items():
-            out.append((disp, t0, max(end, t0), p))
+        for disp, (t0, p, src) in cur.items():
+            out.append((disp, t0, max(end, t0), p, src))
     focus.sort()
     return [iv for iv in out if iv[2] >= lo and iv[1] <= hi and iv[3].exists()], focus
 
@@ -715,11 +806,12 @@ def select(config, transcript, wins, manual_times, tz):
             # one that changed most recently.
             at = next((d for t, d in reversed(focus) if t <= tp), None)
             on_focus = [iv for iv in live if iv[0] == at]
-            disp, t0, _, path = max(on_focus or live, key=lambda iv: iv[1])
-            hit.setdefault(str(path), (disp, t0, path, tp))
-        for key, (disp, t0, path, tp) in hit.items():  # one hit per scene per turn
+            disp, t0, _, path, src = max(on_focus or live, key=lambda iv: iv[1])
+            hit.setdefault(str(path), (disp, t0, path, tp, src))
+        for key, (disp, t0, path, tp, src) in hit.items():  # one hit per scene per turn
             sc = scenes.setdefault(key, {"path": path, "display": disp, "hits": 0, "fresh": 0,
-                                         "part": part, "offset": float(off), "wall": tp})
+                                         "part": part, "offset": float(off), "wall": tp,
+                                         "origin": src})
             sc["hits"] += 1
             if tp - t0 <= s["fresh_s"]:
                 sc["fresh"] += 1
@@ -734,7 +826,8 @@ def select(config, transcript, wins, manual_times, tz):
         c["fate"] = "selected" if i < s["max_captions"] else "over-cap"
 
     records = [{"path": c["path"], "part": c["part"], "offset": c["offset"], "source": "auto",
-                "klass": "anchored", "taken": datetime.fromtimestamp(c["wall"], tz)}
+                "klass": "anchored", "taken": datetime.fromtimestamp(c["wall"], tz),
+                "origin": c["origin"]}
                for c in cands if c["fate"] == "selected"]
     report = {
         "scenes_on_screen": len({str(iv[3]) for iv in intervals}),
@@ -749,7 +842,7 @@ def select(config, transcript, wins, manual_times, tz):
                                "display": c["display"], "part": c["part"],
                                "at": f"{int(c['offset']) // 60}:{int(c['offset']) % 60:02d}",
                                "hits": c["hits"], "fresh": c["fresh"], "score": c["score"],
-                               "fate": c["fate"]} for c in cands), key=lambda c: c["score"], reverse=True),
+                               "fate": c["fate"], "origin": c["origin"]} for c in cands), key=lambda c: c["score"], reverse=True),
     }
     return records, report
 

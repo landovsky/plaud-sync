@@ -398,6 +398,12 @@ def caption(records, out_dir, config):
     )
     for r in records:
         name = r["staged"]
+        prompt = prompt_tpl.format(name=name)
+        if _origin(r):
+            # Where it was taken resolves what the pixels can't: staging vs
+            # production, which app, which record the URL names.
+            prompt += (f" Context (from the system, not the image): it was on screen in {_origin(r)}. "
+                       "Mention the app/page if it helps identify the screen.")
         # Keyed by source as well: the staged name is a position, and a later
         # run can put a different image at the same position.
         key = f"{name}|{Path(r['path']).name}"
@@ -407,7 +413,7 @@ def caption(records, out_dir, config):
         try:
             res = subprocess.run(
                 ["claude", "-p", "--output-format", "text", "--allowedTools", "Read"],
-                input=prompt_tpl.format(name=name), capture_output=True, text=True,
+                input=prompt, capture_output=True, text=True,
                 timeout=180, cwd=str(out_dir),
             )
         except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
@@ -432,6 +438,14 @@ def _where(r):
     return {"phone": "mobil", "auto": "obrazovka, auto"}.get(r["source"], "obrazovka")
 
 
+def _origin(r):
+    """'Google Chrome · Export ceníků · https://admin…/exports' for an
+    autocaptured scene that knows where it came from, else ''."""
+    o = r.get("origin") or {}
+    parts = [o.get("app"), o.get("tab") or o.get("window"), o.get("url")]
+    return " · ".join(p for p in parts if p)
+
+
 def _stamp(seconds):
     return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
 
@@ -452,7 +466,8 @@ def visual_context(records, config):
         for r in anchored:
             where = _where(r)
             part = f"část {r['part']}, " if r["part"] else ""
-            out.append(f"- **[{part}{_stamp(r['offset'])}] {where}** — {r['caption']}")
+            origin = f" ({_origin(r)})" if _origin(r) else ""
+            out.append(f"- **[{part}{_stamp(r['offset'])}] {where}**{origin} — {r['caption']}")
         out.append("")
     if assoc:
         out.append("## Bez přesného zařazení v čase")
