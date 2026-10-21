@@ -295,6 +295,15 @@ def _sources(urls=True):
     return out
 
 
+def _page(src):
+    """What page a source shows, for telling look-alike screens apart: the URL
+    when there is one (a Chrome window's title is its custom name, the same for
+    every tab), else app + window title. None when unknown."""
+    if not src:
+        return None
+    return f"{src.get('app')}|{src.get('url') or src.get('tab') or src.get('window')}"
+
+
 def _permission_looks_missing():
     """Without Screen Recording, screencapture still succeeds — returning only the
     wallpaper — so a successful capture proves nothing. Ask macOS in-process
@@ -369,8 +378,13 @@ class SceneTracker:
         for d in self.displays.values():
             d["scene"] = None
 
-    def observe(self, idx, sig, t0):
-        """Returns None, or (event_t, scene_name, is_new)."""
+    def observe(self, idx, sig, t0, where=None):
+        """Returns None, or (event_t, scene_name, is_new).
+
+        where() — called only when a scene is about to be logged — names the
+        page on screen (app + URL, or app + window). Two orders' ZDV tabs share
+        a layout and differ in a line of small text, which pixels alone matched
+        as a revisit; a different page name rules that out."""
         s = self.s
         d = self.displays.setdefault(idx, {"scene": None, "prev": None, "prev_t": t0,
                                            "since": None, "library": []})
@@ -383,13 +397,15 @@ class SceneTracker:
             # Strict on purpose: a false revisit loses a screen for good (two
             # white pages with a sidebar once matched at a loose threshold), a
             # missed one only costs a duplicate file.
-            name = next((n for lib_sig, n in d["library"]
-                         if _compare(sig, d["prev"], lib_sig, s["cell_delta"])[1] < s["revisit"]), None)
+            ident = where() if where else None
+            name = next((n for lib_sig, n, lib_ident in d["library"]
+                         if (ident is None or lib_ident is None or ident == lib_ident)
+                         and _compare(sig, d["prev"], lib_sig, s["cell_delta"])[1] < s["revisit"]), None)
             new = name is None
             if new:
                 self.saved += 1
                 name = f"scene_{self.saved:04d}_d{idx}.jpg"
-                d["library"] = (d["library"] + [(sig, name)])[-LIBRARY_SIZE:]
+                d["library"] = (d["library"] + [(sig, name, ident)])[-LIBRARY_SIZE:]
             else:
                 self.revisits += 1
             # Stamp the scene with when it first appeared, not when it was confirmed.
@@ -438,7 +454,7 @@ def capture(config, should_continue, reason):
     locked = False
     focus = None
     error_notified = False
-    blind, blind_checked, blind_notified = False, 0.0, 0.0
+    blind, blind_checked, blind_notified = None, 0.0, 0.0  # None: first check always logs
     stop_reason = "stopped"
     try:
         while True:
@@ -468,7 +484,7 @@ def capture(config, should_continue, reason):
                     blind = missing
                     _event(timeline, t=t0, event="blind" if blind else "sight")
                     _log("Screen Recording permission " + ("missing — frames show only the wallpaper"
-                                                           if blind else "is back"))
+                                                           if blind else "OK"))
                 if blind and t0 - blind_notified >= 600:
                     blind_notified = t0
                     notify("Autocapture is blind",
@@ -494,14 +510,22 @@ def capture(config, should_continue, reason):
                 _event(timeline, t=t0, focus=cur)
                 focus = cur
 
-            sources = None  # looked up once per sample, only when a display has a scene
+            sources = {}  # looked up once per sample, only when a display has a scene
+
+            def source_of(idx):
+                if not s["source"]:
+                    return None
+                if "front" not in sources:
+                    sources.update(_sources(s["source_urls"]) or {"front": None})
+                return (sources.get("displays") or {}).get(str(idx))
+
             for idx, path in shots:
                 if raw_dir:
                     _shrink(path, raw_dir / f"{t0:.1f}_d{idx}.jpg", width, quality=70)
                 sig = _thumb(path, tmp)
                 if sig is None:
                     continue
-                hit = tracker.observe(idx, sig, t0)
+                hit = tracker.observe(idx, sig, t0, where=lambda: _page(source_of(idx)))
                 if not hit:
                     continue
                 t_event, name, new = hit
@@ -510,12 +534,9 @@ def capture(config, should_continue, reason):
                     if tracker.saved == 1:
                         notify("Autocapture working", "First scene saved.")
                 _event(timeline, t=t_event, display=idx, scene=name)
-                if s["source"]:
-                    if sources is None:
-                        sources = _sources(s["source_urls"])
-                    src = sources.get("displays", {}).get(str(idx))
-                    if src:
-                        _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
+                src = source_of(idx)
+                if src:
+                    _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
 
             _write_status(state="capturing", session=str(session), reason=reason, started=started,
                           saved=tracker.saved, revisits=tracker.revisits, displays=len(shots),
