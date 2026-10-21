@@ -858,15 +858,19 @@ def prepare_visuals(recordings, config, work_dir, step_label="", transcript=None
     """
     if not visuals.enabled(config):
         return [], ""
+    # Its own step: captioning is one vision call per image and can take minutes,
+    # which must not look like the transcript step hanging.
+    print(f"  {step_label} Visual context (screenshots, phone, autocapture)...")
     try:
         records = visuals.collect(recordings, config, work_dir / "phone", transcript)
     except Exception as e:  # never let an image break a transcript
         print(f"  Warning: visual collection failed: {e}", file=sys.stderr)
         return [], ""
     if not records:
+        print("  No images for this recording.")
         return [], ""
     anchored = sum(1 for r in records if r["klass"] == "anchored")
-    print(f"  {step_label}Visuals: {len(records)} image(s) "
+    print(f"  Captioning {len(records)} image(s) via Claude "
           f"({anchored} anchored, {len(records) - anchored} associated)...", end=" ", flush=True)
     records = visuals.stage(records, work_dir, config)
     records = visuals.caption(records, work_dir, config)
@@ -955,7 +959,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
     # Steps 1-2: obtain the diarized transcript. Plaud downloads audio and
     # transcribes it via ElevenLabs; Wispr already produced a local transcript,
     # so we just read it (no audio download, no re-transcription cost).
-    nsteps = 3 if source == "wispr" else 4
+    nsteps = (3 if source == "wispr" else 4) + (1 if visuals.enabled(config) else 0)
     if source == "wispr":
         print(f"  [1/{nsteps}] Reading Wispr Flow transcript...", end=" ", flush=True)
         raw_text = wispr_raw_text_cached(recording, work_dir)
@@ -991,6 +995,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
 
     # 2b. Visual enrichment (opt-in): images captured while the recording ran.
     visual_records, visual_ctx = prepare_visuals([recording], config, work_dir,
+                                                 f"[{nsteps - 2}/{nsteps}]",
                                                  transcript=raw_text)
 
     # 3. Classify & summarize via Claude
@@ -1097,7 +1102,8 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     merged_work_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_parts = []
-    step_total = len(recordings) * 2 + 2  # download + transcribe per recording, then classify + write
+    # download + transcribe per recording, then visuals (opt-in) + classify + write
+    step_total = len(recordings) * 2 + 2 + (1 if visuals.enabled(config) else 0)
     step = 0
 
     for i, rec in enumerate(recordings):
@@ -1167,12 +1173,16 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
         "part_count": len(recordings),
     }
 
+    # Visual enrichment (opt-in) across every part of the merged session.
+    if visuals.enabled(config):
+        step += 1
+    visual_records, visual_ctx = prepare_visuals(recordings, config, merged_work_dir,
+                                                 f"[{step}/{step_total}]",
+                                                 transcript=combined_transcript)
+
     # Classify & summarize
     step += 1
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
-    # Visual enrichment (opt-in) across every part of the merged session.
-    visual_records, visual_ctx = prepare_visuals(recordings, config, merged_work_dir,
-                                                 transcript=combined_transcript)
     summarize_input = (f"{combined_transcript}\n\n{visual_ctx}" if visual_ctx
                        else combined_transcript)
 
