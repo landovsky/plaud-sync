@@ -304,21 +304,42 @@ def _page(src):
     return f"{src.get('app')}|{src.get('url') or src.get('tab') or src.get('window')}"
 
 
-def _permission_looks_missing():
-    """Without Screen Recording, screencapture still succeeds — returning only the
-    wallpaper — so a successful capture proves nothing. Ask macOS in-process
-    first: TCC charges the grant to this process (the prompt names Python), the
-    same one screencapture's frames are judged by. The window-title probe ran in
-    an osascript child and answered "fine" through a whole blind meeting, so it
-    is only the fallback. None when neither can tell."""
+_PREFLIGHT_JXA = ('ObjC.import("CoreGraphics"); ObjC.bindFunction("CGPreflightScreenCaptureAccess", ["bool", []]); '
+                  '$.CGPreflightScreenCaptureAccess() ? "1" : "0"')
+
+
+def _permission_probes():
+    """Every way of asking, side by side — they have disagreed: in-process the
+    answer is Python.app's own grant, from a child process it is the app's."""
+    out = {}
     try:
         import ctypes
         cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
         cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-        return not cg.CGPreflightScreenCaptureAccess()
+        out["in_process"] = bool(cg.CGPreflightScreenCaptureAccess())
     except (OSError, AttributeError):
-        pass
+        out["in_process"] = None
+    j = _jxa(_PREFLIGHT_JXA)
+    out["child"] = {"1": True, "0": False}.get(j)
     m = re.fullmatch(r"(\d+)/(\d+)", _jxa(_WINDOWS_JXA))
+    out["window_titles"] = m.group(0) if m else None
+    return out
+
+
+def _permission_looks_missing():
+    """Without Screen Recording, screencapture still succeeds — returning only the
+    wallpaper — so a successful capture proves nothing; ask macOS instead.
+
+    Ask from a child process, as screencapture is one: macOS judges children by
+    the app that launched them, but asked in-process it answers for Homebrew's
+    Python.app, a bundle with its own (meant to be off) grant — which once
+    raised "blind" while frames were fine. The window-title probe answered
+    "fine" through a whole blind meeting, so it comes last. None: can't tell."""
+    p = _permission_probes()
+    for k in ("child", "in_process"):
+        if p[k] is not None:
+            return not p[k]
+    m = re.fullmatch(r"(\d+)/(\d+)", p["window_titles"] or "")
     if not m or int(m.group(2)) == 0:
         return None
     return int(m.group(1)) == 0
@@ -1007,6 +1028,8 @@ def main():
     sub.add_parser("stop", help="stop a background capture/watch")
     sub.add_parser("status", help="show what autocapture is doing")
     sub.add_parser("install-app", help="build ~/Applications/Plaud Autocapture.app (named permission prompt)")
+    ck = sub.add_parser("check", help="ask whether Screen Recording is granted, as capture would (via the app)")
+    ck.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
     rp = sub.add_parser("replay", help="re-run scene detection over a session's raw frames")
     rp.add_argument("session", help="session directory (or its name under the capture dir)")
     rp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -1034,6 +1057,22 @@ def main():
         print(f"started in the background — log: {LOG_FILE}")
     elif args.cmd == "install-app":
         install_app()
+    elif args.cmd == "check":
+        if args.here or not APP_PATH.exists():
+            _log(f"check ({'app' if args.here else 'terminal'}): " + json.dumps(_permission_probes()))
+            if args.here:
+                return
+        else:
+            mark = LOG_FILE.stat().st_size if LOG_FILE.exists() else 0
+            subprocess.run(["open", "-g", "-n", str(APP_PATH), "--args", "check", "--here"], check=True)
+            for _ in range(30):
+                time.sleep(0.5)
+                new = LOG_FILE.read_text()[mark:] if LOG_FILE.exists() else ""
+                if "check (app): " in new:
+                    break
+        line = next((l for l in reversed(LOG_FILE.read_text().splitlines()) if "check (" in l), None) \
+            if LOG_FILE.exists() else None
+        print(line or "no answer from the app")
     elif args.cmd == "replay":
         session = Path(args.session).expanduser()
         if not session.is_dir():

@@ -450,7 +450,13 @@ permission, `screencapture` still succeeds and returns only the wallpaper (a who
 meeting was lost that way). So capture asks macOS directly (`CGPreflightScreenCaptureAccess`)
 at start and every minute; while the answer is no it sends an **"Autocapture is blind"**
 notification every 10 minutes and writes `blind` / `sight` events to the timeline, and scene
-selection ignores everything captured blind.
+selection ignores everything captured blind. The question is asked from a child process,
+the same way `screencapture` runs: asked inside Python, macOS answers for Homebrew's
+Python.app rather than for the app below, and said "no" while frames were real.
+
+```bash
+python3 autocapture.py check   # asks through the app; prints each probe's answer
+```
 
 Screen Recording permission goes to whichever *app* macOS holds responsible for the process.
 From a terminal that is the terminal app; under tmux it has no name, and the prompt says
