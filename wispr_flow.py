@@ -12,7 +12,7 @@ Data layout (macOS):
         flow.sqlite                       # Meetings table (title, summary, speakerMap, ...)
         meetings/<uuid>/
             refined.ndjson                # cleaned diarized transcript (one JSON obj/line)
-            live.ndjson                   # real-time transcript (unused)
+            live.ndjson                   # real-time transcript (fills the unrefined tail)
             speakers.observations.ndjson  # speaker diarization observations (unused)
             upload.ogg                    # source audio (unused — we already have text)
 
@@ -22,6 +22,14 @@ Data layout (macOS):
 
 Speaker names come from the meeting's `speakerMap` JSON (numeric speaker id ->
 person -> display name); we resolve it into {speaker_id: name} up front.
+
+A recording that was stopped and resumed has several segments. Wispr often
+refines only the first one and never comes back for the rest (its
+`refinePipelineRanThroughStopSeq` lags `latestRecordingStopSeq`, though the
+counter itself isn't reliable), so `refined.ndjson` silently ends at the first
+stop. The rest exists only in `live.ndjson` (lines tagged `"segment": N` on a
+continuous `startRecordingMs` clock); we append every segment that starts after
+the last refined line, so nothing said after a restart is lost.
 
 Everything here is read-only and best-effort: the SQLite DB is opened `mode=ro`
 (safe alongside the running app's WAL), and any failure degrades to "no Wispr
@@ -142,6 +150,10 @@ def _refined_path(config, uuid):
     return wispr_dir(config) / "meetings" / uuid / "refined.ndjson"
 
 
+def _live_path(config, uuid):
+    return wispr_dir(config) / "meetings" / uuid / "live.ndjson"
+
+
 def _audio_path(config, uuid):
     p = wispr_dir(config) / "meetings" / uuid / "upload.ogg"
     return p if p.exists() else None
@@ -221,6 +233,7 @@ def list_meetings(config, days):
             "_wispr": {
                 "uuid": uuid,
                 "refined_path": str(refined),
+                "live_path": str(_live_path(config, uuid)),
                 "audio_path": str(_audio_path(config, uuid)) if _audio_path(config, uuid) else None,
                 "summary": row["summary"],
                 "notes": row["notes"],
@@ -283,4 +296,55 @@ def transcript_text(recording):
                 name = f"Speaker {sid}" if sid is not None else "Speaker"
             ts = obj.get("timestamp") or ""
             lines.append(f"[{ts}] {name}: {text}")
+    lines += _unrefined_live_lines(live_path=info.get("live_path"),
+                                   refined_through_secs=_last_timestamp_seconds(refined_path))
     return "\n\n".join(lines)
+
+
+def _format_ms(ms):
+    # Same uncapped-minutes clock as refined.ndjson ("97:57").
+    secs = int(ms) // 1000
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
+def _unrefined_live_lines(live_path, refined_through_secs):
+    """Live-transcript lines for the segments Wispr never refined: every segment
+    after the first whose first utterance starts after the last refined line.
+    The first segment is always refined (we only get here with a non-empty
+    refined.ndjson, and the live clock can run a few seconds off the refined
+    one), and a later refined segment has refined lines at or past its own
+    start, so this never repeats refined text.
+
+    Live speaker ids come from a separate, mic-level diarization and don't match
+    the refined ids, so they get their own `Live speaker N` label instead of
+    being passed off as a refined speaker.
+    """
+    if not live_path or not Path(live_path).exists():
+        return []
+    segments = {}
+    with open(live_path, encoding="utf-8") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            text = (obj.get("text") or "").strip()
+            start = obj.get("startRecordingMs")
+            if obj.get("segment") is None or start is None or not text:
+                continue
+            segments.setdefault(obj["segment"], []).append((start, obj, text))
+
+    lines = []
+    for seg in sorted(segments)[1:]:
+        utterances = sorted(segments[seg], key=lambda u: u[0])
+        if refined_through_secs is not None and utterances[0][0] // 1000 <= refined_through_secs:
+            continue  # refined already covers this segment
+        for start, obj, text in utterances:
+            spk = obj.get("speaker") or {}
+            sid = spk.get("id")
+            name = spk.get("name") or (f"Live speaker {sid}" if sid is not None else "Live speaker")
+            lines.append(f"[{_format_ms(start)}] {name}: {text}")
+    return lines
