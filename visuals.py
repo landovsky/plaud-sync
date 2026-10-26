@@ -232,18 +232,29 @@ def _await_phone(adb):
 
 
 def _pull_phone(config, lo, hi, staging):
-    """Copy phone images whose filename time falls in the window."""
+    """Copy phone images whose filename time falls in the window.
+
+    A re-run finds the photos an earlier run already pulled into `staging`. If the
+    phone isn't connected then, those copies are used instead of asking for it —
+    otherwise re-processing a meeting silently drops its phone photos (a 14.10
+    backfill lost the printed margin table that way).
+    """
     adb = adb_bin(config)
     if not phone_dirs(config):
         return []
+
+    import plaud_transcribe as pt
+    tz = pt.local_tz(config)
+    staged = _staged_phone(staging, lo, hi, tz)
+    if staged and not (shutil.which(adb) and _device_state(adb) == "ready"):
+        print(f"  Phone not connected — using {len(staged)} photo(s) pulled by an earlier run.")
+        return staged
+
     if not shutil.which(adb):
         print(f"  Note: '{adb}' not found — skipping phone photos", file=sys.stderr)
         return []
     if not _await_phone(adb):
         return []
-
-    import plaud_transcribe as pt
-    tz = pt.local_tz(config)
     pulled = []
     staging.mkdir(parents=True, exist_ok=True)
     for remote in phone_dirs(config):
@@ -275,6 +286,15 @@ def _pull_phone(config, lo, hi, staging):
     else:
         print("  No phone photos in the meeting window — you can unplug the phone now.")
     return pulled
+
+
+def _staged_phone(staging, lo, hi, tz):
+    staging = Path(staging)
+    if not staging.is_dir():
+        return []
+    return sorted(p for p in staging.iterdir()
+                  if p.suffix.lower() in IMAGE_SUFFIXES
+                  and (t := capture_time(p, tz)) and lo <= t <= hi)
 
 
 def collect(recordings, config, staging, transcript=None):
