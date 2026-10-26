@@ -33,6 +33,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEFAULT_SCREENSHOT_DIRS = ["~/Desktop"]
 DEFAULT_PHONE_DIRS = ["/sdcard/DCIM/Camera", "/sdcard/Pictures/Screenshots"]
@@ -400,6 +401,13 @@ def caption(records, out_dir, config):
     Captions rather than raw images are what reach the summarizer: it keeps the
     prompt small, and it makes what the model claimed to see an artifact the user
     can read and correct, instead of something buried inside a summary.
+
+    An autocaptured frame is often the scrolled-down rest of the frame before it
+    (a table whose query and period are only on the previous screen), so it is
+    captioned with the previous caption from the same window as context; read
+    alone, its numbers lose their scope. The same comparison lets the model drop
+    frames that add nothing (SAME), and error/blank pages (SKIP). Dropped frames
+    are removed from staging and from the returned records.
     """
     cache_path = out_dir / "captions.json"
     cache = {}
@@ -412,10 +420,28 @@ def caption(records, out_dir, config):
     prompt_tpl = (
         "Read the image file screenshots/{name} and describe it factually in Czech, "
         "in 1-3 sentences. Include any legible identifiers, numbers, names, screen or "
-        "column titles, and visible state (counts, filters, errors). Describe ONLY what "
-        "is legible in the image — do not infer intent or what was decided. "
+        "column titles, and visible state (counts, filters, errors). Keep any printed "
+        "sentence that qualifies numbers (period, scope, comparison) with those numbers. "
+        "Describe ONLY what is legible in the image — do not infer intent or what was "
+        "decided. Leave out system UI unrelated to the work (Wi-Fi menu, notifications). "
         "Reply with the description only."
     )
+    auto_tpl = (
+        " If the image shows nothing work-related that is legible — a browser or network "
+        "error page, a blank or loading page, a lock screen — reply with the single word "
+        f"{SKIP}."
+    )
+    prev_tpl = (
+        " The previous frame from the same window ({ago} s earlier) was described as: "
+        "«{prev}». If this frame continues that content (e.g. the rest of the same answer "
+        "or table), say what it belongs to — the query, period or scope stated there. "
+        "Every other claim must be visible in this frame itself (e.g. don't call rows "
+        "sorted because the previous frame was). "
+        "If this frame adds no new legible information compared with that description, "
+        f"reply with the single word {SAME}."
+    )
+    last_in_window = {}  # window key -> (taken, caption)
+    kept = []
     for r in records:
         name = r["staged"]
         prompt = prompt_tpl.format(name=name)
@@ -424,32 +450,74 @@ def caption(records, out_dir, config):
             # production, which app, which record the URL names.
             prompt += (f" Context (from the system, not the image): it was on screen in {_origin(r)}. "
                        "Mention the app/page if it helps identify the screen.")
+        window = _window_key(r)
+        if window:
+            prompt += auto_tpl
+            prev = last_in_window.get(window)
+            if prev:
+                ago = int((r["taken"] - prev[0]).total_seconds())
+                prompt += prev_tpl.format(ago=ago, prev=prev[1])
         # Keyed by source as well: the staged name is a position, and a later
         # run can put a different image at the same position.
         key = f"{name}|{Path(r['path']).name}"
-        if key in cache:
-            r["caption"] = cache[key]
+        text = cache.get(key)
+        if text is None:
+            text = _caption_one(prompt, name, out_dir)
+            if text:
+                cache[key] = text
+        if not text:
+            kept.append(r)  # captioning failed — keep the image, uncaptioned
             continue
-        try:
-            res = subprocess.run(
-                ["claude", "-p", "--output-format", "text", "--allowedTools", "Read"],
-                input=prompt, capture_output=True, text=True,
-                timeout=180, cwd=str(out_dir),
-            )
-        except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
-            print(f"  Warning: captioning failed for {name}: {e}", file=sys.stderr)
+        if text.strip().rstrip(".").upper() in (SKIP, SAME):
+            try:
+                (out_dir / "screenshots" / name).unlink()
+            except OSError:
+                pass
             continue
-        if res.returncode != 0:
-            print(f"  Warning: captioning failed for {name}: {res.stderr[:120]}", file=sys.stderr)
-            continue
-        text = res.stdout.strip()
-        if text:
-            r["caption"] = cache[key] = text
+        r["caption"] = text
+        if window:
+            last_in_window[window] = (r["taken"], text)
+        kept.append(r)
     try:
         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
-    return records
+    return kept
+
+
+SKIP, SAME = "SKIP", "SAME"
+
+
+def _window_key(r):
+    """Which window an autocaptured frame came from; None for manual images,
+    which were taken on purpose and are never dropped."""
+    if r.get("source") != "auto":
+        return None
+    o = r.get("origin") or {}
+    if o.get("url"):
+        # Tab titles repeat across unrelated pages (every DUB admin tab is
+        # "Hřiště hrou"), and SAME against an unrelated page would drop a frame
+        # silently. The page itself is the scheme, host and path; the query is
+        # usually just a filter on it.
+        u = urlsplit(o["url"])
+        return (o.get("app"), u.scheme, u.netloc, u.path)
+    return (o.get("app"), o.get("window") or o.get("tab")) if o.get("app") else ("auto",)
+
+
+def _caption_one(prompt, name, out_dir):
+    try:
+        res = subprocess.run(
+            ["claude", "-p", "--output-format", "text", "--allowedTools", "Read"],
+            input=prompt, capture_output=True, text=True,
+            timeout=180, cwd=str(out_dir),
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
+        print(f"  Warning: captioning failed for {name}: {e}", file=sys.stderr)
+        return None
+    if res.returncode != 0:
+        print(f"  Warning: captioning failed for {name}: {res.stderr[:120]}", file=sys.stderr)
+        return None
+    return res.stdout.strip() or None
 
 
 # --- Output ---
@@ -507,7 +575,11 @@ SUMMARY_INSTRUCTIONS = (
     "schůzky. Použij je k rozklíčování toho, na co mluvčí ukazují ('tady', 'tohle'), a "
     "ke správnému uvedení identifikátorů, čísel a názvů obrazovek či prvků. NEPOUŽÍVEJ "
     "je jako důkaz o tom, co bylo rozhodnuto — rozhodnutí plynou výhradně z toho, co "
-    "bylo řečeno. Snímky bez přesného zařazení v čase neuváděj jako součást časové osy."
+    "bylo řečeno. Snímky bez přesného zařazení v čase neuváděj jako součást časové osy. "
+    "Čísla ze snímků uváděj vždy s rozsahem či obdobím, ke kterému se podle popisu "
+    "vztahují (např. 'kontroly z roku 2026'), nikdy bez něj. Ručně psané poznámky na "
+    "vyfocených dokumentech jsou poznámky účastníků — uveď je jako takové (např. "
+    "požadovaná úprava šablony), i když nezazněly nahlas."
 )
 
 

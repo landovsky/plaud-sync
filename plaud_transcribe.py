@@ -873,9 +873,11 @@ def prepare_visuals(recordings, config, work_dir, step_label="", transcript=None
     print(f"  Captioning {len(records)} image(s) via Claude "
           f"({anchored} anchored, {len(records) - anchored} associated)...", end=" ", flush=True)
     records = visuals.stage(records, work_dir, config)
+    staged = len(records)
     records = visuals.caption(records, work_dir, config)
     captioned = sum(1 for r in records if r.get("caption"))
-    print(f"{captioned} captioned")
+    dropped = staged - len(records)
+    print(f"{captioned} captioned" + (f", {dropped} dropped (repeat or error page)" if dropped else ""))
     return records, visuals.visual_context(records, config)
 
 
