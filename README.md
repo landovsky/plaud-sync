@@ -163,7 +163,9 @@ That's it. Transcripts and summaries appear under the mapped project directory. 
 | `--days N` | `30` | How many days back to fetch |
 | `--all` | off | Process every unprocessed recording, no prompts |
 | `--language` | config `language`, else `cs` | Transcription hint + which prompt template (`cs`/`en`) is used |
-| `--force` | off | For `init`: overwrite an existing config |
+| `--force` | off | For `init`: overwrite an existing config; for `file` / `process <ref>`: redo a processed recording |
+| `--cut START-END` | none | For `process <ref>`: leave an off-topic stretch out (see below) |
+| `--instructions` | none | For `file` / `process <ref>`: one-off summarization steering |
 
 **Interactive prompt commands** (in `process` mode):
 
@@ -190,6 +192,22 @@ and level of detail. Press Enter to skip. They apply to every recording in that
 selection (or to the merged session) and are recorded in `state.json` alongside
 the entry, so you can later see what a summary was steered toward. `--all` runs
 without prompting and uses no custom instructions.
+
+**One recording, with an off-topic stretch cut out.** Name the recording (id,
+id prefix or title words) and give the range to leave out, as offsets from the
+start of the recording, exactly as the transcript prints them:
+
+```bash
+./plaud_transcribe.py process d8bfe180 --cut 29:16-35:00   # repeat --cut for more
+```
+
+Turns from START up to (not including) END are dropped, and so are the screenshots,
+phone photos and autocapture frames taken in that stretch. They're never captioned.
+One `✂ ——— LEFT OUT …` line marks the gap, and the range is recorded as `cuts:` in
+the front matter and in `state.json`. Wispr's own summary (`wispr-summary.md`) isn't
+kept for a cut recording, because it covers the whole recording. Everything else is the normal pipeline. A
+recording that's already done needs `--force`. The cached transcript stays whole,
+so a different cut can be tried later.
 
 **Moving** a recording after the fact:
 

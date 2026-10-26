@@ -467,6 +467,64 @@ def format_diarized_transcript(transcription_data, bookmarks=None):
     return "\n\n".join(lines)
 
 
+# --- Cuts: leaving off-topic stretches out of a recording ---
+
+TURN_STAMP_RE = re.compile(r"^\[(\d+(?::\d+){1,2})\]")
+
+
+def parse_clock(text):
+    """'MM:SS' (minutes uncapped, as in transcripts: '97:57') or 'H:MM:SS' → seconds."""
+    parts = text.strip().split(":")
+    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+        raise ValueError(f"not a MM:SS or H:MM:SS time: {text!r}")
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return secs
+
+
+def parse_cut(text):
+    """'29:16-34:55' → (1756, 2095): a half-open range of recording offsets."""
+    start, sep, end = text.partition("-")
+    if not sep:
+        raise ValueError(f"--cut must be START-END, got {text!r}")
+    lo, hi = parse_clock(start), parse_clock(end)
+    if hi <= lo:
+        raise ValueError(f"--cut end must be after start, got {text!r}")
+    return lo, hi
+
+
+def in_cuts(seconds, cuts):
+    return any(lo <= seconds < hi for lo, hi in cuts)
+
+
+def apply_cuts(transcript_text, cuts):
+    """Drop every turn whose timestamp falls in a cut, leaving one marker line
+    where each cut was. Lines without a timestamp (bookmarks) go with the turn
+    before them. The marker tells a later reader the gap is deliberate."""
+    if not cuts:
+        return transcript_text
+    out, inside, marked = [], False, set()
+    for line in transcript_text.split("\n\n"):
+        m = TURN_STAMP_RE.match(line)
+        if m:
+            t = parse_clock(m.group(1))
+            hit = next(((lo, hi) for lo, hi in cuts if lo <= t < hi), None)
+            inside = hit is not None
+            if hit and hit not in marked:
+                marked.add(hit)
+                out.append(f"✂ ——— LEFT OUT {format_cut(hit)} (off-topic, cut on request) ———")
+        if not inside:
+            out.append(line)
+    return "\n\n".join(out)
+
+
+def format_cut(cut):
+    def stamp(s):
+        return f"{s // 60:02d}:{s % 60:02d}"
+    return f"{stamp(cut[0])}–{stamp(cut[1])}"
+
+
 # --- Claude CLI for Classification & Summarization ---
 
 def load_prompt_template(language):
@@ -783,6 +841,9 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     # months later, "why is this so BOM-heavy?" should be answerable in place.
     if extra_instructions:
         front_matter["instructions"] = extra_instructions
+    # Same for a cut: a gap in the transcript must be explainable from the file.
+    if recording_meta.get("cuts"):
+        front_matter["cuts"] = ", ".join(recording_meta["cuts"])  # a string, so it gets quoted
 
     fm = yaml_front_matter(front_matter)
 
@@ -849,7 +910,7 @@ def write_wispr_summary(wispr_info, recording_meta, output_dir, config):
 
 # --- Visual enrichment ---
 
-def prepare_visuals(recordings, config, work_dir, step_label="", transcript=None):
+def prepare_visuals(recordings, config, work_dir, step_label="", transcript=None, cuts=None):
     """Collect, stage and caption images captured while the recording ran.
 
     Runs before summarization because the captions feed it, but the output
@@ -866,6 +927,13 @@ def prepare_visuals(recordings, config, work_dir, step_label="", transcript=None
     except Exception as e:  # never let an image break a transcript
         print(f"  Warning: visual collection failed: {e}", file=sys.stderr)
         return [], ""
+    if cuts:
+        # Images taken during a cut belong to the off-topic stretch, not the meeting.
+        # Filtered before captioning, so they cost nothing.
+        kept = [r for r in records if r["offset"] is None or not in_cuts(r["offset"], cuts)]
+        if len(kept) < len(records):
+            print(f"  {len(records) - len(kept)} image(s) left out with the cut.")
+        records = kept
     if not records:
         print("  No images for this recording.")
         return [], ""
@@ -925,7 +993,7 @@ def wispr_raw_text_cached(recording, work_dir):
 
 
 def process_recording(recording, token, config, folders, projects, state, language,
-                      extra_instructions=None):
+                      extra_instructions=None, cuts=None):
     file_id = recording["id"]
     source = recording.get("source", "plaud")
     filename = recording.get("filename", "untitled")
@@ -946,6 +1014,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
         "start_time": start_ms,
         **({"source_path": recording["_local_path"]} if source == "local" else {}),
         **({"source_path": recording["_recorder"]["path"]} if source == "recorder" else {}),
+        **({"cuts": [format_cut(c) for c in cuts]} if cuts else {}),
     }
 
     origin = {"wispr": "Wispr Flow", "local": recording.get("_local_path"),
@@ -995,10 +1064,16 @@ def process_recording(recording, token, config, folders, projects, state, langua
             )
             transcript_path.write_text(raw_text, encoding="utf-8")
 
+    # The cached transcript stays whole; cuts apply on every run, so the same
+    # recording can be re-processed with a different cut.
+    if cuts:
+        raw_text = apply_cuts(raw_text, cuts)
+        print(f"  Left out: {', '.join(format_cut(c) for c in cuts)}")
+
     # 2b. Visual enrichment (opt-in): images captured while the recording ran.
     visual_records, visual_ctx = prepare_visuals([recording], config, work_dir,
                                                  f"[{nsteps - 2}/{nsteps}]",
-                                                 transcript=raw_text)
+                                                 transcript=raw_text, cuts=cuts)
 
     # 3. Classify & summarize via Claude
     print(f"  [{nsteps - 1}/{nsteps}] Classifying & summarizing via Claude...", end=" ", flush=True)
@@ -1058,7 +1133,9 @@ def process_recording(recording, token, config, folders, projects, state, langua
                   visual_records=visual_records, visual_context=visual_ctx)
     if visual_records:
         copy_visuals(work_dir, output_dir)
-    if source == "wispr":
+    # Wispr's summary covers the whole recording and can't be cut, so with a cut
+    # it would bring the left-out stretch straight back (the 26.10 portal meeting).
+    if source == "wispr" and not cuts:
         write_wispr_summary(wispr_info, recording_meta, output_dir, config)
     print(f"→ {output_dir}")
 
@@ -1074,6 +1151,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
         # Keep the one-off steering with the entry: a re-read of a summary later
         # is confusing without knowing what the user asked it to emphasize.
         **({"instructions": extra_instructions} if extra_instructions else {}),
+        **({"cuts": recording_meta["cuts"]} if cuts else {}),
     }
     save_state(state)
 
@@ -1478,7 +1556,7 @@ def git_commit_working(results, config):
 
 
 def execute_selection(selected, merge, token, config, folders, projects, state, language,
-                      extra_instructions=None):
+                      extra_instructions=None, cuts=None):
     results = []
     if extra_instructions:
         print(f"\n  Custom instructions: {extra_instructions}")
@@ -1492,7 +1570,7 @@ def execute_selection(selected, merge, token, config, folders, projects, state, 
         print(f"\nProcessing {len(selected)} recording(s)...")
         for rec in selected:
             result = process_recording(rec, token, config, folders, projects, state, language,
-                                       extra_instructions=extra_instructions)
+                                       extra_instructions=extra_instructions, cuts=cuts)
             if result:
                 results.append(result)
 
@@ -1724,11 +1802,44 @@ def cmd_move(args, config, state):
         do_move(file_id, entry, project_name, config, state)
 
 
+def find_recording(ref, recordings, config):
+    """One recording by id, id prefix (with or without 'wispr:') or title words.
+    Anything but exactly one match is refused rather than guessed."""
+    exact = [r for r in recordings if ref in (r["id"], r["id"].split(":", 1)[-1])]
+    matches = exact or [r for r in recordings
+                        if r["id"].split(":", 1)[-1].startswith(ref) or r["id"].startswith(ref)]
+    if not matches:
+        matches = [r for r in recordings if fuzzy_match(ref, r.get("filename", ""))]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        print(f"No recording matches '{ref}' (try a larger --days).")
+    else:
+        print(f"'{ref}' matches {len(matches)} recordings — be more specific:")
+        for r in matches:
+            when = local_dt(r.get("start_time", 0), config).strftime("%Y-%m-%d %H:%M")
+            print(f"  {r['id']}  {when}  {r.get('filename')}")
+    return None
+
+
 def cmd_process(args, token, config, state, folders):
     projects = get_projects(config)
     recordings = list_all_recordings(token, config, args.days)
 
     auto_skip_short(recordings, state)
+
+    if args.extra:
+        rec = find_recording(args.extra[0], recordings, config)
+        if not rec:
+            return
+        entry = state.get("transcribed", {}).get(rec["id"], {})
+        if entry.get("status") == "done" and not args.force:
+            print(f"Already processed: {rec.get('filename')}\n  → {entry.get('output_dir')}"
+                  "\n  (use --force to redo)")
+            return
+        execute_selection([rec], False, token, config, folders, projects, state, args.language,
+                          extra_instructions=args.instructions, cuts=args.cuts)
+        return
 
     if args.all:
         transcribed = state.get("transcribed", {})
@@ -1850,17 +1961,28 @@ def main():
     parser.add_argument("command", nargs="?", default="process",
                         choices=["list", "process", "move", "init", "file"])
     parser.add_argument("extra", nargs="*",
-                        help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...")
+                        help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...; "
+                             "for 'process': one recording (id, id prefix or title words)")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--all", action="store_true", help="Process all unprocessed recordings")
     parser.add_argument("--language", default=None, help="Primary language (default: config 'language' or cs)")
     parser.add_argument("--force", action="store_true",
-                        help="For 'init': overwrite an existing config; for 'file': redo a processed file")
+                        help="For 'init': overwrite an existing config; "
+                             "for 'file' / 'process <ref>': redo a processed recording")
     parser.add_argument("--title", help="For 'file': recording title (default: file name)")
     parser.add_argument("--date", help="For 'file': start time, 'YYYY-MM-DD[ HH:MM]' (default: file mtime)")
     parser.add_argument("--merge", action="store_true", help="For 'file': treat the files as one session")
-    parser.add_argument("--instructions", help="For 'file': one-off summarization steering")
+    parser.add_argument("--instructions", help="For 'file' / 'process <ref>': one-off summarization steering")
+    parser.add_argument("--cut", action="append", default=[], metavar="START-END",
+                        help="For 'process <ref>': leave an off-topic stretch out, e.g. 29:16-34:55 "
+                             "(offsets as in the transcript; repeatable)")
     args = parser.parse_args()
+    try:
+        args.cuts = sorted(parse_cut(c) for c in args.cut)
+    except ValueError as e:
+        parser.error(str(e))
+    if args.cuts and not (args.command == "process" and args.extra):
+        parser.error("--cut needs one recording: process <ref> --cut START-END")
 
     config = load_config()
     state = load_state()
