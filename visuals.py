@@ -35,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import adb_link
+
 DEFAULT_SCREENSHOT_DIRS = ["~/Desktop"]
 DEFAULT_PHONE_DIRS = ["/sdcard/DCIM/Camera", "/sdcard/Pictures/Screenshots"]
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".heic")
@@ -165,18 +167,20 @@ def _wispr_segments(rec):
 
 # --- Collection ---
 
+_pair_hint_shown = False
+
+
+def _pair_hint(text):
+    """Pairing is a one-off setup step: say it once per run, however often we retry."""
+    global _pair_hint_shown
+    if not _pair_hint_shown:
+        _pair_hint_shown = True
+        print(f"\n{text}", file=sys.stderr)
+
+
 def _device_state(adb):
-    """'ready' | 'unauthorized' | 'absent' — the three cases worth telling apart."""
-    try:
-        devs = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=20).stdout
-    except (subprocess.SubprocessError, OSError):
-        return "absent"
-    lines = [l for l in devs.splitlines()[1:] if l.strip()]
-    if any(l.split()[1:2] == ["device"] for l in lines):
-        return "ready"
-    if any("unauthorized" in l for l in lines):
-        return "unauthorized"
-    return "absent"
+    """'ready' | 'unauthorized' | 'absent' — cable first, then a silent Wi-Fi connect."""
+    return adb_link.find_phone(adb, _pair_hint)
 
 
 def _timed_input(prompt, timeout):
@@ -192,7 +196,7 @@ def _timed_input(prompt, timeout):
 
 
 def _await_phone(adb):
-    """Ask the user to plug the phone in, and retry until they decline.
+    """Ask the user to connect the phone (cable or Wi-Fi), and retry until they decline.
 
     Phone photos are often the only record of a physical drawing or of the other
     participant's screen, and the pipeline may be run hours later — a silent skip
@@ -210,12 +214,14 @@ def _await_phone(adb):
     while True:
         if state == "unauthorized":
             print("\n  Phone is connected but not authorised — accept the "
-                  "USB-debugging prompt on the device.")
+                  "debugging prompt on the device, then press Enter.")
+            prompt = "  "
         else:
-            print("\n  No phone detected. Connect it to include photos taken during "
-                  "the meeting.")
+            print("\n  No phone (cable or Wi-Fi). Connect it to include photos taken "
+                  "during the meeting.")
+            prompt = "  Retry? [Y/n] "
         try:
-            answer = _timed_input("  Retry? [Y/n] ", PHONE_PROMPT_TIMEOUT_S)
+            answer = _timed_input(prompt, PHONE_PROMPT_TIMEOUT_S)
         except (EOFError, KeyboardInterrupt):
             print()
             return False

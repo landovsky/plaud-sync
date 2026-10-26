@@ -28,6 +28,8 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import adb_link
+
 RECORDER_PACKAGE = "com.google.android.apps.recorder"
 MEDIA_URI = "content://media/external/audio/media"
 PROJECTION = ["_data", "datetaken", "duration", "_size"]
@@ -102,11 +104,7 @@ def title_start(name, finalized, tz):
 
 
 def _device_ready(adb):
-    try:
-        out = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=20).stdout
-    except (subprocess.SubprocessError, OSError):
-        return False
-    return any(l.split()[1:2] == ["device"] for l in out.splitlines()[1:])
+    return adb_link.find_phone(adb) == "ready"
 
 
 def parse_rows(output):
@@ -150,7 +148,7 @@ def list_recordings(config, days):
         print(f"Note: '{adb}' not found — Google Recorder recordings not listed", file=sys.stderr)
         return []
     if not _device_ready(adb):
-        print("Note: phone not connected — Google Recorder recordings not listed", file=sys.stderr)
+        print("Note: no phone (cable or Wi-Fi) — Google Recorder recordings not listed", file=sys.stderr)
         return []
     # One string for `adb shell` (it re-joins args through the device shell);
     # the where-clause quotes must survive that.
