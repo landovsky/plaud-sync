@@ -19,7 +19,9 @@ at each end:
                  select anything; pointing *at a scene* is the signal.
 
 Capture is started by hand (`run`) or follows Wispr Flow (`watch`): a meeting is
-live while its Meetings row has no endedAt. macOS notifications say when capture
+live while its Meetings row has no endedAt. `install-agent` keeps the watcher
+alive across logins, reboots and crashes — without it a restart silently ends
+capture (2026-10-27: one reboot cost two days of meetings). macOS notifications say when capture
 starts, when the first frame proves Screen Recording permission works, and when
 it stops — the screen gives no other sign that it is being recorded.
 
@@ -49,6 +51,9 @@ STATUS_FILE = STATE_DIR / "status.json"
 LOG_FILE = STATE_DIR / "autocapture.log"
 APP_PATH = Path.home() / "Applications" / "Plaud Autocapture.app"
 APP_ID = "local.plaud-sync.autocapture"
+AGENT_ID = APP_ID + ".watch"
+AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{AGENT_ID}.plist"
+PAUSED_FILE = STATE_DIR / "paused"  # `stop` leaves it so the agent does not undo a deliberate stop
 
 DEFAULTS = {
     "enabled": True,          # only consulted by the pipeline; frames exist only if you ran capture
@@ -1047,6 +1052,63 @@ def install_app():
     print(f"installed {APP_PATH}")
 
 
+# --- Login agent ---
+
+def _launch_watch():
+    """Start `watch` through the app (so the app holds the Screen Recording grant)."""
+    if APP_PATH.exists():
+        subprocess.run(["open", "-g", "-n", str(APP_PATH), "--args", "watch"], check=True)
+        return f"via {APP_PATH.name}"
+    cmd = [sys.executable, str(Path(__file__).resolve()), "watch"]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "a") as log:  # _log already writes the file; only tracebacks go here
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    return "in the background"
+
+
+def ensure():
+    """What the agent runs: start the watcher unless it is running or paused by `stop`."""
+    if PAUSED_FILE.exists() or _running_pid():
+        return
+    how = _launch_watch()
+    _log(f"watcher was not running — started it {how} (agent)")
+
+
+def install_agent(interval_s):
+    """LaunchAgent: `ensure` at login and every interval_s, in the user's GUI session.
+
+    launchd starts only `ensure` (plain Python, no screen access); the watcher
+    itself is opened through the app exactly as `start --watch` does, so the
+    Screen Recording grant stays with the app.
+    """
+    AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    import plistlib
+    plist = {
+        "Label": AGENT_ID,
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "ensure"],
+        "RunAtLoad": True,
+        "StartInterval": int(interval_s),
+        "ProcessType": "Background",
+        "StandardOutPath": "/dev/null",   # _log already writes the file; only tracebacks go here
+        "StandardErrorPath": str(LOG_FILE),
+    }
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{AGENT_ID}"], capture_output=True)
+    with open(AGENT_PLIST, "wb") as f:
+        plistlib.dump(plist, f)
+    PAUSED_FILE.unlink(missing_ok=True)
+    subprocess.run(["launchctl", "bootstrap", domain, str(AGENT_PLIST)], check=True)
+    print(f"installed {AGENT_PLIST} — checks every {int(interval_s)}s and at login")
+
+
+def uninstall_agent():
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_ID}"], capture_output=True)
+    AGENT_PLIST.unlink(missing_ok=True)
+    print("agent removed — the watcher now runs only when started by hand")
+
+
 # --- CLI ---
 
 def _running_pid():
@@ -1083,7 +1145,15 @@ def _foreground(mode, config, hours):
 def main():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import plaud_transcribe as pt
-    ap = argparse.ArgumentParser(description="Continuous, change-driven screen capture for meeting visuals.")
+    ap = argparse.ArgumentParser(
+        description="Continuous, change-driven screen capture for meeting visuals.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""recipes:
+  one-time setup:   install-app, grant Screen Recording to Plaud Autocapture, install-agent
+  is it working?    status   (process, state, agent); check  (permission probes via the app)
+  pause / resume:   stop  (agent stays paused until `start`);  start --watch
+  re-tune offline:  replay <session> --set change=0.04
+log: ~/.cache/plaud-autocapture/autocapture.log""")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="capture now, in the foreground, until Ctrl-C or max_hours")
     r.add_argument("--hours", type=float, help="override max_hours for this run")
@@ -1094,6 +1164,11 @@ def main():
     sub.add_parser("stop", help="stop a background capture/watch")
     sub.add_parser("status", help="show what autocapture is doing")
     sub.add_parser("install-app", help="build ~/Applications/Plaud Autocapture.app (named permission prompt)")
+    ia = sub.add_parser("install-agent", help="keep the Wispr watcher running across logins, reboots and crashes")
+    ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
+                    help="how often the agent checks the watcher is alive (default 300)")
+    sub.add_parser("uninstall-agent", help="remove the login agent")
+    sub.add_parser("ensure", help="start the watcher unless running or paused (what the agent runs)")
     ck = sub.add_parser("check", help="ask whether Screen Recording is granted, as capture would (via the app)")
     ck.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
     rp = sub.add_parser("replay", help="re-run scene detection over a session's raw frames")
@@ -1108,8 +1183,12 @@ def main():
     elif args.cmd == "start":
         if _running_pid():
             sys.exit(f"autocapture already running (pid {_running_pid()})")
-        sub_args = ["watch"] if args.watch else ["run"]
-        if args.hours and not args.watch:
+        PAUSED_FILE.unlink(missing_ok=True)
+        if args.watch:
+            print(f"started {_launch_watch()} — log: {LOG_FILE}")
+            return
+        sub_args = ["run"]
+        if args.hours:
             sub_args += ["--hours", str(args.hours)]
         if APP_PATH.exists():  # screen access is then asked for by, and granted to, the app
             subprocess.run(["open", "-g", "-n", str(APP_PATH), "--args", *sub_args], check=True)
@@ -1123,6 +1202,12 @@ def main():
         print(f"started in the background — log: {LOG_FILE}")
     elif args.cmd == "install-app":
         install_app()
+    elif args.cmd == "install-agent":
+        install_agent(args.interval)
+    elif args.cmd == "uninstall-agent":
+        uninstall_agent()
+    elif args.cmd == "ensure":
+        ensure()
     elif args.cmd == "check":
         if args.here or not APP_PATH.exists():
             _log(f"check ({'app' if args.here else 'terminal'}): " + json.dumps(_permission_probes()))
@@ -1151,6 +1236,10 @@ def main():
             overrides[k] = float(v) if re.fullmatch(r"[\d.]+", v) else v
         replay(session, overrides, config)
     elif args.cmd == "stop":
+        if AGENT_PLIST.exists():
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            PAUSED_FILE.touch()
+            print("agent paused until `start` (or `install-agent`)")
         pid = _running_pid()
         if not pid:
             print("not running")
@@ -1161,6 +1250,9 @@ def main():
         pid = _running_pid()
         st = json.loads(STATUS_FILE.read_text()) if STATUS_FILE.exists() else {}
         print(f"process: {'running, pid ' + str(pid) if pid else 'not running'}")
+        agent = ("not installed — a reboot or crash ends the watcher (`install-agent`)"
+                 if not AGENT_PLIST.exists() else "paused by `stop`" if PAUSED_FILE.exists() else "installed")
+        print(f"agent:   {agent}")
         if st:
             age = int(time.time() - st.get("updated", 0))
             print(f"state:   {st.get('state')} (updated {age}s ago)")

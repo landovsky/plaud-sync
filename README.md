@@ -502,6 +502,19 @@ interpreter record the screen. Re-running `install-app` rebuilds the binary, and
 treats it as a new app: switch Plaud Autocapture off and on again under Screen & System Audio
 Recording (or remove it and let it ask again), then restart capture.
 
+The watcher is a plain process: a reboot, logout or crash ends it, and nothing brings it back
+unless the login agent is installed (on 2026-10-27 one reboot cost two days of meetings):
+
+```bash
+python3 autocapture.py install-agent   # LaunchAgent: at login and every 5 min, start the watcher if it is down
+python3 autocapture.py status          # process, agent (installed / paused / not installed), state
+python3 autocapture.py stop            # also pauses the agent until the next `start`
+```
+
+launchd runs only `autocapture.py ensure`, which opens the watcher through the app, so the
+Screen Recording grant stays with **Plaud Autocapture**. macOS lists the agent under Login
+Items & Extensions as "python3.15"; switching it off there disables the restart.
+
 Frames go to `~/Pictures/plaud-autocapture/<session>/` with a `timeline.jsonl` of which scene
 was on which display when — never to `~/Desktop`, which visuals treats as deliberate
 screenshots. Capture pauses while the screen is locked, stops after `max_hours`, and sessions
