@@ -992,6 +992,18 @@ def wispr_raw_text_cached(recording, work_dir):
     return raw_text
 
 
+def resolve_output_dir(state, file_ids, target_base, dir_name):
+    """Where a recording's outputs go. A redo (`--force`) writes back into the
+    directory it got the first time, even though the summarizer usually titles
+    it differently: a new slug would leave the old directory behind as a
+    duplicate (2026-11-02 training), and break links to a committed transcript."""
+    for fid in file_ids:
+        prev = ((state.get("transcribed") or {}).get(fid) or {}).get("output_dir")
+        if prev and Path(prev).parent == target_base and Path(prev).is_dir():
+            return Path(prev)
+    return target_base / dir_name
+
+
 def process_recording(recording, token, config, folders, projects, state, language,
                       extra_instructions=None, cuts=None):
     file_id = recording["id"]
@@ -1127,7 +1139,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
     else:
         target_base = default_output_dir(config)
 
-    output_dir = target_base / dir_name
+    output_dir = resolve_output_dir(state, [file_id], target_base, dir_name)
     write_outputs(classification, recording_meta, raw_text, output_dir,
                   extra_instructions=extra_instructions,
                   visual_records=visual_records, visual_context=visual_ctx)
@@ -1307,7 +1319,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     else:
         target_base = default_output_dir(config)
 
-    output_dir = target_base / dir_name
+    output_dir = resolve_output_dir(state, file_ids, target_base, dir_name)
     write_outputs(classification, recording_meta, combined_transcript, output_dir,
                   extra_instructions=extra_instructions,
                   visual_records=visual_records, visual_context=visual_ctx)
