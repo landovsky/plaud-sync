@@ -19,7 +19,8 @@ at each end:
                  select anything; pointing *at a scene* is the signal.
 
 Capture is started by hand (`run`) or follows Wispr Flow (`watch`): a meeting is
-live while its Meetings row has no endedAt. `install-agent` keeps the watcher
+live while its Meetings row has no endedAt, or after a resume while its live
+transcript ends on a `resumed` marker. `install-agent` keeps the watcher
 alive across logins, reboots and crashes — without it a restart silently ends
 capture (2026-10-27: one reboot cost two days of meetings). macOS notifications say when capture
 starts, when the first frame proves Screen Recording permission works, and when
@@ -74,6 +75,10 @@ DEFAULTS = {
     "manual_gap_s": 20,       # a deliberate screenshot this close to a pointed-at scene wins
     "fresh_s": 60,            # pointing within this long after a screen change is the strongest signal
     "wispr_poll_s": 10,
+    # A resumed meeting keeps its endedAt (Wispr sets it at the pause and never
+    # clears it), so it counts as live while live.ndjson ends on a `resumed`
+    # marker — unless the file has been silent this long (Wispr crashed mid-segment).
+    "wispr_resume_stale_min": 15,
     "deixis": [],             # extra pointing words/phrases, diacritics-free lowercase
     # Where each scene came from: the app and window in front on that display,
     # and for Chrome the tab title and URL (asks macOS for Automation once).
@@ -693,6 +698,9 @@ def wispr_live_meeting(config, max_hours):
     """The Wispr meeting being recorded right now, as {id, created_ms}, or None.
 
     Wispr sets Meetings.endedAt when a meeting stops; while it runs it is NULL.
+    A paused-and-resumed meeting is the exception: endedAt stays set from the
+    pause, so it is live again when its live.ndjson ends on a `resumed` marker
+    (2026-11-02: the 80-minute second half of a training got no frames).
     Rows older than max_hours are ignored, so a crashed meeting that never got
     an endedAt cannot keep capture on forever.
     """
@@ -700,23 +708,50 @@ def wispr_live_meeting(config, max_hours):
     db = wispr_flow.wispr_db_path(config)
     if not db.exists():
         return None
+    since = time.time() * 1000 - max_hours * 3600 * 1000
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
         try:
-            row = conn.execute(
-                "SELECT id, createdAt FROM Meetings WHERE endedAt IS NULL AND isDeleted = 0 "
-                "ORDER BY createdAt DESC LIMIT 1").fetchone()
+            rows = conn.execute(
+                "SELECT id, createdAt, endedAt FROM Meetings WHERE isDeleted = 0 "
+                "AND (endedAt IS NULL OR endedAt > ?) ORDER BY createdAt DESC LIMIT 5",
+                (since,)).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as e:
         _log(f"wispr read failed: {e}")
         return None
-    if not row:
-        return None
-    created = wispr_flow._parse_created(row[1])
-    if not created or time.time() * 1000 - created > max_hours * 3600 * 1000:
-        return None
-    return {"id": row[0], "created_ms": created}
+    stale_s = settings(config)["wispr_resume_stale_min"] * 60
+    for mid, created_raw, ended in rows:
+        created = wispr_flow._parse_created(created_raw)
+        if not created or created < since:
+            continue
+        if ended is None or _resumed_after_end(wispr_flow.wispr_dir(config) / "meetings" / mid, stale_s):
+            return {"id": mid, "created_ms": created}
+    return None
+
+
+def _resumed_after_end(meeting_dir, stale_s):
+    """True when the meeting's last pause/resume marker is `resumed` and the live
+    transcript is still being written."""
+    p = meeting_dir / "live.ndjson"
+    try:
+        if time.time() - p.stat().st_mtime > stale_s:
+            return False
+        # Whole file: a long segment puts the marker far back (2 h ≈ 0.5 MB).
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        if '"marker"' not in line:
+            continue
+        try:
+            marker = json.loads(line).get("marker")
+        except json.JSONDecodeError:
+            continue
+        if marker in ("paused", "stopped", "resumed"):
+            return marker == "resumed"
+    return False
 
 
 def _wispr_files(config, meeting_id):
