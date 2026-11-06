@@ -17,6 +17,12 @@ Summarization currently requires the Claude Code CLI (`claude`) on your PATH.
 A pluggable LLM gateway (Anthropic API / OpenAI-compatible) is on the roadmap —
 pull requests welcome.
 
+Context documents for the summary: after each summary the run prints
+"Tools used:" (✓/✗) and "Denied:" lines; the last run's are also saved in
+docs/working/last_claude_tools.txt. The summarizer can only read files inside
+the folder you run from, and fetch sites allowed in .claude/settings.local.json
+(or ~/.claude/settings.json). Copy any other document into this folder first.
+
 Env vars:
   PLAUD_BEARER_TOKEN      — Plaud.ai API token (or set "token" in ~/.plaud-sync/config.json)
   ELEVENLABS_API_KEY      — ElevenLabs API key for transcription
@@ -689,7 +695,7 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
     timeout = max(300, duration_min * 30)
     try:
         result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
+            ["claude", "-p", "--output-format", "stream-json", "--verbose"],
             input=prompt, capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError:
@@ -709,9 +715,12 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
         print(f"Error: claude CLI failed: {result.stderr[:300]}", file=sys.stderr)
         return None
 
-    text = result.stdout.strip()
+    text, used, denied = parse_claude_stream(result.stdout)
+    report = format_tool_report(used, denied)
+    print(report, file=sys.stderr)
     WORKING_DIR.mkdir(parents=True, exist_ok=True)
     (WORKING_DIR / "last_claude_response.txt").write_text(text, encoding="utf-8")
+    (WORKING_DIR / "last_claude_tools.txt").write_text(report + "\n", encoding="utf-8")
     parsed = _parse_summary_response(text)
     if parsed is None:
         print("Error: Could not parse Claude response", file=sys.stderr)
@@ -720,6 +729,67 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
         print(f"Response ({len(text)} chars) head: {text[:300]}", file=sys.stderr)
         print(f"…tail: {text[-300:]}", file=sys.stderr)
     return parsed
+
+
+# --- Tool report ---
+#
+# A document named in the instructions is silently skipped when the summarizer
+# is not allowed to open it (outside the cwd, or a site not on the WebFetch
+# allowlist): `claude -p` has nobody to approve the prompt, so it is denied and
+# the summary goes on without it. The stream-json output lists every tool call
+# and every denial, so we print both after each summary for a visual check.
+
+# Plumbing the model uses to load other tools; not something the user asked for.
+_HIDDEN_TOOLS = {"ToolSearch"}
+
+
+def parse_claude_stream(stdout):
+    """(result_text, used, denied) from `claude -p --output-format stream-json`.
+
+    used/denied are lists of (tool_name, input_dict). Non-JSON lines are
+    skipped; with no result event the text is empty and parsing fails later
+    as it would for any truncated response."""
+    text, used, denied = "", [], []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "assistant":
+            for c in (ev.get("message") or {}).get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    used.append((c.get("name") or "?", c.get("input") or {}))
+        elif ev.get("type") == "result":
+            text = (ev.get("result") or "").strip()
+            for d in ev.get("permission_denials") or []:
+                denied.append((d.get("tool_name") or "?", d.get("tool_input") or {}))
+    return text, used, denied
+
+
+def _tool_target(name, inp):
+    for k in ("file_path", "url", "command", "query", "pattern", "path"):
+        if inp.get(k):
+            v = str(inp[k]).replace(str(Path.home()), "~", 1)
+            return f"{name} {v[:120]}"
+    return name
+
+
+def format_tool_report(used, denied):
+    """Two lines: what the summarizer touched (✓/✗) and what it was refused."""
+    denied_keys = [_tool_target(n, i) for n, i in denied]
+    items = []
+    for n, i in used:
+        if n in _HIDDEN_TOOLS:
+            continue
+        t = _tool_target(n, i)
+        items.append(f"{t} {'✗' if t in denied_keys else '✓'}")
+    lines = ["  Tools used: " + (" · ".join(items) if items else "none")]
+    if denied_keys:
+        lines.append("  Denied:     " + " · ".join(denied_keys))
+    return "\n".join(lines)
 
 
 # --- Helpers ---
