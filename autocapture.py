@@ -103,6 +103,11 @@ DEFAULTS = {
     "private_words": [  # in a window or tab title, diacritics-free lowercase
         "internet banking", "internetove bankovnictvi", "online banking", "password", "heslo",
     ],
+    # Physical monitors that are never captured, whatever they show: part of the
+    # monitor's name as macOS gives it (`displays` lists them), case-insensitive,
+    # e.g. ["built-in"] for the laptop panel. Names, not numbers: the numbers
+    # follow which display is main and shift when a monitor is plugged in.
+    "ignore_displays": [],
 }
 PRIVATE_LISTS = ("private_hosts", "private_apps", "private_words")
 # 96x60, not smaller: at 32x20 a whole new page of text in the same layout
@@ -251,12 +256,14 @@ def _compare(sig, prev, ref, cell_delta):
     return moving / n, changed / n
 
 
-_CURSOR_JXA = """ObjC.import("AppKit");
-const m = $.NSEvent.mouseLocation, s = $.NSScreen.screens; let r = 0;
-for (let i = 0; i < s.count; i++) { const f = s.objectAtIndex(i).frame;
+# NSScreen.screens is main-first, the same order screencapture numbers its
+# files in (checked 2026-11-17 by pixel size: d1 = Built-in, d2 = external).
+_SCREENS_JXA = """ObjC.import("AppKit");
+const m = $.NSEvent.mouseLocation, s = $.NSScreen.screens; let r = 0; const names = [];
+for (let i = 0; i < s.count; i++) { const x = s.objectAtIndex(i), f = x.frame; names.push(x.localizedName.js);
   if (m.x >= f.origin.x && m.x < f.origin.x + f.size.width &&
       m.y >= f.origin.y && m.y < f.origin.y + f.size.height) r = i + 1; }
-r"""
+JSON.stringify({cursor: r, names: names})"""
 
 _WINDOWS_JXA = """ObjC.import("CoreGraphics"); ObjC.import("AppKit");
 const a = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1 | 16, 0)); let named = 0, total = 0;
@@ -307,12 +314,22 @@ def _jxa(script):
         return ""
 
 
-def _cursor_display():
-    """Which display the mouse is on (1 = main, as screencapture numbers them),
-    or None. Where you point is a better attention signal than which screen
-    changed last — a terminal streaming output changes constantly."""
-    out = _jxa(_CURSOR_JXA)
-    return int(out) if out.isdigit() and int(out) > 0 else None
+def _screens():
+    """(cursor, names): which display the mouse is on (1 = main, as screencapture
+    numbers them) or None, and every display's name in that numbering ([] when
+    it can't tell). Where you point is a better attention signal than which
+    screen changed last — a terminal streaming output changes constantly."""
+    try:
+        out = json.loads(_jxa(_SCREENS_JXA) or "{}")
+    except json.JSONDecodeError:
+        return None, []
+    cur = out.get("cursor")
+    return (cur if isinstance(cur, int) and cur > 0 else None), list(out.get("names") or [])
+
+
+def _ignored_display(name, patterns):
+    """Whether a monitor is one config says never to capture (part of its name)."""
+    return bool(name) and any(p and p.lower() in name.lower() for p in patterns)
 
 
 def _sources(urls=True):
@@ -533,6 +550,9 @@ def capture(config, should_continue, reason):
     error_notified = False
     blind, blind_checked, blind_notified = None, 0.0, 0.0  # None: first check always logs
     private = set()  # displays showing a private screen right now
+    ignored = set()  # displays skipped by ignore_displays right now
+    names = []       # last known display names, kept for when a lookup fails
+    names_warned = False
     stop_reason = "stopped"
     try:
         while True:
@@ -583,7 +603,15 @@ def capture(config, should_continue, reason):
                 time.sleep(s["interval_s"])
                 continue
 
-            cur = _cursor_display() if len(shots) > 1 else None
+            cur = None
+            if len(shots) > 1 or s["ignore_displays"]:
+                cur, got = _screens()
+                if len(got) == len(shots):
+                    names = got
+                elif len(names) != len(shots) and s["ignore_displays"] and not names_warned:
+                    # Unknown names: capture rather than lose the meeting, as _private does.
+                    _log("display names unknown — ignore_displays not applied until they are")
+                    names_warned = True
             if cur and cur != focus:
                 _event(timeline, t=t0, focus=cur)
                 focus = cur
@@ -598,6 +626,18 @@ def capture(config, should_continue, reason):
                 return (sources.get("displays") or {}).get(str(idx))
 
             for idx, path in shots:
+                name = names[idx - 1] if len(names) == len(shots) else None
+                if _ignored_display(name, s["ignore_displays"]):
+                    path.unlink(missing_ok=True)
+                    if idx not in ignored:
+                        ignored.add(idx)
+                        _event(timeline, t=t0, display=idx, event="ignored", name=name)
+                        _log(f"display {idx} ({name}): ignored by config, not capturing")
+                        tracker.forget(idx)
+                    continue
+                if idx in ignored:
+                    ignored.discard(idx)
+                    _log(f"display {idx} ({name}): capturing")
                 if s["private"] and _private(source_of(idx), s):
                     path.unlink(missing_ok=True)
                     if idx not in private:
@@ -629,6 +669,7 @@ def capture(config, should_continue, reason):
 
             _write_status(state="capturing", session=str(session), reason=reason, started=started,
                           saved=tracker.saved, revisits=tracker.revisits, displays=len(shots),
+                          ignored=sorted(names[i - 1] for i in ignored if i <= len(names)),
                           focus=focus, raw=bool(raw_dir))
             time.sleep(max(0.0, s["interval_s"] - (time.time() - t0)))
     finally:
@@ -666,7 +707,7 @@ def replay(session, overrides, config):
         if "scene" not in e:  # keep start/stop/lock/focus as captured
             events.append(e)
     lock_times = sorted(e["t"] for e in events if e.get("event") == "lock")
-    privates = sorted((e["t"], e["display"]) for e in events if e.get("event") == "private")
+    privates = sorted((e["t"], e["display"]) for e in events if e.get("event") in ("private", "ignored"))
     for t0 in sorted(frames):
         while lock_times and lock_times[0] <= t0:
             lock_times.pop(0)
@@ -837,8 +878,8 @@ def _intervals(root, lo, hi):
     """([(display, t0, t1, path, source)], [(t, display)]) — when each scene was on
     screen, and which display had the mouse, from every session timeline
     overlapping [lo, hi] (epoch seconds). Lock and stop end every display's
-    scene: capture off means nothing is known to be on screen; a private screen
-    ends its own display's. A source event belongs to the scene that started on
+    scene: capture off means nothing is known to be on screen; a private or
+    ignored screen ends its own display's. A source event belongs to the scene that started on
     its display just before it (a replay with other thresholds can move scene
     starts, so only within a few seconds)."""
     out, focus = [], []
@@ -876,7 +917,7 @@ def _intervals(root, lo, hi):
                 c = cur.get(e["display"])
                 if c and 0 <= t - c[0] <= 6:
                     c[2] = e["source"]
-            elif e.get("event") == "private":
+            elif e.get("event") in ("private", "ignored"):
                 prev = cur.pop(e.get("display"), None)
                 if prev:
                     out.append((e["display"], prev[0], t, prev[1], prev[2]))
@@ -1187,6 +1228,8 @@ def main():
   one-time setup:   install-app, grant Screen Recording to Plaud Autocapture, install-agent
   is it working?    status   (process, state, agent); check  (permission probes via the app)
   pause / resume:   stop  (agent stays paused until `start`);  start --watch
+  skip a monitor:   displays  (names), then config visuals.autocapture.ignore_displays,
+                    e.g. ["built-in"]; then stop + start --watch (config is read at start)
   re-tune offline:  replay <session> --set change=0.04
 log: ~/.cache/plaud-autocapture/autocapture.log""")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1198,6 +1241,7 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     st.add_argument("--hours", type=float)
     sub.add_parser("stop", help="stop a background capture/watch")
     sub.add_parser("status", help="show what autocapture is doing")
+    sub.add_parser("displays", help="list monitors by name and whether ignore_displays skips them")
     sub.add_parser("install-app", help="build ~/Applications/Plaud Autocapture.app (named permission prompt)")
     ia = sub.add_parser("install-agent", help="keep the Wispr watcher running across logins, reboots and crashes")
     ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
@@ -1292,9 +1336,18 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
             age = int(time.time() - st.get("updated", 0))
             print(f"state:   {st.get('state')} (updated {age}s ago)")
             for k in ("reason", "session", "last_session", "saved", "revisits", "displays",
-                      "last_stop", "error"):
+                      "ignored", "last_stop", "error"):
                 if k in st:
                     print(f"{k + ':':9}{st[k]}")
+
+    elif args.cmd == "displays":
+        patterns = settings(config)["ignore_displays"]
+        _, names = _screens()
+        if not names:
+            sys.exit("could not ask macOS for the displays")
+        for i, n in enumerate(names, 1):
+            print(f"{i}  {n:32} {'ignored' if _ignored_display(n, patterns) else 'captured'}")
+        print(f"ignore_displays: {patterns}  (part of a name, case-insensitive)")
 
 
 if __name__ == "__main__":

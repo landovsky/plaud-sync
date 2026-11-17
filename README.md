@@ -461,6 +461,13 @@ continuously during a meeting, and keeps the cost bounded with one filter at eac
   added to the built-in ones; `"private": false` turns this off. It is a heuristic: only the
   front window per display is judged, URLs come only from Chrome (other browsers fall back
   to the window title), and when the window can't be looked up the screen is captured.
+- **Whole monitors can be left out.** `"ignore_displays": ["built-in"]` never captures the
+  MacBook panel, only the external monitor(s). Entries are part of the monitor's name as
+  macOS gives it, case-insensitive; `python3 autocapture.py displays` lists the names and
+  which ones are skipped. Names, not numbers, because display numbers follow which screen
+  is main and shift when a monitor is plugged in. An ignored display logs one `ignored`
+  event (ending its scene) and nothing else. Config is read when capture starts, so restart
+  a running watcher (`stop`, then `start --watch`) after changing it.
 
 ```bash
 python3 autocapture.py watch          # capture while a Wispr Flow meeting is recording
