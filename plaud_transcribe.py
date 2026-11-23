@@ -313,7 +313,7 @@ def obtain_audio(recording, token, config, step_prefix):
         print(f"  {step_prefix} Local audio ({size_mb:.1f} MB)")
         return audio_path
     if recording.get("source") == "recorder":
-        print(f"  {step_prefix} Pulling audio from phone...", end=" ", flush=True)
+        print(f"  {step_prefix} Recorder audio from phone...", end=" ", flush=True)
         audio_path = google_recorder.pull(recording, config, AUDIO_DIR)
         print(f"{audio_path.stat().st_size / 1024 / 1024:.1f} MB")
         return audio_path
@@ -1106,7 +1106,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
     print(f"  {date_str} · {format_duration(duration)} · {origin}")
     print(f"{'='*60}")
 
-    work_dir = WORKING_DIR / file_id.replace(":", "_")
+    work_dir = work_dir_for(recording)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # Steps 1-2: obtain the diarized transcript. Plaud downloads audio and
@@ -1260,7 +1260,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     print(f"  Total: {format_duration(total_duration)}")
     print(f"{'='*60}")
 
-    merged_work_dir = WORKING_DIR / f"merged_{'_'.join(fid.replace(':', '_')[:12] for fid in file_ids)}"
+    merged_work_dir = merged_work_dir_for(recordings)
     merged_work_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_parts = []
@@ -1272,7 +1272,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
         file_id = rec["id"]
         rec_source = rec.get("source", "plaud")
         part_label = f"part {i+1}/{len(recordings)}"
-        work_dir = WORKING_DIR / file_id.replace(":", "_")
+        work_dir = work_dir_for(rec)
         work_dir.mkdir(parents=True, exist_ok=True)
 
         if rec_source == "wispr":
@@ -1637,11 +1637,56 @@ def git_commit_working(results, config):
             pass
 
 
+def work_dir_for(recording):
+    return WORKING_DIR / recording["id"].replace(":", "_")
+
+
+def merged_work_dir_for(recordings):
+    ids = [r["id"] for r in sorted(recordings, key=lambda r: r.get("start_time", 0))]
+    return WORKING_DIR / f"merged_{'_'.join(fid.replace(':', '_')[:12] for fid in ids)}"
+
+
+def prefetch_phone_files(selected, merge, config):
+    """Copy everything this run needs from the phone before anything else runs:
+    Google Recorder audio, then the phone photos of every transcript.
+
+    Per recording, the phone used to be needed twice — audio at the start,
+    photos after transcription (minutes of ElevenLabs) — and again for every
+    further recording in the selection. Pulling it all up front means one short
+    phase, one "unplug now", and the rest of the run works from local copies.
+    A failed audio pull is only a warning here: the recording's own step retries
+    it and reports the error in context.
+    """
+    recorder = [r for r in selected if r.get("source") == "recorder"]
+    photos = visuals.enabled(config) and visuals.phone_dirs(config)
+    if not (recorder or photos):
+        return
+    print("\n  Phone: copying audio and photos for the whole selection first...")
+    used = False
+    for rec in recorder:
+        try:
+            path = google_recorder.pull(rec, config, AUDIO_DIR)
+            used = True
+            print(f"    {rec.get('filename', 'untitled')}: audio "
+                  f"{path.stat().st_size / 1024 / 1024:.1f} MB")
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            print(f"    Warning: {rec.get('filename', 'untitled')}: {e}", file=sys.stderr)
+    groups = ([(selected, merged_work_dir_for(selected) / "phone")] if merge
+              else [([r], work_dir_for(r) / "phone") for r in selected])
+    phone_used, photos_staged = visuals.prefetch_phone(groups, config)
+    used = used or phone_used
+    if photos and phone_used:
+        print(f"    {photos_staged} phone photo(s) staged")
+    if used:
+        print("  Everything is copied — you can unplug the phone now.")
+
+
 def execute_selection(selected, merge, token, config, folders, projects, state, language,
                       extra_instructions=None, cuts=None):
     results = []
     if extra_instructions:
         print(f"\n  Custom instructions: {extra_instructions}")
+    prefetch_phone_files(selected, merge, config)
     if merge:
         print(f"\nMerging & processing {len(selected)} recording(s)...")
         result = process_merged_recordings(selected, token, config, folders, projects, state, language,
