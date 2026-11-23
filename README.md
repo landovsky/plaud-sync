@@ -363,12 +363,15 @@ Because Wispr already produced the transcript, the Wispr path **skips the audio 
   "wispr": {
     "enabled": true,
     "data_dir": "~/Library/Application Support/Wispr Flow",
-    "keep_wispr_summary": true
+    "keep_wispr_summary": true,
+    "live_fallback_minutes": 30
   }
 }
 ```
 
-It's graceful and read-only: the Wispr SQLite store is opened read-only (safe while the app is running), a Wispr meeting whose transcript isn't on disk yet is simply skipped, and any Wispr read error degrades to "no Wispr meetings" without ever blocking the Plaud pipeline. `data_dir` only needs setting if your Wispr Flow store isn't at the macOS default shown above.
+It's graceful and read-only: the Wispr SQLite store is opened read-only (safe while the app is running), a Wispr meeting whose transcript isn't on disk yet is held back with a note (never skipped silently), and any Wispr read error degrades to "no Wispr meetings" without ever blocking the Plaud pipeline. `data_dir` only needs setting if your Wispr Flow store isn't at the macOS default shown above.
+
+**When Wispr never refines a meeting.** Sometimes Wispr finalizes a meeting but never writes its refined transcript (seen after an "offline for N min" gap). Until `live_fallback_minutes` after the meeting ended, it's held back while Wispr may still be refining it. After that it's listed and processed from Wispr's live transcript: rougher text, speakers labelled `Live speaker N`. The output carries `transcript_from: wispr-live` in its front matter. The live text isn't cached, so if Wispr refines the meeting later, `process <ref> --force` picks up the refined version.
 
 > **Note:** the Plaud token is still required — Wispr meetings are merged *into* the Plaud listing, not a standalone mode. If you only use Wispr, you still need a valid Plaud token for the list step to succeed.
 
@@ -604,7 +607,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 | `elevenlabs_model` | transcribe | ElevenLabs model id (default `scribe_v2`) |
 | `fernet_key` | transcribe | Override Plaud's audio-URL decryption key if they rotate it |
 | `process_bookmarks` | transcribe | `true` to inline device bookmarks into the transcript (default off — see [Bookmarks](#bookmarks-device-marks)) |
-| `wispr` | transcribe | Ingest local [Wispr Flow](#wispr-flow-meetings) meetings: `{ "enabled": true, "data_dir": "~/…/Wispr Flow", "keep_wispr_summary": true }` (default off) |
+| `wispr` | transcribe | Ingest local [Wispr Flow](#wispr-flow-meetings) meetings: `{ "enabled": true, "data_dir": "~/…/Wispr Flow", "keep_wispr_summary": true, "live_fallback_minutes": 30 }` (default off) |
 | `recorder` | transcribe | List and pull [Google Recorder](#google-recorder-pixel-phone) recordings from a USB-connected Pixel: `{ "enabled": true, "adb": "adb" }` (default off) |
 | `visuals` | transcribe | Attach screenshots and phone photos taken during the recording — see [Meeting visuals](#meeting-visuals) (default off) |
 | `timezone` | both | IANA tz for the Plaud API (default `Europe/Prague`) |

@@ -914,6 +914,9 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
     # Same for a cut: a gap in the transcript must be explainable from the file.
     if recording_meta.get("cuts"):
         front_matter["cuts"] = ", ".join(recording_meta["cuts"])  # a string, so it gets quoted
+    # Live-feed text is rougher and its speakers aren't named — say so in the file.
+    if recording_meta.get("transcript_from"):
+        front_matter["transcript_from"] = recording_meta["transcript_from"]
 
     fm = yaml_front_matter(front_matter)
 
@@ -1049,7 +1052,10 @@ def wispr_raw_text_cached(recording, work_dir):
     or None if it can't be read. Wispr already produced the transcript locally,
     so this replaces Plaud's download + ElevenLabs steps entirely."""
     transcript_path = work_dir / "transcript.txt"
-    if transcript_path.exists():
+    # A live-feed fallback is never cached: if Wispr refines the meeting later,
+    # a --force redo must pick up the refined transcript instead.
+    live = (recording.get("_wispr") or {}).get("transcript_from") == "live"
+    if transcript_path.exists() and not live:
         return transcript_path.read_text(encoding="utf-8")
     try:
         raw_text = wispr_flow.transcript_text(recording)
@@ -1058,7 +1064,8 @@ def wispr_raw_text_cached(recording, work_dir):
         return None
     if not raw_text:
         return None
-    transcript_path.write_text(raw_text, encoding="utf-8")
+    if not live:
+        transcript_path.write_text(raw_text, encoding="utf-8")
     return raw_text
 
 
@@ -1097,6 +1104,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
         **({"source_path": recording["_local_path"]} if source == "local" else {}),
         **({"source_path": recording["_recorder"]["path"]} if source == "recorder" else {}),
         **({"cuts": [format_cut(c) for c in cuts]} if cuts else {}),
+        **({"transcript_from": "wispr-live"} if wispr_info.get("transcript_from") == "live" else {}),
     }
 
     origin = {"wispr": "Wispr Flow", "local": recording.get("_local_path"),
@@ -1120,7 +1128,9 @@ def process_recording(recording, token, config, folders, projects, state, langua
             print("FAILED (no transcript)")
             return None
         turns = raw_text.count("\n\n") + 1
-        print(f"{turns} turns")
+        live_note = (" (live transcript — Wispr never refined it)"
+                     if wispr_info.get("transcript_from") == "live" else "")
+        print(f"{turns} turns{live_note}")
     else:
         # 1. Obtain audio (local file, Plaud cache, or download)
         audio_path = obtain_audio(recording, token, config, f"[1/{nsteps}]")
