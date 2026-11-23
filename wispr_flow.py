@@ -31,6 +31,13 @@ stop. The rest exists only in `live.ndjson` (lines tagged `"segment": N` on a
 continuous `startRecordingMs` clock); we append every segment that starts after
 the last refined line, so nothing said after a restart is lost.
 
+Sometimes Wispr never writes `refined.ndjson` at all — on 2026-11-23 a meeting
+with an "offline for 6 min" gap stayed unrefined for hours, and was skipped
+without a word. A finalized meeting still unrefined `live_fallback_minutes`
+(default 30) after it ended is therefore processed from `live.ndjson` instead,
+with live speaker labels; until then it is held back with a note, since Wispr
+may still be refining it.
+
 Everything here is read-only and best-effort: the SQLite DB is opened `mode=ro`
 (safe alongside the running app's WAL), and any failure degrades to "no Wispr
 meetings" rather than blocking the Plaud pipeline.
@@ -45,8 +52,17 @@ from pathlib import Path
 DEFAULT_WISPR_DIR = Path.home() / "Library" / "Application Support" / "Wispr Flow"
 
 
+DEFAULT_LIVE_FALLBACK_MIN = 30
+
+
 def _cfg(config):
     return config.get("wispr") or {}
+
+
+def live_fallback_minutes(config):
+    """How long after a meeting ended to wait for Wispr's refined transcript
+    before using the live one (`wispr.live_fallback_minutes`)."""
+    return float(_cfg(config).get("live_fallback_minutes", DEFAULT_LIVE_FALLBACK_MIN))
 
 
 def wispr_dir(config):
@@ -198,17 +214,37 @@ def list_meetings(config, days):
         except sqlite3.Error:
             pass
 
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     for row in rows:
         uuid = row["id"]
         refined = _refined_path(config, uuid)
-        if not refined.exists() or refined.stat().st_size == 0:
-            continue  # transcript not ready — nothing to process yet
-
+        live = _live_path(config, uuid)
         created_ms = _parse_created(row["createdAt"])
         ended_ms = row["endedAt"]
+        if (created_ms or 0) < cutoff_ms and (ended_ms or 0) < cutoff_ms:
+            continue
+        title = row["title"] or "Untitled meeting"
+
+        transcript_from = "refined"
+        if not refined.exists() or refined.stat().st_size == 0:
+            # Never skip silently: a meeting that just vanishes from the list is
+            # only noticed when someone counts (2026-11-23).
+            if not _live_last_ms(live):
+                print(f"  Note: Wispr meeting '{title}' has no transcript yet — not listed",
+                      file=sys.stderr)
+                continue
+            waited_min = (now_ms - int(ended_ms or created_ms or now_ms)) / 60000
+            if waited_min < live_fallback_minutes(config):
+                print(f"  Note: Wispr is still refining '{title}' — listed once refined, or "
+                      f"from its live transcript after {live_fallback_minutes(config):g} min",
+                      file=sys.stderr)
+                continue
+            transcript_from = "live"
 
         if created_ms and ended_ms:
             duration_ms = max(0, int(ended_ms) - created_ms)
+        elif transcript_from == "live":
+            duration_ms = _live_last_ms(live) or 0
         else:
             last_secs = _last_timestamp_seconds(refined)
             duration_ms = (last_secs * 1000) if last_secs else 0
@@ -226,14 +262,15 @@ def list_meetings(config, days):
         meetings.append({
             "id": f"wispr:{uuid}",
             "source": "wispr",
-            "filename": row["title"] or "Untitled meeting",
+            "filename": title,
             "start_time": start_ms,
             "duration": duration_ms,
             "filetag_id_list": [],
             "_wispr": {
                 "uuid": uuid,
                 "refined_path": str(refined),
-                "live_path": str(_live_path(config, uuid)),
+                "live_path": str(live),
+                "transcript_from": transcript_from,
                 "audio_path": str(_audio_path(config, uuid)) if _audio_path(config, uuid) else None,
                 "summary": row["summary"],
                 "notes": row["notes"],
@@ -263,6 +300,24 @@ def _last_timestamp_seconds(refined_path):
     return last
 
 
+def _live_last_ms(live_path):
+    """End of the last live utterance on the recording clock, or None if the
+    live transcript is missing or has no text."""
+    last = None
+    try:
+        with open(live_path, encoding="utf-8") as f:
+            for raw in f:
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if (obj.get("text") or "").strip() and obj.get("endRecordingMs") is not None:
+                    last = max(last or 0, int(obj["endRecordingMs"]))
+    except OSError:
+        return None
+    return last
+
+
 def transcript_text(recording):
     """Build a diarized transcript string from a meeting's refined.ndjson,
     formatted like the Plaud pipeline's output: `[MM:SS] Speaker: text`.
@@ -273,6 +328,9 @@ def transcript_text(recording):
     info = recording.get("_wispr") or {}
     refined_path = info.get("refined_path")
     speaker_names = info.get("speaker_names") or {}
+    if info.get("transcript_from") == "live":
+        # Wispr never refined it: the whole meeting comes from the live feed.
+        return "\n\n".join(_unrefined_live_lines(info.get("live_path"), None, all_segments=True))
     if not refined_path:
         return ""
 
@@ -307,7 +365,7 @@ def _format_ms(ms):
     return f"{secs // 60:02d}:{secs % 60:02d}"
 
 
-def _unrefined_live_lines(live_path, refined_through_secs):
+def _unrefined_live_lines(live_path, refined_through_secs, all_segments=False):
     """Live-transcript lines for the segments Wispr never refined: every segment
     after the first whose first utterance starts after the last refined line.
     The first segment is always refined (we only get here with a non-empty
@@ -318,6 +376,9 @@ def _unrefined_live_lines(live_path, refined_through_secs):
     Live speaker ids come from a separate, mic-level diarization and don't match
     the refined ids, so they get their own `Live speaker N` label instead of
     being passed off as a refined speaker.
+
+    With all_segments, every segment is returned — for a meeting Wispr never
+    refined at all.
     """
     if not live_path or not Path(live_path).exists():
         return []
@@ -338,7 +399,7 @@ def _unrefined_live_lines(live_path, refined_through_secs):
             segments.setdefault(obj["segment"], []).append((start, obj, text))
 
     lines = []
-    for seg in sorted(segments)[1:]:
+    for seg in sorted(segments)[0 if all_segments else 1:]:
         utterances = sorted(segments[seg], key=lambda u: u[0])
         if refined_through_secs is not None and utterances[0][0] // 1000 <= refined_through_secs:
             continue  # refined already covers this segment

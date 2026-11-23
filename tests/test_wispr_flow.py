@@ -72,3 +72,87 @@ class TestFullyRefinedRecording:
         (tmp_path / "live.ndjson").unlink()
 
         assert wispr_flow.transcript_text(rec) == "[00:05] Tomáš: Ahoj."
+
+
+# --- Meetings Wispr never refined (2026-11-23: "offline for 6 min", no refined.ndjson) ---
+
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
+
+def _store(tmp_path, ended_min_ago, refined=None, live=None):
+    """A Wispr data dir with one finalized meeting that ended `ended_min_ago` minutes ago."""
+    db = sqlite3.connect(tmp_path / "flow.sqlite")
+    db.execute("CREATE TABLE Meetings (id, title, summary, notes, speakerMap, participantNames,"
+               " createdAt, endedAt, isDeleted, finalized)")
+    ended = datetime.now(timezone.utc) - timedelta(minutes=ended_min_ago)
+    created = ended - timedelta(minutes=5)
+    db.execute("INSERT INTO Meetings VALUES ('m1', 'Radka', NULL, NULL, NULL, NULL, ?, ?, 0, 1)",
+               (created.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " +00:00", int(ended.timestamp() * 1000)))
+    db.commit()
+    db.close()
+    d = tmp_path / "meetings" / "m1"
+    d.mkdir(parents=True)
+    if refined is not None:
+        _write_ndjson(d / "refined.ndjson", refined)
+    if live is not None:
+        _write_ndjson(d / "live.ndjson", [{"meta": {"v": 3}}] + live)
+    return {"wispr": {"enabled": True, "data_dir": str(tmp_path)}}
+
+
+def _live_turn(start_ms, text, segment=0):
+    return {**_live(segment, start_ms, text, sid=1), "endRecordingMs": start_ms + 2_000}
+
+
+class TestMeetingWisprNeverRefined:
+    """The 23.11 Radka meeting was finalized, but Wispr never wrote its refined
+    transcript — and the pipeline skipped it without a word, so it was only
+    missed when someone counted the day's recordings."""
+
+    def test_is_processed_from_the_live_transcript_once_wispr_had_its_chance(self, tmp_path):
+        config = _store(tmp_path, ended_min_ago=120,
+                        live=[_live_turn(7_000, "Předávací protokoly."), _live_turn(60_000, "Kalkulace.")])
+
+        [meeting] = wispr_flow.list_meetings(config, days=1)
+
+        assert meeting["_wispr"]["transcript_from"] == "live"
+        assert wispr_flow.transcript_text(meeting) == (
+            "[00:07] Live speaker 1: Předávací protokoly.\n\n[01:00] Live speaker 1: Kalkulace.")
+
+    def test_waits_while_wispr_may_still_be_refining_but_says_so(self, tmp_path, capsys):
+        config = _store(tmp_path, ended_min_ago=5, live=[_live_turn(7_000, "Ahoj.")])
+
+        assert wispr_flow.list_meetings(config, days=1) == []
+        assert "still refining 'Radka'" in capsys.readouterr().err
+
+    def test_the_wait_is_configurable_for_people_who_want_it_sooner(self, tmp_path):
+        config = _store(tmp_path, ended_min_ago=5, live=[_live_turn(7_000, "Ahoj.")])
+        config["wispr"]["live_fallback_minutes"] = 1
+
+        assert len(wispr_flow.list_meetings(config, days=1)) == 1
+
+    def test_a_meeting_with_no_transcript_at_all_is_reported_not_dropped_silently(self, tmp_path, capsys):
+        config = _store(tmp_path, ended_min_ago=120, live=[])
+
+        assert wispr_flow.list_meetings(config, days=1) == []
+        assert "'Radka' has no transcript yet" in capsys.readouterr().err
+
+    def test_a_refined_meeting_still_uses_the_refined_transcript(self, tmp_path):
+        config = _store(tmp_path, ended_min_ago=120, refined=[_refined("00:05", "Ahoj.")],
+                        live=[_live_turn(5_000, "Ahoj.")])
+
+        [meeting] = wispr_flow.list_meetings(config, days=1)
+
+        assert meeting["_wispr"]["transcript_from"] == "refined"
+
+
+class TestLiveFallbackIsNotCached:
+    """If Wispr refines the meeting later, a --force redo must get the better transcript."""
+
+    def test_live_text_is_not_written_to_the_transcript_cache(self, tmp_path, monkeypatch):
+        import plaud_transcribe
+        monkeypatch.setattr(wispr_flow, "transcript_text", lambda r: "[00:07] Live speaker 1: Ahoj.")
+        rec = {"_wispr": {"transcript_from": "live"}}
+
+        assert plaud_transcribe.wispr_raw_text_cached(rec, tmp_path) == "[00:07] Live speaker 1: Ahoj."
+        assert not (tmp_path / "transcript.txt").exists()

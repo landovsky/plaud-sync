@@ -14,7 +14,8 @@
   "wispr": {
     "enabled": false,
     "data_dir": "~/Library/Application Support/Wispr Flow",
-    "keep_wispr_summary": true
+    "keep_wispr_summary": true,
+    "live_fallback_minutes": 30
   },
   "recorder": {
     "enabled": false,

@@ -128,7 +128,7 @@ class TestRecorderAudioAndPhotosComeOffThePhoneBeforeTranscription:
         monkeypatch.setattr(plaud_transcribe.google_recorder, "pull",
                             lambda r, c, d: order.append("audio") or _file(tmp_path / "a.m4a"))
         monkeypatch.setattr(visuals, "prefetch_phone",
-                            lambda groups, c: order.append(("photos", [str(g[1]) for g in groups])) or (True, 0))
+                            lambda groups, c, on_ready=None: order.append(("photos", [str(g[1]) for g in groups])) or (True, 0))
         monkeypatch.setattr(plaud_transcribe, "process_recording",
                             lambda *a, **k: order.append("process") or None)
         monkeypatch.setattr(plaud_transcribe, "git_commit_working", lambda *a: None)
@@ -140,7 +140,7 @@ class TestRecorderAudioAndPhotosComeOffThePhoneBeforeTranscription:
     def test_a_merged_session_stages_photos_where_its_visuals_step_reads_them(self, tmp_path, monkeypatch):
         seen = []
         monkeypatch.setattr(plaud_transcribe, "WORKING_DIR", tmp_path)
-        monkeypatch.setattr(visuals, "prefetch_phone", lambda groups, c: seen.extend(groups) or (False, 0))
+        monkeypatch.setattr(visuals, "prefetch_phone", lambda groups, c, on_ready=None: seen.extend(groups) or (False, 0))
 
         plaud_transcribe.prefetch_phone_files([MEETING_B, MEETING_A], True, CONFIG)
 
@@ -155,3 +155,25 @@ class TestRecorderAudioAndPhotosComeOffThePhoneBeforeTranscription:
 def _file(path):
     path.write_bytes(b"abc")
     return path
+
+
+class TestRunWithoutAPhone:
+    """With no phone attached, the run printed 'Phone: copying…' and then nothing,
+    which reads like a hang or a silent failure."""
+
+    def test_prints_no_copying_header_when_the_phone_never_showed_up(self, tmp_path, phone, monkeypatch, capsys):
+        monkeypatch.setattr(plaud_transcribe, "WORKING_DIR", tmp_path)
+        monkeypatch.setattr(visuals, "_await_phone", lambda a: False)
+
+        plaud_transcribe.prefetch_phone_files([MEETING_A], False, CONFIG)
+
+        assert "Phone: copying" not in capsys.readouterr().out
+
+    def test_announces_the_copying_once_the_phone_is_there(self, tmp_path, phone, monkeypatch, capsys):
+        monkeypatch.setattr(plaud_transcribe, "WORKING_DIR", tmp_path)
+
+        plaud_transcribe.prefetch_phone_files([MEETING_A, MEETING_B], False, CONFIG)
+
+        out = capsys.readouterr().out
+        assert out.count("Phone: copying") == 1
+        assert out.index("Phone: copying") < out.index("you can unplug")
