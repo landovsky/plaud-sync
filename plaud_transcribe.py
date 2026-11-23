@@ -1671,8 +1671,18 @@ def prefetch_phone_files(selected, merge, config):
     photos = visuals.enabled(config) and visuals.phone_dirs(config)
     if not (recorder or photos):
         return
-    print("\n  Phone: copying audio and photos for the whole selection first...")
+    shown = []
+
+    def header():
+        # Only once the phone is actually there: with no phone, a "copying"
+        # line followed by nothing reads like a hang or a silent failure.
+        if not shown:
+            shown.append(True)
+            print("\n  Phone: copying audio and photos for the whole selection first...")
+
     used = False
+    if recorder:
+        header()   # Recorder rows are only listed when the phone was found
     for rec in recorder:
         try:
             path = google_recorder.pull(rec, config, AUDIO_DIR)
@@ -1683,7 +1693,7 @@ def prefetch_phone_files(selected, merge, config):
             print(f"    Warning: {rec.get('filename', 'untitled')}: {e}", file=sys.stderr)
     groups = ([(selected, merged_work_dir_for(selected) / "phone")] if merge
               else [([r], work_dir_for(r) / "phone") for r in selected])
-    phone_used, photos_staged = visuals.prefetch_phone(groups, config)
+    phone_used, photos_staged = visuals.prefetch_phone(groups, config, on_ready=header)
     used = used or phone_used
     if photos and phone_used:
         print(f"    {photos_staged} phone photo(s) staged")

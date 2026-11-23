@@ -304,7 +304,7 @@ def _pull_window(adb, config, lo, hi, staging, tz, listings):
     return _staged_phone(staging, lo, hi, tz)
 
 
-def prefetch_phone(groups, config):
+def prefetch_phone(groups, config, on_ready=None):
     """Pull the phone photos of every recording in this run, up front.
 
     `groups` is [(recordings, staging_dir)] — one entry per transcript that will
@@ -314,7 +314,9 @@ def prefetch_phone(groups, config):
 
     Asks for the phone at most once. Afterwards every group counts as fetched,
     whatever the outcome: a recording later in the run uses what is staged and
-    never prompts again. Returns (phone_used, photos_staged).
+    never prompts again. `on_ready` is called once the phone is there, just
+    before pulling — so a run without a phone prints no "copying" header.
+    Returns (phone_used, photos_staged).
     """
     if not enabled(config) or not phone_dirs(config):
         return False, 0
@@ -334,6 +336,8 @@ def prefetch_phone(groups, config):
         ready = _await_phone(adb)
         if not ready:
             return False, sum(len(_staged_phone(s, *w, tz)) for w, s in spans)
+        if on_ready:
+            on_ready()
         listings = {}
         total = 0
         for (lo, hi), staging in spans:
