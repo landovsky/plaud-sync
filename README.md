@@ -337,6 +337,7 @@ The Pixel **Recorder** app saves every recording to the phone's shared storage (
 ```
 
 - Listing is one MediaStore query (`owner_package_name=com.google.android.apps.recorder`). Audio is pulled only for recordings you process and is cached in `docs/audio/`.
+- Audio and [phone photos](#meeting-visuals) are copied off the phone together, before transcription starts, for the whole selection. You can unplug the phone as soon as that phase ends, not after ElevenLabs finishes.
 - **Start time** comes from Recorder's default title stamp (`Oct 13 at 10_12 …`, `Thursday at 06_53`). Recorder rewrites the file when you edit a recording, so the file's timestamp can't be trusted. A recording retitled without the stamp falls back to MediaStore's `datetaken − duration`.
 - **Title**: the date stamp is dropped (the date is already in the output path), so `Oct 14 at 09_51 hh Šárka obchodní` becomes `hh Šárka obchodní`.
 - **Identity** is MediaStore's `datetaken`, so renaming a recording on the phone doesn't make it look new. Outputs carry `source: recorder`, a `recorder_id`, and the on-phone `source_path`.
@@ -394,6 +395,13 @@ running, captions each one, and uses them for both the transcript and the summar
 
 Phone photos are pulled over `adb` (accept the USB-debugging prompt on the device). No
 device, no `adb`, or an unauthorised phone is a warning, never a failure.
+
+**The phone is needed once per run, at the start.** Before any transcription, `process`
+copies everything the selection needs from the phone: Google Recorder audio, then the
+photos of every selected recording, one `adb pull` per phone folder. Then it prints
+*"Everything is copied — you can unplug the phone now"*. Later steps use the copies and
+never ask for the phone again in that run, even for a recording with no photos. Photos that
+an earlier run already staged are not pulled again.
 
 **Two placement classes, deliberately different.** Images captured *inside a recording
 segment* are **anchored**: their time is exact, so they are interleaved into the transcript

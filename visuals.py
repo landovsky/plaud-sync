@@ -238,13 +238,120 @@ def _await_phone(adb):
             return True
 
 
+# Staging dirs whose phone photos were already pulled in this run (by
+# prefetch_phone). Their recordings use the staged copies and never ask for the
+# phone again: it was announced as safe to unplug.
+_prefetched = set()
+
+
+def _staging_key(staging):
+    return str(Path(staging).resolve())
+
+
+def window(recordings, config):
+    """(lo, hi) wall-clock span in which an image belongs to these recordings:
+    first recording start to last recording end plus the post-meeting tail.
+    None if the recordings have no windows."""
+    wins = windows_for(recordings, config)
+    if not wins:
+        return None
+    return (min(w[1] for w in wins),
+            max(w[2] for w in wins) + timedelta(minutes=tail_minutes(config)))
+
+
+def _phone_listing(adb, remote):
+    try:
+        out = subprocess.run([adb, "shell", f"ls {remote} 2>/dev/null"],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    return [n for n in out.split() if n.lower().endswith(IMAGE_SUFFIXES)]
+
+
+def _pull_batch(adb, remote, names, staging):
+    """Copy `names` from one phone dir in a single `adb pull` (one call instead
+    of one per photo). Files land in a scratch dir first and are moved in only
+    once complete, so an interrupted transfer never looks already staged."""
+    if not names:
+        return
+    part = Path(staging) / ".part"
+    part.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([adb, "pull", *[f"{remote}/{n}" for n in names], str(part)],
+                       capture_output=True, timeout=180 + 30 * len(names))
+    except (subprocess.SubprocessError, OSError):
+        pass
+    for n in names:
+        src = part / n
+        if src.exists():
+            src.replace(Path(staging) / n)
+    shutil.rmtree(part, ignore_errors=True)
+
+
+def _pull_window(adb, config, lo, hi, staging, tz, listings):
+    """Pull the phone photos taken in [lo, hi] into staging, skipping ones an
+    earlier run already staged (a photo never changes once taken). `listings`
+    caches each phone dir's file list across calls. Returns the staged photos."""
+    staging = Path(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    for remote in phone_dirs(config):
+        if remote not in listings:
+            listings[remote] = _phone_listing(adb, remote)
+        wanted = [n for n in listings[remote]
+                  if (t := capture_time(n, tz)) and lo <= t <= hi   # filename only — no stat() on the device
+                  and not (staging / n).exists()]
+        _pull_batch(adb, remote, wanted, staging)
+    return _staged_phone(staging, lo, hi, tz)
+
+
+def prefetch_phone(groups, config):
+    """Pull the phone photos of every recording in this run, up front.
+
+    `groups` is [(recordings, staging_dir)] — one entry per transcript that will
+    be written. Done before any transcription, so the phone can be unplugged
+    after one short phase instead of being needed again by each recording's
+    visuals step, minutes later (and after ElevenLabs, for Recorder audio).
+
+    Asks for the phone at most once. Afterwards every group counts as fetched,
+    whatever the outcome: a recording later in the run uses what is staged and
+    never prompts again. Returns (phone_used, photos_staged).
+    """
+    if not enabled(config) or not phone_dirs(config):
+        return False, 0
+    import plaud_transcribe as pt
+    tz = pt.local_tz(config)
+    spans = [(window(recs, config), staging) for recs, staging in groups]
+    spans = [(w, s) for w, s in spans if w]
+    keys = {_staging_key(s) for _, s in spans}
+    adb = adb_bin(config)
+    ready = False
+    try:
+        if not spans:
+            return False, 0
+        if not shutil.which(adb):
+            print(f"  Note: '{adb}' not found — skipping phone photos", file=sys.stderr)
+            return False, sum(len(_staged_phone(s, *w, tz)) for w, s in spans)
+        ready = _await_phone(adb)
+        if not ready:
+            return False, sum(len(_staged_phone(s, *w, tz)) for w, s in spans)
+        listings = {}
+        total = 0
+        for (lo, hi), staging in spans:
+            total += len(_pull_window(adb, config, lo, hi, staging, tz, listings))
+        return True, total
+    finally:
+        _prefetched.update(keys)
+
+
 def _pull_phone(config, lo, hi, staging):
     """Copy phone images whose filename time falls in the window.
 
-    A re-run finds the photos an earlier run already pulled into `staging`. If the
-    phone isn't connected then, those copies are used instead of asking for it —
-    otherwise re-processing a meeting silently drops its phone photos (a 14.10
-    backfill lost the printed margin table that way).
+    After prefetch_phone, the staged copies are the answer — the phone may
+    already be unplugged. Otherwise a re-run finds the photos an earlier run
+    already pulled into `staging`. If the phone isn't connected then, those
+    copies are used instead of asking for it — otherwise re-processing a meeting
+    silently drops its phone photos (a 14.10 backfill lost the printed margin
+    table that way).
     """
     adb = adb_bin(config)
     if not phone_dirs(config):
@@ -253,6 +360,8 @@ def _pull_phone(config, lo, hi, staging):
     import plaud_transcribe as pt
     tz = pt.local_tz(config)
     staged = _staged_phone(staging, lo, hi, tz)
+    if _staging_key(staging) in _prefetched:
+        return staged
     if staged and not (shutil.which(adb) and _device_state(adb) == "ready"):
         print(f"  Phone not connected — using {len(staged)} photo(s) pulled by an earlier run.")
         return staged
@@ -262,28 +371,7 @@ def _pull_phone(config, lo, hi, staging):
         return []
     if not _await_phone(adb):
         return []
-    pulled = []
-    staging.mkdir(parents=True, exist_ok=True)
-    for remote in phone_dirs(config):
-        try:
-            listing = subprocess.run([adb, "shell", f"ls {remote} 2>/dev/null"],
-                                     capture_output=True, text=True, timeout=60).stdout
-        except (subprocess.SubprocessError, OSError):
-            continue
-        for name in listing.split():
-            if not name.lower().endswith(IMAGE_SUFFIXES):
-                continue
-            t = capture_time(name, tz)   # filename only — no stat() on the device
-            if not t or not (lo <= t <= hi):
-                continue
-            dest = staging / name
-            try:
-                subprocess.run([adb, "pull", f"{remote}/{name}", str(dest)],
-                               capture_output=True, timeout=180)
-            except (subprocess.SubprocessError, OSError):
-                continue
-            if dest.exists():
-                pulled.append(dest)
+    pulled = _pull_window(adb, config, lo, hi, staging, tz, {})
 
     # The phone is only needed for this step. Say so explicitly — otherwise it
     # stays plugged in for the rest of the run (captioning and summarizing can
@@ -318,10 +406,10 @@ def collect(recordings, config, staging, transcript=None):
     import plaud_transcribe as pt
     tz = pt.local_tz(config)
     wins = windows_for(recordings, config)
-    if not wins:
+    span = window(recordings, config)
+    if not span:
         return []
-    lo = min(w[1] for w in wins)
-    hi = max(w[2] for w in wins) + timedelta(minutes=tail_minutes(config))
+    lo, hi = span
 
     candidates = []
     for d in screenshot_dirs(config):
