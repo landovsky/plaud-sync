@@ -183,6 +183,16 @@ def notify(title, message, sound=None):
         pass
 
 
+def _displays_status(names, patterns, overrides):
+    """status.json `displays`: [{name, captured, source}] so the menu bar never
+    calls JXA. [] when the names are not known."""
+    out = []
+    for n in names:
+        captured, source = display_state(n, patterns, overrides)
+        out.append({"name": n, "captured": captured, "source": source})
+    return out
+
+
 def _write_status(**fields):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     fields["updated"] = time.time()
@@ -330,6 +340,64 @@ def _screens():
 def _ignored_display(name, patterns):
     """Whether a monitor is one config says never to capture (part of its name)."""
     return bool(name) and any(p and p.lower() in name.lower() for p in patterns)
+
+
+OVERRIDES_FILE = STATE_DIR / "displays.json"
+_overrides_cache = {"key": None, "data": {}}
+
+
+def load_overrides():
+    """{display name: True|False} set by `display <name|n> on|off`. Re-read only
+    when the file's mtime changes, so the capture loop can call it every sample
+    and a toggle applies from the next frame without a restart."""
+    try:
+        st = OVERRIDES_FILE.stat()
+    except OSError:
+        _overrides_cache.update(key=None, data={})
+        return {}
+    key = (str(OVERRIDES_FILE), st.st_mtime_ns, st.st_size)
+    if _overrides_cache["key"] != key:
+        try:
+            raw = json.loads(OVERRIDES_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        data = {k: v for k, v in raw.items() if isinstance(v, bool)} if isinstance(raw, dict) else {}
+        _overrides_cache.update(key=key, data=data)
+    return dict(_overrides_cache["data"])
+
+
+def set_override(name, on):
+    """Store an override under the display's NAME (not its index), atomically."""
+    data = load_overrides()
+    data[name] = bool(on)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = OVERRIDES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, OVERRIDES_FILE)
+
+
+def display_state(name, patterns, overrides):
+    """(captured, source): an override wins over ignore_displays in both
+    directions; source is "override", "config" (a pattern skips it) or "default"."""
+    if name and name in (overrides or {}):
+        return bool(overrides[name]), "override"
+    if _ignored_display(name, patterns):
+        return False, "config"
+    return True, "default"
+
+
+def resolve_display(target, names):
+    """A display number (as `displays` shows it) or exact name -> the NAME, which
+    is what gets stored so an unplugged monitor keeps its override. ValueError
+    lists the current displays when the target matches none."""
+    listing = ", ".join(f"{i}={n}" for i, n in enumerate(names, 1)) or "none found"
+    if target.isdigit():
+        if 1 <= int(target) <= len(names):
+            return names[int(target) - 1]
+        raise ValueError(f"no display {target}; current displays: {listing}")
+    if target in names:
+        return target
+    raise ValueError(f"unknown display {target!r}; current displays: {listing}")
 
 
 def _sources(urls=True):
@@ -604,11 +672,13 @@ def capture(config, should_continue, reason):
                 continue
 
             cur = None
-            if len(shots) > 1 or s["ignore_displays"]:
+            overrides = load_overrides()  # mtime-cached: a toggle applies from this sample on
+            if len(shots) > 1 or s["ignore_displays"] or overrides:
                 cur, got = _screens()
                 if len(got) == len(shots):
                     names = got
-                elif len(names) != len(shots) and s["ignore_displays"] and not names_warned:
+                elif (len(names) != len(shots) and (s["ignore_displays"] or overrides)
+                      and not names_warned):
                     # Unknown names: capture rather than lose the meeting, as _private does.
                     _log("display names unknown — ignore_displays not applied until they are")
                     names_warned = True
@@ -627,12 +697,13 @@ def capture(config, should_continue, reason):
 
             for idx, path in shots:
                 name = names[idx - 1] if len(names) == len(shots) else None
-                if _ignored_display(name, s["ignore_displays"]):
+                captured, why = display_state(name, s["ignore_displays"], overrides)
+                if not captured:
                     path.unlink(missing_ok=True)
                     if idx not in ignored:
                         ignored.add(idx)
-                        _event(timeline, t=t0, display=idx, event="ignored", name=name)
-                        _log(f"display {idx} ({name}): ignored by config, not capturing")
+                        _event(timeline, t=t0, display=idx, event="ignored", name=name, by=why)
+                        _log(f"display {idx} ({name}): ignored by {why}, not capturing")
                         tracker.forget(idx)
                     continue
                 if idx in ignored:
@@ -668,7 +739,9 @@ def capture(config, should_continue, reason):
                     _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
 
             _write_status(state="capturing", session=str(session), reason=reason, started=started,
-                          saved=tracker.saved, revisits=tracker.revisits, displays=len(shots),
+                          saved=tracker.saved, revisits=tracker.revisits,
+                          displays=_displays_status(names if len(names) == len(shots) else [],
+                                                    s["ignore_displays"], overrides),
                           ignored=sorted(names[i - 1] for i in ignored if i <= len(names)),
                           focus=focus, raw=bool(raw_dir))
             time.sleep(max(0.0, s["interval_s"] - (time.time() - t0)))
@@ -1256,7 +1329,9 @@ def main():
   one-time setup:   install-app, grant Screen Recording to Plaud Autocapture, install-agent
   is it working?    status   (process, state, agent); check  (permission probes via the app)
   pause / resume:   stop  (agent stays paused until `start`);  start --watch
-  skip a monitor:   displays  (names), then config visuals.autocapture.ignore_displays,
+  switch a monitor off for now:  display 2 off   (back on: display 2 on; applies from the next
+                    frame, survives restarts; stored by name in ~/.cache/plaud-autocapture/displays.json)
+  skip a monitor:   displays  (names, state, source), then config visuals.autocapture.ignore_displays,
                     e.g. ["built-in"]; then stop + start --watch (config is read at start)
   re-tune offline:  replay <session> --set change=0.04
 log: ~/.cache/plaud-autocapture/autocapture.log""")
@@ -1269,7 +1344,10 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     st.add_argument("--hours", type=float)
     sub.add_parser("stop", help="stop a background capture/watch")
     sub.add_parser("status", help="show what autocapture is doing")
-    sub.add_parser("displays", help="list monitors by name and whether ignore_displays skips them")
+    sub.add_parser("displays", help="list monitors by name, whether they are captured, and why (override/config)")
+    dp = sub.add_parser("display", help="switch one monitor's capture on or off, no restart (stored by name)")
+    dp.add_argument("target", help="display name, or its number as shown by `displays`")
+    dp.add_argument("state", choices=["on", "off"])
     sub.add_parser("install-app", help="build ~/Applications/Plaud Autocapture.app (named permission prompt)")
     ia = sub.add_parser("install-agent", help="keep the Wispr watcher running across logins, reboots and crashes")
     ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
@@ -1382,9 +1460,22 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
         _, names = _screens()
         if not names:
             sys.exit("could not ask macOS for the displays")
+        overrides = load_overrides()
         for i, n in enumerate(names, 1):
-            print(f"{i}  {n:32} {'ignored' if _ignored_display(n, patterns) else 'captured'}")
+            captured, source = display_state(n, patterns, overrides)
+            print(f"{i}  {n:32} {'captured' if captured else 'ignored':9} {source}")
         print(f"ignore_displays: {patterns}  (part of a name, case-insensitive)")
+        gone = sorted(k for k in overrides if k not in names)
+        if gone:
+            print(f"overrides for displays not connected now: {gone}")
+    elif args.cmd == "display":
+        _, names = _screens()
+        try:
+            name = resolve_display(args.target, names)
+        except ValueError as e:
+            sys.exit(str(e))
+        set_override(name, args.state == "on")
+        print(f"display {name!r}: capture {args.state} (applies from the next frame)")
 
 
 if __name__ == "__main__":

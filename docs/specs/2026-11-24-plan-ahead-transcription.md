@@ -455,8 +455,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K5 | B1, B4 | done | af01afa | `load_runner_env` (direnv exec, only 3 keys + PATH), `preflight` before any paid call, Wispr/recorder jobs resolved without the Plaud API, `install-runner`/`uninstall-runner` (WatchPaths + StartInterval 60), shared `--help` test; uncommitted. B1 (starts within 10 s after enqueue, live) pending a manual check by the manager after install |
 | K6 | C1, C2, C3, C5, C7 | done | `3fb2919` | `publish.py` commit/push steps registered in runner (worktree on `transcripts/<id>`, push to main with rebase retry, safe ff), 22 tests in `tests/test_publish_main.py`; uncommitted; pr mode fails with "pr lands in K7" |
 | K7 | C4, C6, D8 | done | `e557513` | `publish.push_pr` (push branch if origin tip differs, reuse open PR via `gh pr list --head`, else `gh pr create`), `GH_BIN`/`runner.gh`, knobs in `runner --help`, 12 tests in `tests/test_publish_pr.py` |
-| K8 | D1-D4 | done | | `deliver.py` (work text, parsed outcome message/fresh/held/unknown/plan, held step state so retry re-delivers only), `runner --deliver-plan`, README stage-1 section, 34 tests in `tests/test_deliver.py` + `tests/test_runner_e2e.py`; uncommitted |
-| K9 | F1, F2, F3 | pending | | Display overrides + `display` command |
+| K8 | D1-D4 | done | `de1510c` | `deliver.py` (work text, parsed outcome message/fresh/held/unknown/plan, held step state so retry re-delivers only), `runner --deliver-plan`, README stage-1 section, 34 tests in `tests/test_deliver.py` + `tests/test_runner_e2e.py`; uncommitted |
+| K9 | F1, F2, F3 | done | | `displays.json` overrides (by name, mtime-cached), `display <name|n> on|off`, source column, status.json `displays` list; uncommitted |
 | K10 | F4, F6, F7 | pending | | SwiftBar plugin, read-only status + install-swiftbar |
 | K11 | F5, D2, D9 | pending | | SwiftBar actions: toggles, pause, retry/cancel/seen |
 | K12 | G1, G3 (logic) | pending | | Plan logic without UI: pending list, suggestions, build_job |
