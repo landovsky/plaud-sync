@@ -2178,6 +2178,11 @@ config: projects  (~/.plaud-sync/config.json)
 
 
 def main():
+    # Job-queue commands have their own parser and never touch the network.
+    if len(sys.argv) > 1 and sys.argv[1] in ("enqueue", "jobs"):
+        import jobs_cli
+        sys.exit(jobs_cli.main(sys.argv[1:], host=sys.modules[__name__]))
+
     parser = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Download, transcribe, classify and summarize Plaud recordings",
@@ -2185,7 +2190,7 @@ def main():
         epilog=CONFIG_HELP,
     )
     parser.add_argument("command", nargs="?", default="process",
-                        choices=["list", "process", "move", "init", "file"])
+                        choices=["list", "process", "move", "init", "file", "enqueue", "jobs"])
     parser.add_argument("extra", nargs="*",
                         help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...; "
                              "for 'process': one recording (id, id prefix or title words)")
