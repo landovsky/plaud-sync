@@ -10,7 +10,8 @@ after, so a crash or reboot resumes at the first unfinished step (B2). The
 transcribe step leans on the pipeline's work-dir cache, so a resume does not pay
 for the transcription twice. Steps are pluggable (STEP_FUNCS): commit/push are
 publish.py (worktree commit + push, never touching the user's checkout);
-deliver is still a placeholder that marks itself `skipped`.
+deliver is deliver.py (cc-tree hand-off). A held delivery leaves the deliver step
+in state `held` and the job `held`; `jobs retry` then runs that step alone.
 
 One runner at a time: a flock on the lock file (the kernel drops it when the
 process dies, so a crash never leaves a stale lock). A second runner exits 0 at
@@ -27,6 +28,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import deliver
 import jobs
 import publish
 from autocapture import notify  # module-level, dependency-free: reused, not copied
@@ -230,15 +232,11 @@ def step_transcribe(job, ctx, checkpoint=None):
     return "done"
 
 
-def _placeholder(job, ctx, checkpoint=None):
-    return "skipped"   # K8 registers the real deliver
-
-
 STEP_FUNCS = {
     "transcribe": step_transcribe,
     "commit": publish.step_commit,
     "push": publish.step_push,
-    "deliver": _placeholder,
+    "deliver": deliver.step_deliver,
 }
 
 
@@ -302,6 +300,12 @@ def run_job(job, ctx):
                 return "failed"
             jobs.set_step(job, name, outcome or "done")
             _save(job)
+            if outcome == "held":
+                held_id = ((job.get("result") or {}).get("delivered") or {}).get("id")
+                job.update(state="held", error=f"held for you: {held_id or '?'}")
+                _save(job)
+                ctx.notify("Plaud job held", f"held for you: {held_id or '?'} ({job['id']})")
+                return "held"
         job["state"] = "done"
         job["error"] = None
         job.pop("failed_step", None)
@@ -320,10 +324,10 @@ def _runnable(job):
     return job.get("state") in ("queued", "running")
 
 
-def run_queue(host, days=DEFAULT_DAYS, once=False, only=None, say=print):
+def run_queue(host, days=DEFAULT_DAYS, once=False, only=None, say=print, deliver_plan=False):
     """Oldest queued job first, until none is left. Returns the ids it ran."""
     visuals.set_interactive(False)   # before anything can reach the phone prompt
-    ctx = SimpleNamespace(host=host, days=days, notify=lambda *a, **k: notify(*a, **k))
+    ctx = SimpleNamespace(host=host, days=days, deliver_plan=deliver_plan, notify=lambda *a, **k: notify(*a, **k))
     ran = []
     while True:
         candidates = [j for j in jobs.list_jobs()
@@ -349,6 +353,8 @@ recipes:
     plaud-transcribe runner --job 20261124-1702
   look further back for Plaud recordings than the default 30 days
     plaud-transcribe runner --days 90        (or config: {"runner": {"days": 90}})
+  see what delivery would do, without messaging any session
+    plaud-transcribe runner --deliver-plan
   use another lock file (tests)
     plaud-transcribe runner --lock-file /tmp/r.lock
 
@@ -371,6 +377,18 @@ publishing (push = main | pr, see publish.py):
                            (default 3); config {"runner": {"push_retries": N}}
     GH_BIN=/path/to/gh     gh binary for pr mode (default gh);
                            config {"runner": {"gh": "/path/to/gh"}}
+
+hand-off (deliver.py): `cc-tree deliver <node> -` with the work text on stdin
+  once the transcripts are pushed. Skipped for mode none or no node. A held
+  delivery sets the job to 'held' (one notification, "held for you: <id>");
+  `jobs retry` then re-delivers only. cc-tree missing or failing fails just the
+  deliver step; the transcript stays pushed and a retry makes no new commit.
+    CC_TREE_BIN=/path/cc-tree      cc-tree binary (default cc-tree);
+                                   config {"deliver": {"bin": "..."}}
+    PLAUD_DELIVER_TIMEOUT=SECONDS  wait for cc-tree (default 180); config deliver.timeout
+    PLAUD_DELIVER_PLAN=1           dry run, same as --deliver-plan: runs
+                                   `cc-tree deliver <node> --plan`, records its
+                                   answer, never messages anything
 
 credentials:
   Started by launchd there is no shell, so at start the runner fills in what is
@@ -397,6 +415,9 @@ def build_parser():
     p.add_argument("--days", type=int, default=None,
                    help=f"how far back to look up Plaud recordings by id "
                         f"(default: config runner.days, else {DEFAULT_DAYS})")
+    p.add_argument("--deliver-plan", action="store_true",
+                   help="dry-run the hand-off: `cc-tree deliver <node> --plan`, nothing is sent "
+                        "(same as PLAUD_DELIVER_PLAN=1)")
     return p
 
 
@@ -427,7 +448,7 @@ def main(argv=None, host=None):
                 days = int((host.load_config(validate=False).get("runner") or {}).get("days", DEFAULT_DAYS))
             except (OSError, ValueError, TypeError):
                 days = DEFAULT_DAYS
-        run_queue(host, days=days, once=args.once, only=only)
+        run_queue(host, days=days, once=args.once, only=only, deliver_plan=args.deliver_plan)
     finally:
         lock.close()
     return 0

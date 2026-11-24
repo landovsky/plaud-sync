@@ -140,6 +140,36 @@ That's it. Transcripts and summaries appear under the mapped project directory. 
 
 ---
 
+## Unattended runs: enqueue, runner, push, deliver
+
+Instead of running the pipeline in a terminal, queue a job and let a background runner do it:
+
+```bash
+plaud-transcribe enqueue --recording plaud:<id> --project Alpha   # --note "only the action items", --mode later
+plaud-transcribe install-runner      # LaunchAgent: starts the runner when a job file appears
+plaud-transcribe jobs list           # state per job; failed/held ones are marked with !
+plaud-transcribe jobs retry <id>     # failed or held job: resumes at the first unfinished step
+plaud-transcribe jobs seen <id>      # acknowledge a failed/held job without retrying it
+plaud-transcribe runner --help       # every knob, with recipes
+```
+
+A job runs four steps: transcribe, commit, push, deliver. Commits are made in a temporary worktree of
+`origin/main`, so your checkout and any session working in it are not touched. Per project, `push` is
+`main` (straight to main), `pr` (a branch plus a pull request via `gh`) or `none`. A project's `node`
+is the cc-tree node that is handed the finished work (`cc-tree deliver <node> -`, with the titles,
+repo-relative paths, commit and PR link on stdin); `deliver_ask` is the standing "process it" request,
+and `enqueue --note` overrides it for one job. `--mode later` only says the transcript exists.
+cc-tree chooses between messaging a healthy session, starting a fresh one or holding the work for
+you; a held job shows as `held` with the cc-tree id. If cc-tree is missing or fails, only the deliver
+step fails: the transcript stays pushed and `jobs retry` re-delivers without a new commit.
+`runner --deliver-plan` (or `PLAUD_DELIVER_PLAN=1`) asks cc-tree what it would do and sends nothing.
+
+One-time setup: the LaunchAgent has no shell, so the runner loads its credentials with
+`direnv exec` in this repo. Run `direnv allow` here once, and make sure `ELEVENLABS_API_KEY` is in
+the sops-encrypted credentials the `.envrc` reads (add it yourself; the runner only reads it).
+
+---
+
 ## Usage
 
 ### `plaud_transcribe.py` — the full pipeline
