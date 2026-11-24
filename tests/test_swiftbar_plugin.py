@@ -415,7 +415,7 @@ class TestJobActions:
         acts = [l for l, p, a in menu_items(out) if "—" in l]
         assert len(acts) == 1 and acts[0].startswith("⟳")
 
-    def test_plugin_has_no_arm_entry_yet(self):
+    def test_no_arm_entry_while_no_meeting_is_live(self):
         out = render([self._failed()], actions=ACT)
         assert "Arm current" not in out
 
@@ -507,3 +507,59 @@ class TestPlanItem:
         with pytest.raises(SystemExit):
             jobs_cli.main(["install-swiftbar", "--help"])
         assert "terminal_cmd" in capsys.readouterr().out
+
+
+LIVE = {"state": "capturing", "started": NOW - 600, "saved": 3,
+        "meeting": {"id": "9f2c-aaaa", "title": "Koperníci weekly"}}
+
+
+class TestArmCurrentMeetingItem:
+    """K15 / E4: planning during the meeting is one click, offered only while there is a
+    live Wispr meeting to arm (the plugin learns it from status.json, never from Wispr)."""
+
+    def test_item_opens_the_plan_screen_on_the_live_meeting_and_parses_through_the_real_parser(self):
+        (p, a), = by_label(render(status=LIVE, actions=ACT), "Arm current meeting")
+        assert p["terminal"] == "true" and a == [f"{REPO}/plaud_transcribe.py", "plan", "--arm-live"]
+        ns = parse_for_real(p, a)
+        assert ns.command == "plan" and ns.arm_live is True
+
+    def test_it_uses_the_configured_terminal_like_the_plan_item(self):
+        act = {**ACT, "terminal_cmd": ["open", "-na", "Ghostty", "--args", "-e"]}
+        (p, a), = by_label(render(status=LIVE, actions=act), "Arm current meeting")
+        assert p["bash"] == "open" and a[-3:] == [f"{REPO}/plaud_transcribe.py", "plan", "--arm-live"]
+
+    def test_no_item_when_watching_idle_or_when_the_status_carries_no_meeting(self):
+        for status in ({"state": "watching"}, {"state": "capturing", "saved": 1},
+                       {"state": "capturing", "meeting": None}, {"state": "capturing", "meeting": {"id": ""}},
+                       {"state": "watching", "meeting": LIVE["meeting"]}):
+            assert "Arm current" not in render(status=status, actions=ACT)
+
+    def test_no_item_when_the_watcher_is_down_because_its_last_status_is_stale(self):
+        assert "Arm current" not in render(status=LIVE, pid_alive=False, actions=ACT)
+
+    def test_no_item_without_the_recorded_interpreter(self):
+        assert "Arm current" not in render(status=LIVE)
+
+
+class TestArmedJobsInTheMenu:
+    def _armed(self, **kw):
+        return job("armed", id="a1", recordings=[], trigger={"wispr": "9f2c-aaaa", "title": "Koperníci weekly",
+                                                             "armed_at": _iso()}, **kw)
+
+    def test_an_armed_job_says_which_meeting_it_waits_for(self):
+        out = render([self._armed()], actions=ACT)
+        assert "⏳ hriste: armed meeting — waiting for 'Koperníci weekly' to end" in out
+
+    def test_without_a_stored_title_it_still_reads_sensibly(self):
+        j = self._armed()
+        j["trigger"].pop("title")
+        assert "waiting for the meeting to end" in render([j], actions=ACT)
+
+    def test_cancel_is_offered_and_runs_the_real_jobs_cancel(self):
+        (p, a), = by_label(render([self._armed()], actions=ACT), "Cancel")
+        ns = parse_for_real(p, a)
+        assert (ns.command, ns.jobs_command, ns.id) == ("jobs", "cancel", "a1")
+
+    def test_armed_jobs_are_not_counted_as_the_runner_being_busy(self):
+        assert title(render([self._armed()], actions=ACT)) == "○"
+        assert title(render([self._armed(), job("running", id="r")], actions=ACT)) == "⟳1"

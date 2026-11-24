@@ -69,3 +69,21 @@ class TestResumedMeetingKeepsCapturing:
         config, _ = _store(tmp_path, ended, [PAUSED, RESUMED, _said(1, "Pokračujeme.")], live_age_s=20 * 60)
 
         assert autocapture.wispr_live_meeting(config, 3) is None
+
+
+class TestMeetingTitleForTheMenu:
+    """The menu says which meeting "Arm current meeting..." arms; the watcher puts the title
+    into status.json, and a missing one must never stop a capture."""
+
+    def test_the_title_is_read_from_the_wispr_row(self, tmp_path):
+        config, mid = _store(tmp_path, None, [])
+        conn = sqlite3.connect(tmp_path / "flow.sqlite")
+        conn.execute("ALTER TABLE Meetings ADD COLUMN title TEXT")
+        conn.execute("UPDATE Meetings SET title = 'Koperníci weekly'")
+        conn.commit()
+        conn.close()
+        assert autocapture.meeting_title(config, mid) == "Koperníci weekly"
+
+    def test_an_unreadable_store_gives_an_empty_title_not_an_exception(self, tmp_path):
+        config, mid = _store(tmp_path, None, [])    # fixture has no title column
+        assert autocapture.meeting_title(config, mid) == ""

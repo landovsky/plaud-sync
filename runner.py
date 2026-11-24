@@ -561,6 +561,7 @@ hand-off (deliver.py): `cc-tree deliver <node> -` with the work text on stdin
   deliver step; the transcript stays pushed and a retry makes no new commit.
     CC_TREE_BIN=/path/cc-tree      cc-tree binary (default cc-tree);
                                    config {"deliver": {"bin": "..."}}
+    PLAUD_NONINTERACTIVE=1         never read stdin in the pipeline, even on a terminal (the runner sets it itself)
     PLAUD_DELIVER_TIMEOUT=SECONDS  wait for cc-tree (default 180); config deliver.timeout
     PLAUD_DELIVER_PLAN=1           dry run, same as --deliver-plan: runs
                                    `cc-tree deliver <node> --plan`, records its

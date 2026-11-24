@@ -142,6 +142,11 @@ the Python that ran install-swiftbar. That path is recorded in ~/.plaud-sync/swi
 Re-run install-swiftbar after moving the repo or switching Python; without the file the menu
 shows no actions. Actions pass --notify-errors, so a failure becomes a notification.
 
+"Arm current meeting..." appears only while autocapture is capturing a live Wispr meeting (the
+watcher records its id and title in status.json). It opens the same terminal on
+`plaud-transcribe plan --arm-live`. An armed job shows in Jobs as "waiting for '<title>' to
+end", with Cancel, and is not counted in the title's ⟳ number.
+
 "Plan a transcript..." opens a terminal running `plaud-transcribe plan`. By default that is
 SwiftBar's own terminal=true. To use another terminal, set `swiftbar.terminal_cmd` in
 ~/.plaud-sync/config.json (a list: the command line that precedes the command to run) and
@@ -156,9 +161,15 @@ recipes:
     plaud-transcribe plan
   look further back
     plaud-transcribe plan --days 60
+  plan it during the meeting: open with the live Wispr meeting selected; saving ARMS the job
+  (it runs once the meeting has ended and its transcript is ready; same as the menu's
+  "Arm current meeting..." and `enqueue --arm-wispr live`). Without a live meeting the screen
+  says so and is a normal plan.
+    plaud-transcribe plan --arm-live
 
 keys: Space select, m merge, c cut a span out of the highlighted recording, p project,
-  n node (fuzzy over `cc-tree show <tree>`), x clear the node, Tab next field, Enter save
+  n node (fuzzy over `cc-tree show <tree>`), x clear the node, a arm the highlighted row (only a
+  live Wispr meeting can be armed; it cannot be combined with other recordings, m or c), Tab next field, Enter save
   (ctrl+s inside a text area, where Enter is a newline), Esc quit. On save the job id is printed.
   The screen only writes the job file; the runner does the work (same job as `enqueue`).
 
@@ -259,6 +270,9 @@ def build_parser():
                                     "save a job. Nothing is processed here.",
                         epilog=PLAN_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     pl.add_argument("--days", type=int, default=30, help="how far back to list recordings (default 30)")
+    pl.add_argument("--arm-live", action="store_true",
+                    help="open with the live Wispr meeting selected, to arm a job on it (saving "
+                         "queues it for after the meeting ends); says so when no meeting is live")
     return p
 
 
@@ -429,7 +443,7 @@ def build_enqueue_job(args, host):
             raise jobs.JobError(f"--cut must be REC=START-END, got {item!r}")
         cuts.setdefault(rec, []).append(span)
     import plan_logic   # the one place plan fields become a job (same for the plan screen)
-    arm = None
+    arm = arm_title = None
     if getattr(args, "arm_wispr", None):
         if args.recording or args.merge or args.cut:
             raise jobs.JobError("--arm-wispr waits for a meeting that is still running; it cannot "
@@ -440,11 +454,11 @@ def build_enqueue_job(args, host):
             if not row:
                 raise jobs.JobError("no Wispr meeting is live right now (is Wispr recording, and "
                                     "wispr.enabled set?); pass --arm-wispr <uuid> to arm a known one")
-            arm = row["id"].removeprefix("wispr:")
+            arm, arm_title = row["id"].removeprefix("wispr:"), row.get("filename")
     return plan_logic.build_job(
         {"recordings": args.recording, "merge": args.merge, "cuts": cuts,
          "instructions": args.instructions, "project": args.project, "push": args.push,
-         "node": args.node, "mode": args.mode, "note": args.note, "arm": arm}, host=host)
+         "node": args.node, "mode": args.mode, "note": args.note, "arm": arm, "arm_title": arm_title}, host=host)
 
 
 def cmd_enqueue(args, host):
@@ -533,12 +547,12 @@ def cmd_plan(args, host):
                 if Path(cand).exists() and Path(cand) != Path(sys.executable):
                     os.environ[REEXEC_ENV] = "1"   # one hop only: no loop if that Python lacks it too
                     os.execv(cand, [cand, str(REPO_DIR / "plaud_transcribe.py"), "plan",
-                                    "--days", str(args.days)])
+                                    "--days", str(args.days)] + (["--arm-live"] if args.arm_live else []))
                     return 0   # not reached: execv replaces this process
         print(PLAN_HINT.format(python=sys.executable), file=sys.stderr)
         return 2
     import plan_app
-    job_id = plan_app.PlanApp(host=host, days=args.days).run()
+    job_id = plan_app.PlanApp(host=host, days=args.days, arm_live=args.arm_live).run()
     if job_id:
         print(job_id)
     return 0

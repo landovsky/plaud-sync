@@ -188,6 +188,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-plan.txt
 | Esc | quit, nothing written (asks once, "Esc again", if you changed anything; goes back from the summary) |
 | Space | select or unselect the recording under the cursor (the first row starts selected; a live Wispr meeting is first) |
 | `m` / `c` | merge the selected recordings / cut a span out of the highlighted one (not together) |
+| `a` | arm: select only the highlighted row (works on the live Wispr meeting only) |
 | `p` / `n` / `x` | pick the project / pick a node from `cc-tree show <tree>` / clear the node |
 | Tab | next field: recordings, mode, note, instructions |
 
@@ -195,6 +196,27 @@ The common case (newest recording, suggested project, its node) is Enter, Enter.
 "Plan a transcript…", which opens a terminal on this screen; `swiftbar.terminal_cmd` in the config
 (for example `["open", "-na", "Ghostty", "--args", "-e"]`) picks another terminal, see
 `plaud-transcribe install-swiftbar --help`. Tests: `.venv/bin/pytest` (the Homebrew run skips the screen tests).
+
+### Plan it during the meeting
+
+Decide what happens to a transcript while the meeting is still running, then forget it:
+
+1. While Wispr is recording and autocapture is watching, pick **Arm current meeting…** in the SwiftBar
+   menu. It opens the plan screen with the live meeting selected (`plaud-transcribe plan --arm-live`).
+   Choose project, node and note as usual and press Enter, Enter. Without the menu:
+   `plaud-transcribe enqueue --arm-wispr live --project "…"` (or `--arm-wispr <uuid>`).
+2. The job is `armed` and shows in the menu as "waiting for '<title>' to end", with Cancel. It is not
+   counted in the title's ⟳ number and does nothing yet.
+3. After the meeting ends and Wispr's transcript is ready, the runner (every 60 s, or
+   `plaud-transcribe jobs promote`) turns it into a normal queued job; it then transcribes, pushes and
+   hands off like any other. Nothing more to do. A deleted meeting, or one that never ends within
+   `arm.max_hours` (default 3), fails the job with a notification.
+
+Caveat: Wispr writes no "ended" marker, and a pause looks like an end. A meeting whose last marker is
+`paused` therefore waits up to `wispr.live_fallback_minutes` (default 30) before the job starts, so a
+quick resume keeps the meeting whole; a meeting that really ended on a pause starts that much later.
+The live meeting cannot be combined with other recordings, `m` or `c`, and Plaud or Recorder
+recordings cannot be armed at all. With no live meeting, `plan --arm-live` says so and is a normal plan.
 
 ---
 

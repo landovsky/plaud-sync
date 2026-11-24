@@ -13,6 +13,9 @@ Keys (the footer shows them too)
   m      merge the selected recordings into one transcript     c  cut a span out of the
          (not combinable with cuts)                               highlighted recording
   p      pick the project (fuzzy)       n  pick the node (fuzzy)       x  clear the node
+  a      arm: select only the highlighted row, to run its job when the meeting ends (the live
+         Wispr meeting only; saving with it selected arms the job, it cannot be combined with
+         other recordings, m or c)
   Mode (now / later / none) is the radio set: arrows move, Space chooses.
 
 Fastest path (one recording, defaults accepted): launch, wait for the list, Enter, Enter. The first
@@ -21,6 +24,7 @@ its title, the node and mode follow the project.
 
 Recipes
   more days of recordings: plaud-transcribe plan --days 60
+  plan it during the meeting: `plaud-transcribe plan --arm-live` (the menu's "Arm current meeting...")
   a recording of another source (Wispr/phone) shows in the same list; the live Wispr meeting is
   first and marked "LIVE".
 """
@@ -192,14 +196,16 @@ class PlanApp(App):
         Binding("p", "pick_project", "Project"),
         Binding("n", "pick_node", "Node"),
         Binding("x", "clear_node", "Clear node"),
+        Binding("a", "arm", "Arm"),
     ]
 
-    def __init__(self, host=None, days=30):
+    def __init__(self, host=None, days=30, arm_live=False):
         super().__init__()
         if host is None:
             import plaud_transcribe as host
         self.host = host
         self.days = days
+        self.arm_live = arm_live
         self.config, self.state, self.folders = {}, {}, {}
         self.specs = {}            # project name -> {push, node, deliver_ask, ...}
         self.rows = []             # recording dicts, in list order
@@ -291,6 +297,9 @@ class PlanApp(App):
             recs.highlighted = 0
         self.query_one("#loading").display = False
         notes = list(data["notes"])
+        if self.arm_live and not any(r.get("live") for r in self.rows):
+            notes.append("No Wispr meeting is live right now, so there is nothing to arm: "
+                         "this is a normal plan.")
         if not self.rows:
             notes.append("No pending recordings.")
         self.query_one("#notes", Static).update("\n".join(notes))
@@ -336,12 +345,21 @@ class PlanApp(App):
     def fields(self):
         """The plan fields exactly as handed to build_job (empty ones left out)."""
         ids = self.selected_ids()
+        live = self._live_selected(ids)
+        if live:     # armed: no recordings yet, the job waits for this meeting
+            return self._with_text({"recordings": [], "arm": live["id"].removeprefix("wispr:"),
+                                    "arm_title": live.get("filename") or None, **self._common()})
         f = {"recordings": ids}
         if self.merge:
             f["merge"] = True
         cuts = {r: s for r, s in self.cuts.items() if r in ids and s}
         if cuts:
             f["cuts"] = cuts
+        f.update(self._common())
+        return self._with_text(f)
+
+    def _common(self):
+        f = {}
         if self.project:
             f["project"] = self.project
         if self.node_override:
@@ -349,11 +367,20 @@ class PlanApp(App):
         mode = self.mode_choice or ("none" if self.node_override == "" else None)
         if mode:
             f["mode"] = mode
+        return f
+
+    def _with_text(self, f):
         for key, wid in (("note", "#note"), ("instructions", "#instructions")):
             text = self.query_one(wid, TextArea).text.strip()
             if text:
                 f[key] = text
         return f
+
+    def _live_selected(self, ids):
+        """The selected live Wispr row, or None. Only a live Wispr meeting can be armed (E4):
+        Plaud and Recorder rows never are, whatever their flags say."""
+        return next((r for r in self.rows if r["id"] in ids and r.get("live")
+                     and r.get("source") == "wispr" and r["id"].startswith("wispr:")), None)
 
     def _refresh_labels(self):
         spec = self.specs.get(self.project) if self.project else None
@@ -390,7 +417,7 @@ class PlanApp(App):
 
     def check_action(self, action, parameters):
         if action in ("save", "save_now", "quit_form", "merge", "cut", "pick_project",
-                      "pick_node", "clear_node"):
+                      "pick_node", "clear_node", "arm"):
             if len(self.screen_stack) > 1:      # a picker is open: its own keys apply
                 return False
             # inside a text area Enter and the letters are text; only Esc and ctrl+s act
@@ -429,6 +456,9 @@ class PlanApp(App):
     def action_cut(self):
         recs = self.query_one("#recs", SelectionList)
         if recs.highlighted is None or not self.rows:
+            return
+        if self.rows[recs.highlighted].get("live"):
+            self._error("A live meeting cannot be cut: it has no transcript yet")
             return
         rid = self.rows[recs.highlighted]["id"]
 
@@ -485,6 +515,24 @@ class PlanApp(App):
             self._refresh_labels()
         self.push_screen(PickerScreen(f"Node in {tree}", items), done)
 
+    def action_arm(self):
+        """Select only the highlighted row for arming; refused for anything that is not a
+        live Wispr meeting (E4: Plaud / Recorder upload times are unknown)."""
+        recs = self.query_one("#recs", SelectionList)
+        if recs.highlighted is None or not self.rows:
+            return
+        row = self.rows[recs.highlighted]
+        if not self._live_selected([row["id"]]):
+            self._error("Only a live Wispr meeting can be armed (Plaud and Recorder recordings "
+                        "have no known upload time); this row can be saved as a normal job")
+            return
+        recs.deselect_all()
+        recs.select(row["id"])
+        self.merge = False
+        self.cuts.pop(row["id"], None)
+        self._error("")
+        self._refresh_labels()
+
     def action_clear_node(self):
         self.node_override, self.mode_choice = "", "none"
         self._refresh_labels()
@@ -493,8 +541,17 @@ class PlanApp(App):
         if not self.loaded:
             self._error("Still loading the recordings")
             return
+        ids = self.selected_ids()
+        if self._live_selected(ids):
+            if len(ids) > 1:
+                self._error("The live meeting can only be armed on its own: unselect the other "
+                            "recordings (a job cannot mix a running meeting with finished ones)")
+                return
+            if self.merge or any(self.cuts.get(i) for i in ids):
+                self._error("An armed job cannot be merged or cut: press m / clear the cut first")
+                return
         f = self.fields()
-        if not f["recordings"]:
+        if not f["recordings"] and "arm" not in f:
             self._error("Select at least one recording (Space)")
             return
         if self.merge and len(f["recordings"]) < 2:
@@ -524,7 +581,9 @@ class PlanApp(App):
     def _summary(self, job):
         """One line: what will be transcribed, where it goes, who gets it."""
         titles = {r["id"]: r.get("filename", r["id"]) for r in self.rows}
-        what = " + ".join(titles.get(r, r) for r in job["recordings"])
+        trig = job.get("trigger")
+        what = (f"arm: runs when '{trig.get('title') or 'the meeting'}' ends" if trig
+                else " + ".join(titles.get(r, r) for r in job["recordings"]))
         spec = self.specs.get(job["project"]) if job["project"] else None
         where = (f"{job['project']} (push {job['push'] or (spec or {}).get('push') or 'none'})"
                  if job["project"] else "classifier-routed project (push set after routing)")

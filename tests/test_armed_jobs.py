@@ -382,6 +382,7 @@ class TestEnqueueArmWispr:
 
         job = jobs.list_jobs()[-1]
         assert job["state"] == "armed" and job["trigger"]["wispr"] == UUID
+        assert "title" in job["trigger"]     # the menu says which meeting the job waits for
 
     def test_live_without_a_live_meeting_is_an_error_not_a_job_that_waits_for_nothing(self, world, capsys):
         world.wispr.end()

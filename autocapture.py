@@ -596,12 +596,13 @@ def _private(src, s):
     return any(w in title for w in s["private_words"])
 
 
-def capture(config, should_continue, reason):
+def capture(config, should_continue, reason, meeting=None):
     """Capture until should_continue() is false or max_hours passes.
 
     A frame becomes a scene when it differs from the current scene *and* the next
     sample agrees with it — so the settled screen is kept, not the blur of a
-    scroll or a tab switch. Returns (scenes_saved, revisits).
+    scroll or a tab switch. Returns (scenes_saved, revisits). `meeting` ({id, title}) is
+    published in status.json so the menu can offer "Arm current meeting...".
     """
     s = settings(config)
     width = int(((config or {}).get("visuals") or {}).get("max_width", 1600))
@@ -674,7 +675,7 @@ def capture(config, should_continue, reason):
                            f"autocapture. ({err[:80]})", sound="Basso")
                     error_notified = True
                 _write_status(state="error", error=err, session=str(session), reason=reason,
-                              started=started, saved=tracker.saved, revisits=tracker.revisits)
+                              meeting=meeting, started=started, saved=tracker.saved, revisits=tracker.revisits)
                 time.sleep(s["interval_s"])
                 continue
 
@@ -745,7 +746,8 @@ def capture(config, should_continue, reason):
                 if src:
                     _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
 
-            _write_status(state="capturing", session=str(session), reason=reason, started=started,
+            _write_status(state="capturing", session=str(session), reason=reason, meeting=meeting,
+                          started=started,
                           saved=tracker.saved, revisits=tracker.revisits,
                           displays=_displays_status(names if len(names) == len(shots) else [],
                                                     s["ignore_displays"], overrides),
@@ -852,6 +854,20 @@ def wispr_live_meeting(config, max_hours):
     return None
 
 
+def meeting_title(config, meeting_id):
+    """The Wispr title of a meeting ("" when unknown); read-only, never raises."""
+    import wispr_flow
+    try:
+        conn = sqlite3.connect(f"file:{wispr_flow.wispr_db_path(config)}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT title FROM Meetings WHERE id = ?", (meeting_id,)).fetchone()
+        finally:
+            conn.close()
+        return (row[0] or "") if row else ""
+    except Exception:  # noqa: BLE001  a missing title must not stop capture
+        return ""
+
+
 def _resumed_after_end(meeting_dir, stale_s):
     """True when the meeting's last pause/resume marker is `resumed` and the live
     transcript is still being written."""
@@ -934,7 +950,8 @@ def watch(config, stopping):
                     last["files_t"] = now
                 return last["live"]
 
-            capture(config, still_live, reason=f"Wispr meeting {m['id'][:8]}")
+            capture(config, still_live, reason=f"Wispr meeting {m['id'][:8]}",
+                    meeting={"id": m["id"], "title": meeting_title(config, m["id"])})
             if wispr_live_meeting(config, s["max_hours"]):
                 done.add(m["id"])  # stopped by max_hours or a signal while still live
             _write_status(state="watching")
@@ -1411,6 +1428,10 @@ def build_parser():
                     e.g. ["built-in"]; then stop + start --watch (config is read at start)
   between meetings: status.json lists the displays (what the SwiftBar menu shows), refreshed every
                     visuals.autocapture.display_refresh_s (default 300) and when displays.json changes
+  menu "Arm current meeting...": while capturing a Wispr meeting, status.json carries its id and
+                    title ("meeting"); a meeting paused for more than visuals.autocapture.
+                    wispr_resume_stale_min (default 15) minutes without a live transcript is not
+                    treated as resumed
   re-tune offline:  replay <session> --set change=0.04
 log: ~/.cache/plaud-autocapture/autocapture.log""")
     sub = ap.add_subparsers(dest="cmd", required=True)

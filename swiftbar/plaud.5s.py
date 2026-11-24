@@ -25,7 +25,8 @@ Actions (toggle a monitor, pause/resume, retry/cancel/mark seen a job) are menu 
 `bash=<python> param1=<script> ... terminal=false refresh=true`. The interpreter and repo come
 from ~/.plaud-sync/swiftbar.json (env PLAUD_SWIFTBAR_CONFIG), written by `install-swiftbar`:
 this plugin runs on the system python, the actions need the repo's. Without that file the
-menu has no actions (only "Show log"). "Plan a transcript…" opens a terminal (terminal=true) on
+menu has no actions (only "Show log"). "Arm current meeting…" (only while status.json says a meeting is being captured) opens the same
+terminal on `plan --arm-live`. "Plan a transcript…" opens a terminal (terminal=true) on
 `plaud_transcribe.py plan`; swiftbar.json may carry "terminal_cmd" (a list) to use another terminal
 instead. Every action passes --notify-errors, because
 terminal=false would hide a failure.
@@ -79,13 +80,13 @@ def act(actions, *argv, script="autocapture.py"):
     return f" | bash={_q(actions['python'])} {params} terminal=false refresh=true"
 
 
-def plan_action(actions):
-    """' | bash=... terminal=true' that opens a terminal running `plaud_transcribe.py plan`.
+def plan_action(actions, *extra):
+    """' | bash=... terminal=true' that opens a terminal running `plaud_transcribe.py plan [extra]`.
     With swiftbar.json "terminal_cmd" (e.g. ["open","-na","Ghostty","--args","-e"]) that
     command line runs instead, with SwiftBar's own terminal off. '' without actions."""
     if not actions or not actions.get("python") or not actions.get("repo"):
         return ""
-    run = [actions["python"], str(Path(actions["repo"]) / "plaud_transcribe.py"), "plan"]
+    run = [actions["python"], str(Path(actions["repo"]) / "plaud_transcribe.py"), "plan", *extra]
     term = actions.get("terminal_cmd")
     if term:
         argv, flag = [*term, *run], "terminal=false"
@@ -95,6 +96,15 @@ def plan_action(actions):
         return ""
     params = " ".join(f"param{i}={_q(a)}" for i, a in enumerate(argv[1:], 1))
     return f" | bash={_q(argv[0])} {params} {flag} refresh=true".replace("  ", " ")
+
+
+def live_meeting(status):
+    """The meeting autocapture is capturing now, {id, title}, or None (status.json "meeting",
+    written by the watcher: the plugin never opens Wispr's database)."""
+    m = status.get("meeting") if status.get("state") == "capturing" else None
+    if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]:
+        return {"id": m["id"], "title": str(m.get("title") or "")}
+    return None
 
 
 def log_action():
@@ -144,7 +154,8 @@ def job_line(job):
     if state == "queued":
         return f"⟳ {name} — queued"
     if state == "armed":
-        return f"○ {name} — armed, waiting for the meeting to end"
+        title = (job.get("trigger") or {}).get("title")
+        return f"⏳ {name} — waiting for " + (f"'{clean(title, 40)}'" if title else "the meeting") + " to end"
     if state == "cancelled":
         return f"✕ {name} — cancelled"
     if state == "done":
@@ -263,6 +274,10 @@ def render(now, jobs, status, pid_alive, paused, overrides, actions=None):
     plan = plan_action(actions)
     if plan:
         lines.append("Plan a transcript…" + plan)
+    if live_meeting(status) and not down and not paused:
+        arm = plan_action(actions, "--arm-live")
+        if arm:
+            lines.append("Arm current meeting…" + arm)
     lines.append("---")
     lines.append("Jobs")
     listed = visible_jobs(jobs, now)

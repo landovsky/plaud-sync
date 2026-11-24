@@ -468,8 +468,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K11 | F5, D2, D9 | done | `6fd5b68` | menu actions (display toggle, pause/resume, per-job retry/log/cancel/seen, held hint) via `~/.plaud-sync/swiftbar.json` interpreter + `--notify-errors`; watcher now records `displays` while idle (`display_refresh_s`); uncommitted |
 | K12 | G1, G3 (logic) | done | `9756c4d` | `plan_logic.py` (pending_recordings, live_meeting, suggest_project, list_nodes, build_job; enqueue now builds through it), `split_pending`/`short_unseen` extracted in plaud_transcribe, fixture + tests/test_plan_logic.py; uncommitted |
 | K13 | G1, G2, G4 | done | `200540c` | `plan_app.py` (one screen; default case Enter, Enter = 2 keystrokes via a one-line confirm; Esc asks once when the form was changed), `plan` with re-exec/hint, SwiftBar "Plan a transcript…" + `swiftbar.terminal_cmd`, `requirements-plan.txt`; app tests need `.venv/bin/pytest` (Homebrew run skips them); uncommitted |
-| K14 | E1, E2, E3 | done | | `runner.meeting_ready`/`promote_armed` (run before every pick), `jobs promote`, `enqueue --arm-wispr <uuid\|live>`, `arm.max_hours`/`--arm-max-hours`/`PLAUD_ARM_MAX_HOURS`, 31 tests in `tests/test_armed_jobs.py`; a `paused` last marker holds a meeting back for live_fallback_minutes; uncommitted |
-| K15 | E4, F menu, docs | pending | | Arm entry points (enqueue/plan/menu) + final docs |
+| K14 | E1, E2, E3 | done | `03604bb` | `runner.meeting_ready`/`promote_armed` (run before every pick), `jobs promote`, `enqueue --arm-wispr <uuid\|live>`, `arm.max_hours`/`--arm-max-hours`/`PLAUD_ARM_MAX_HOURS`, 31 tests in `tests/test_armed_jobs.py`; a `paused` last marker holds a meeting back for live_fallback_minutes; uncommitted |
+| K15 | E4, F menu, docs | done | | plan screen arms the live row (build_job `arm` + `arm_title`), `plan --arm-live`, `a` key refuses non-Wispr rows, menu 'Arm current meeting...' fed by status.json `meeting` {id,title}, armed jobs read '⏳ … waiting for <title> to end', README recipe; uncommitted |
 
 ## Future work
 

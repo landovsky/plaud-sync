@@ -200,14 +200,16 @@ def list_nodes(tree, config=None):
 
 # --- the one job builder ---
 
-FIELDS = ("recordings", "merge", "cuts", "instructions", "project", "push", "node", "mode", "note", "arm")
+FIELDS = ("recordings", "merge", "cuts", "instructions", "project", "push", "node", "mode", "note", "arm", "arm_title")
 
 
 def build_job(fields, host=None, config=None):
     """Turn plan/enqueue fields into a validated job dict; raises jobs.JobError.
 
     fields: recordings [ids], merge bool, cuts {rec: ["29:16-34:55"]}, instructions,
-    project, push, node, mode, note (all optional but recordings). A project fills
+    project, push, node, mode, note (all optional but recordings), arm (a Wispr meeting
+    uuid: the job waits for it instead of naming recordings) with arm_title (shown in the
+    menu while it waits). A project fills
     push / node / deliver.ask from the config; explicit push/node win; mode defaults
     to "now" when a node is known, else "none"."""
     host = _host(host)
@@ -242,7 +244,10 @@ def build_job(fields, host=None, config=None):
         if fields.get("recordings") or fields.get("merge") or cuts:
             raise jobs.JobError("an armed job waits for a meeting that is still running: "
                                 "it cannot also name recordings, --merge or --cut")
-        extra = {"state": "armed", "trigger": {"wispr": fields["arm"], "armed_at": jobs.now_iso()}}
+        trigger = {"wispr": fields["arm"], "armed_at": jobs.now_iso()}
+        if fields.get("arm_title"):
+            trigger["title"] = str(fields["arm_title"])
+        extra = {"state": "armed", "trigger": trigger}
 
     job = jobs.new_job(**extra,
         recordings=list(fields.get("recordings") or []), merge=bool(fields.get("merge")),

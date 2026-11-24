@@ -76,7 +76,11 @@ def saved_jobs():
 def same_job(saved, fields):
     """The saved job equals build_job of the same fields (G3), except id and timestamp."""
     expected = plan_logic.build_job(fields, host=pt, config=pt.load_config())
-    strip = lambda j: {k: v for k, v in j.items() if k not in ("id", "created")}  # noqa: E731
+    def strip(j):
+        j = {k: v for k, v in j.items() if k not in ("id", "created")}
+        if j.get("trigger"):
+            j["trigger"] = {k: v for k, v in j["trigger"].items() if k != "armed_at"}
+        return j
     return strip(saved) == strip(expected)
 
 
@@ -271,7 +275,116 @@ class TestLiveMeeting:
             assert "LIVE" in str(recs.get_option_at_index(0).prompt)
             await pilot.press("enter", "enter")
         run(scenario)
-        assert saved_jobs()[0]["recordings"] == ["wispr:m1"]
+        # the live row is armed, not queued as a recording (K15)
+        assert saved_jobs()[0]["trigger"]["wispr"] == "m1" and saved_jobs()[0]["recordings"] == []
+
+
+LIVE_ROW = {"id": "wispr:9f2c-aaaa", "source": "wispr", "filename": "Koperníci weekly",
+            "start_time": 4_000_000, "duration": 0, "live": True, "filetag_id_list": []}
+
+
+class TestArmingTheLiveMeeting:
+    """E4 / K15: saving with the live meeting selected arms the job instead of queueing a
+    recording that does not exist yet."""
+
+    def _live(self, monkeypatch):
+        monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: dict(LIVE_ROW))
+
+    def test_enter_enter_arms_the_job_and_the_summary_says_when_it_runs(self, env, monkeypatch):
+        self._live(monkeypatch)
+        seen = {}
+
+        async def scenario(app, pilot):
+            await pilot.press("enter")
+            seen["summary"] = str(app.screen.query_one("#confirm-summary", Static).render())
+            await pilot.press("enter")
+        run(scenario)
+        assert "arm: runs when 'Koperníci weekly' ends" in seen["summary"]
+        (job,) = saved_jobs()
+        assert job["state"] == "armed" and job["recordings"] == []
+        assert same_job(job, {"recordings": [], "arm": "9f2c-aaaa", "arm_title": "Koperníci weekly"})
+
+    def test_the_other_recordings_cannot_ride_along_with_the_meeting(self, env, monkeypatch):
+        self._live(monkeypatch)
+
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "enter")     # live + r-new
+            assert "only be armed on its own" in str(app.query_one("#error", Static).render())
+        run(scenario)
+        assert saved_jobs() == []
+
+    def test_merge_with_the_live_meeting_is_refused_and_writes_nothing(self, env, monkeypatch):
+        self._live(monkeypatch)
+
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "m", "enter")
+            assert saved_jobs() == []
+            assert "only be armed" in str(app.query_one("#error", Static).render())
+        run(scenario)
+
+    def test_a_live_meeting_has_no_transcript_to_cut(self, env, monkeypatch):
+        self._live(monkeypatch)
+
+        async def scenario(app, pilot):
+            await pilot.press("c")
+            assert "cannot be cut" in str(app.query_one("#error", Static).render())
+            assert app.cuts == {}
+        run(scenario)
+
+    def test_a_plaud_row_can_never_be_armed(self, env, monkeypatch):
+        self._live(monkeypatch)
+
+        async def scenario(app, pilot):
+            await pilot.press("down", "a")      # r-new is a Plaud recording
+            assert "Only a live Wispr meeting can be armed" in str(app.query_one("#error", Static).render())
+            assert app.selected_ids() == ["wispr:9f2c-aaaa"]
+        run(scenario)
+
+    def test_a_recorder_row_flagged_live_is_still_not_armable(self, env, monkeypatch):
+        bogus = dict(LIVE_ROW, id="recorder:x1", source="recorder")
+        monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: bogus)
+
+        async def scenario(app, pilot):
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["state"] != "armed" and job["recordings"] == ["recorder:x1"]
+
+    def test_a_on_the_live_row_leaves_only_it_selected(self, env, monkeypatch):
+        self._live(monkeypatch)
+
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "up", "a")
+            assert app.selected_ids() == ["wispr:9f2c-aaaa"]
+        run(scenario)
+
+
+class TestArmLiveFlag:
+    def test_with_no_live_meeting_the_screen_says_so_and_plans_normally(self, env):
+        app = plan_app.PlanApp(host=pt, arm_live=True)
+
+        async def go():
+            async with app.run_test(size=(120, 50)) as pilot:
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert "No Wispr meeting is live" in str(app.query_one("#notes", Static).render())
+                await pilot.press("enter", "enter")
+            return app.return_value
+        asyncio.run(go())
+        (job,) = saved_jobs()
+        assert job["state"] == "queued" and job["recordings"] == ["r-new"]
+
+    def test_with_a_live_meeting_it_is_the_selection_and_no_warning_shows(self, env, monkeypatch):
+        monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: dict(LIVE_ROW))
+        app = plan_app.PlanApp(host=pt, arm_live=True)
+
+        async def go():
+            async with app.run_test(size=(120, 50)) as pilot:
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert "No Wispr meeting" not in str(app.query_one("#notes", Static).render())
+                assert app.selected_ids() == ["wispr:9f2c-aaaa"]
+        asyncio.run(go())
 
 
 class TestOffline:

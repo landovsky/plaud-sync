@@ -84,3 +84,24 @@ class TestHomebrewPythonHasNoTextual:
         with pytest.raises(SystemExit):
             pt.main()
         assert "plan" in capsys.readouterr().out
+
+
+class TestArmLive:
+    """`plan --arm-live` is what the menu's "Arm current meeting..." runs; it must survive the
+    hop into the venv Python."""
+
+    def test_the_flag_survives_the_re_exec_into_the_venv_python(self, no_textual, monkeypatch, tmp_path):
+        py = tmp_path / "venvpython"
+        py.write_text("")
+        monkeypatch.setenv("PLAUD_PLAN_PYTHON", str(py))
+        calls = []
+        monkeypatch.setattr(os, "execv", lambda path, argv: calls.append(argv))
+        jobs_cli.main(["plan", "--arm-live"], host=pt)
+        assert calls[0][2:] == ["plan", "--days", "30", "--arm-live"]
+
+    def test_help_documents_it_and_runs_nothing(self, monkeypatch, capsys):
+        monkeypatch.setattr(os, "execv", lambda *a: pytest.fail("ran"))
+        with pytest.raises(SystemExit):
+            jobs_cli.main(["plan", "--help"], host=pt)
+        out = capsys.readouterr().out
+        assert "--arm-live" in out and "Arm current meeting" in out
