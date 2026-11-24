@@ -74,11 +74,21 @@ AUTO_SKIP_DURATION_MS = 10_000
 
 # --- Config & State ---
 
-def load_config():
+class ConfigError(ValueError):
+    """The config file is readable JSON but a value in it cannot be used."""
+
+
+PUSH_MODES = ("main", "pr", "none")
+
+
+def load_config(validate=True):
+    config = {}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
+            config = json.load(f)
+    if validate:  # fail at load time, naming the project (A3)
+        project_specs(config)
+    return config
 
 
 def load_state():
@@ -103,12 +113,49 @@ def save_state(state):
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-def get_projects(config):
+def project_specs(config):
+    """Full per-project settings: {name: {dir, push, node, hints, deliver_ask}}.
+
+    A `projects` value is either a path string (the original form: push "none",
+    no node) or an object with `dir` plus optional `push` (main|pr|none),
+    `node` (cc-tree ref), `hints` and `deliver_ask`. Raises ConfigError naming
+    the project when a value is unusable. Per-project `hints` win over the
+    top-level `project_hints` entry for the same project."""
     projects = config.get("projects")
-    if projects:
-        return projects
-    fm = config.get("folder_mapping", {})
-    return {k: v for k, v in fm.items() if v is not None}
+    if not projects:
+        fm = config.get("folder_mapping") or {}
+        projects = {k: v for k, v in fm.items() if v is not None}
+    top_hints = config.get("project_hints") or {}
+    specs = {}
+    for name, value in projects.items():
+        if isinstance(value, str):
+            value = {"dir": value}
+        if not isinstance(value, dict):
+            raise ConfigError(f"project '{name}': expected a path string or an object, "
+                              f"got {type(value).__name__}")
+        d = value.get("dir")
+        if not isinstance(d, str) or not d.strip():
+            raise ConfigError(f"project '{name}': 'dir' is required and must be a path string")
+        push = value.get("push", "none")
+        if push not in PUSH_MODES:
+            raise ConfigError(f"project '{name}': push must be main|pr|none, got {push!r}")
+        for key in ("node", "hints", "deliver_ask"):
+            if value.get(key) is not None and not isinstance(value[key], str):
+                raise ConfigError(f"project '{name}': {key} must be a string")
+        hints = value.get("hints") or top_hints.get(name)
+        specs[name] = {
+            "dir": d,
+            "push": push,
+            "node": value.get("node") or None,
+            "hints": hints if isinstance(hints, str) and hints.strip() else None,
+            "deliver_ask": value.get("deliver_ask") or None,
+        }
+    return specs
+
+
+def get_projects(config):
+    """{name: dir-string}; the shape every existing call site expects."""
+    return {name: spec["dir"] for name, spec in project_specs(config).items()}
 
 
 def default_output_dir(config):
@@ -611,7 +658,12 @@ def project_hints(config):
     Purely additive — projects without hints still work off their name, path and
     recent-recording history."""
     hints = config.get("project_hints") or {}
-    return {k: v for k, v in hints.items() if isinstance(v, str) and v.strip()}
+    merged = {k: v for k, v in hints.items() if isinstance(v, str) and v.strip()}
+    # Object-form projects may carry their own hints (they win on a clash).
+    for name, spec in project_specs(config).items():
+        if spec["hints"]:
+            merged[name] = spec["hints"]
+    return merged
 
 
 def recent_examples(state, limit=4):
@@ -653,7 +705,7 @@ def format_project_list(projects, config, state):
 
 
 def claude_summarize(transcript_text, recording_meta, projects, language="en", want_clean=True,
-                     extra_instructions=None, config=None, state=None):
+                     extra_instructions=None, config=None, state=None, forced_project=None):
     project_list = format_project_list(projects, config or {}, state or {})
     duration_min = recording_meta.get("duration", 0) // 60000
 
@@ -690,6 +742,16 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
             'They do NOT replace anything above: keep the same output format, '
             'sentinels, JSON metadata and section structure.\n\n'
             f'{extra_instructions.strip()}\n'
+        )
+
+    # The project was chosen up front (a job): the summary must not argue with it.
+    if forced_project:
+        prompt += (
+            '\n\n## Project already decided\n'
+            f'This recording belongs to the project "{forced_project}"; it was chosen '
+            'by the user and will be filed there. Set "project" to exactly that value '
+            'and write the summary from that project\'s point of view. Still return '
+            'the name, type and tags as specified.\n'
         )
 
     timeout = max(300, duration_min * 30)
@@ -1081,8 +1143,51 @@ def resolve_output_dir(state, file_ids, target_base, dir_name):
     return target_base / dir_name
 
 
+def summary_first_line(classification, limit=200):
+    """First line of prose in the summary (no heading), for commit messages."""
+    for line in strip_leading_h1(classification.get("summary", "") or "").splitlines():
+        line = line.strip().lstrip("#>-*• ").strip()
+        if line:
+            return line[:limit]
+    return ""
+
+
+def _output_files(output_dir):
+    return sorted(p.name for p in Path(output_dir).iterdir() if p.is_file())
+
+
+def _check_forced_project(forced_project, projects):
+    if forced_project and forced_project != "default" and forced_project not in projects:
+        raise ValueError(f"forced project '{forced_project}' is not in the config "
+                         f"(known: {', '.join(sorted(projects)) or 'none'})")
+
+
 def process_recording(recording, token, config, folders, projects, state, language,
-                      extra_instructions=None, cuts=None):
+                      extra_instructions=None, cuts=None, *, forced_project=None,
+                      interactive=True):
+    """Transcribe, summarize and write one recording; returns a result dict or None.
+
+    forced_project: file under that project and ignore the classifier's pick (it
+    still runs for name/summary). interactive=False: never prompt, even on a TTY.
+    """
+    _check_forced_project(forced_project, projects)
+    with visuals.interactive_scope(interactive):
+        return _process_recording(recording, token, config, folders, projects, state,
+                                  language, extra_instructions, cuts, forced_project)
+
+
+def process_merged_recordings(recordings, token, config, folders, projects, state, language,
+                              extra_instructions=None, *, forced_project=None,
+                              interactive=True):
+    """Process multiple recordings as a single merged session (no cuts, by design)."""
+    _check_forced_project(forced_project, projects)
+    with visuals.interactive_scope(interactive):
+        return _process_merged(recordings, token, config, folders, projects, state,
+                               language, extra_instructions, forced_project)
+
+
+def _process_recording(recording, token, config, folders, projects, state, language,
+                       extra_instructions=None, cuts=None, forced_project=None):
     file_id = recording["id"]
     source = recording.get("source", "plaud")
     filename = recording.get("filename", "untitled")
@@ -1183,7 +1288,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
                                       want_clean=(source != "wispr"),
                                       extra_instructions=with_visual_instructions(
                                           extra_instructions, visual_ctx),
-                                      config=config, state=state)
+                                      config=config, state=state, forced_project=forced_project)
     if not classification:
         print("FAILED")
         state.setdefault("transcribed", {})[file_id] = {
@@ -1196,7 +1301,9 @@ def process_recording(recording, token, config, folders, projects, state, langua
     # Normalize: only keep the project label if it matches a real config key,
     # otherwise mark it "default" so unmatched recordings aren't mislabeled.
     project_key = classification.get("project", "default")
-    if project_key not in projects:
+    if forced_project:
+        project_key = forced_project
+    elif project_key not in projects:
         project_key = "default"
     classification["project"] = project_key
     rec_name = classification.get("name", filename)
@@ -1247,12 +1354,15 @@ def process_recording(recording, token, config, folders, projects, state, langua
     }
     save_state(state)
 
-    return {"file_id": file_id, "name": rec_name, "project": project_key, "output_dir": str(output_dir)}
+    return {"file_id": file_id, "name": rec_name, "title": rec_name, "project": project_key,
+            "date": date_str, "duration": duration,
+            "sources": [{"id": file_id, "source": source, "filename": filename}],
+            "summary_first_line": summary_first_line(classification),
+            "files": _output_files(output_dir), "output_dir": str(output_dir)}
 
 
-def process_merged_recordings(recordings, token, config, folders, projects, state, language,
-                              extra_instructions=None):
-    """Process multiple recordings as a single merged session."""
+def _process_merged(recordings, token, config, folders, projects, state, language,
+                    extra_instructions=None, forced_project=None):
     recordings = sorted(recordings, key=lambda r: r.get("start_time", 0))
 
     first = recordings[0]
@@ -1362,7 +1472,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
                                       want_clean=(merged_source != "wispr"),
                                       extra_instructions=with_visual_instructions(
                                           extra_instructions, visual_ctx),
-                                      config=config, state=state)
+                                      config=config, state=state, forced_project=forced_project)
     if not classification:
         print("FAILED")
         for fid in file_ids:
@@ -1376,7 +1486,9 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     # Normalize: only keep the project label if it matches a real config key,
     # otherwise mark it "default" so unmatched recordings aren't mislabeled.
     project_key = classification.get("project", "default")
-    if project_key not in projects:
+    if forced_project:
+        project_key = forced_project
+    elif project_key not in projects:
         project_key = "default"
     classification["project"] = project_key
     rec_name = classification.get("name", first.get("filename", "untitled"))
@@ -1423,23 +1535,44 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
         }
     save_state(state)
 
-    return {"file_id": file_ids[0], "name": rec_name, "project": project_key, "output_dir": str(output_dir)}
+    return {"file_id": file_ids[0], "name": rec_name, "title": rec_name, "project": project_key,
+            "date": date_str, "duration": total_duration,
+            "sources": [{"id": r["id"], "source": r.get("source", "plaud"),
+                         "filename": r.get("filename", "untitled")} for r in recordings],
+            "summary_first_line": summary_first_line(classification),
+            "files": _output_files(output_dir), "output_dir": str(output_dir)}
 
 
 # --- Commands ---
 
+def short_unseen(recordings, state):
+    """Recordings never seen before that are too short to bother with (auto-skipped)."""
+    return [r for r in recordings
+            if r["id"] not in state.get("transcribed", {})
+            and r.get("duration", 0) < AUTO_SKIP_DURATION_MS]
+
+
+def split_pending(recordings, state):
+    """The one definition of "pending": (pending, incomplete).
+
+    pending = never-seen recordings first, then those transcribed but not yet
+    summarised/filed (status "transcribed"); incomplete is the second group.
+    Shared by the interactive list and the plan screen (plan_logic)."""
+    transcribed = state.get("transcribed", {})
+    incomplete = [r for r in recordings
+                  if r["id"] in transcribed and transcribed[r["id"]].get("status") == "transcribed"]
+    new = [r for r in recordings if r["id"] not in transcribed]
+    return new + incomplete, incomplete
+
+
 def auto_skip_short(recordings, state):
     skipped = 0
-    for r in recordings:
-        fid = r["id"]
-        if fid in state.get("transcribed", {}):
-            continue
-        if r.get("duration", 0) < AUTO_SKIP_DURATION_MS:
-            state.setdefault("transcribed", {})[fid] = {
-                "status": "skipped",
-                "reason": f"Auto-skipped: {r.get('duration', 0) / 1000:.0f}s < 10s",
-            }
-            skipped += 1
+    for r in short_unseen(recordings, state):
+        state.setdefault("transcribed", {})[r["id"]] = {
+            "status": "skipped",
+            "reason": f"Auto-skipped: {r.get('duration', 0) / 1000:.0f}s < 10s",
+        }
+        skipped += 1
     if skipped:
         save_state(state)
         print(f"  Auto-skipped {skipped} recording(s) under 10 seconds.")
@@ -1472,11 +1605,8 @@ def parse_indices(text, max_len):
 
 def show_pending(recordings, folders, state, config):
     """Show pending recordings list. Returns (pending, incomplete) lists."""
-    transcribed = state.get("transcribed", {})
-    incomplete = [r for r in recordings
-                  if r["id"] in transcribed and transcribed[r["id"]].get("status") == "transcribed"]
-    new = [r for r in recordings if r["id"] not in transcribed]
-    pending = new + incomplete
+    pending, incomplete = split_pending(recordings, state)
+    new = [r for r in pending if r not in incomplete]
 
     if not pending:
         print("No new recordings to process.")
@@ -2063,7 +2193,10 @@ def cmd_file(args, config, state):
 EXAMPLE_CONFIG = {
     "projects": {
         "project-a": "~/git/project-a/docs/transcripts",
-        "project-b": "~/git/project-b/docs/transcripts",
+        "project-b": {
+            "dir": "~/git/project-b/docs/transcripts",
+            "push": "none",
+        },
     },
     # Optional per-project topic keywords. Classification also learns from the
     # names of recordings already filed under each project, so this is only
@@ -2100,13 +2233,44 @@ def cmd_init(force=False):
     print("Edit 'projects' to map classification labels to your repo paths.")
 
 
+CONFIG_HELP = """\
+config: projects  (~/.plaud-sync/config.json)
+  A project is a path string (files land there, nothing is pushed) or an object:
+
+    "projects": {
+      "Hriste Hrou": {"dir": "~/git/hriste/docs/transcripts", "push": "pr",
+                      "node": "hriste:root", "hints": "BOM, pricing",
+                      "deliver_ask": "pull the action items into ..."},
+      "AI Jam": "~/git/ai-jam/docs/transcripts"
+    }
+
+  dir          where transcripts are written (required in object form)
+  push         main | pr | none (default none): push straight to main, open a
+               PR from a branch, or only write files. Other values are
+               rejected when the config loads, naming the project.
+  node         default cc-tree ref ("tree" or "tree:id") to hand transcripts to
+  hints        topic keywords for classification (also read from "project_hints")
+  deliver_ask  default "process it" request sent to the node; a note given
+               when planning a job overrides it
+"""
+
+
 def main():
+    # Job-queue commands have their own parser and never touch the network.
+    import jobs_cli
+    if len(sys.argv) > 1 and sys.argv[1] in jobs_cli.COMMANDS:
+        sys.exit(jobs_cli.main(sys.argv[1:], host=sys.modules[__name__]))
+
     parser = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Download, transcribe, classify and summarize Plaud recordings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=CONFIG_HELP,
     )
     parser.add_argument("command", nargs="?", default="process",
-                        choices=["list", "process", "move", "init", "file"])
+                        choices=["list", "process", "move", "init", "file", "enqueue", "jobs", "runner",
+                                 "install-runner", "uninstall-runner",
+                                 "install-swiftbar", "uninstall-swiftbar", "plan"])
     parser.add_argument("extra", nargs="*",
                         help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...; "
                              "for 'process': one recording (id, id prefix or title words)")
@@ -2131,7 +2295,10 @@ def main():
     if args.cuts and not (args.command == "process" and args.extra):
         parser.error("--cut needs one recording: process <ref> --cut START-END")
 
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        parser.exit(2, f"{parser.prog}: config error: {e}\n")
     state = load_state()
 
     # Resolve language: CLI flag > config "language" > cs

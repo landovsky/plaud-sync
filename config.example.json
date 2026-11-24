@@ -1,7 +1,13 @@
 {
   "projects": {
     "project-a": "~/git/project-a/docs/transcripts",
-    "project-b": "~/git/project-b/docs/transcripts"
+    "project-b": {
+      "dir": "~/git/project-b/docs/transcripts",
+      "push": "none",
+      "node": "tree:id",
+      "hints": "optional topic keywords (same as project_hints)",
+      "deliver_ask": "optional default request sent to the cc-tree node"
+    }
   },
   "project_hints": {
     "project-a": "keywords, systems or people that identify this project"

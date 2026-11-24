@@ -108,6 +108,8 @@ Then edit `~/.plaud-sync/config.json` — `projects` maps a classification label
 }
 ```
 
+A project may also be an object, e.g. `"playgrove": {"dir": "~/git/playgrove/docs/transcripts", "push": "pr", "node": "playgrove:root"}`. `push` is `main`, `pr` or `none` (default); a typo is rejected at startup with the project's name. `plaud-transcribe --help` documents every key.
+
 `default_output` (where unmatched recordings go) is optional — it defaults to this tool's own `docs/transcripts/`.
 
 **How a recording finds its project.** Meetings rarely say the project name out
@@ -135,6 +137,86 @@ match on:
 ```
 
 That's it. Transcripts and summaries appear under the mapped project directory. (Set `"auto_commit": true` in your config to also commit them into that repo.)
+
+---
+
+## Unattended runs: enqueue, runner, push, deliver
+
+Instead of running the pipeline in a terminal, queue a job and let a background runner do it:
+
+```bash
+plaud-transcribe enqueue --recording plaud:<id> --project Alpha   # --note "only the action items", --mode later
+plaud-transcribe install-runner      # LaunchAgent: starts the runner when a job file appears
+plaud-transcribe jobs list           # state per job; failed/held ones are marked with !
+plaud-transcribe jobs retry <id>     # failed or held job: resumes at the first unfinished step
+plaud-transcribe jobs seen <id>      # acknowledge a failed/held job without retrying it
+plaud-transcribe runner --help       # every knob, with recipes
+```
+
+A job runs four steps: transcribe, commit, push, deliver. Commits are made in a temporary worktree of
+`origin/main`, so your checkout and any session working in it are not touched. Per project, `push` is
+`main` (straight to main), `pr` (a branch plus a pull request via `gh`) or `none`. A project's `node`
+is the cc-tree node that is handed the finished work (`cc-tree deliver <node> -`, with the titles,
+repo-relative paths, commit and PR link on stdin); `deliver_ask` is the standing "process it" request,
+and `enqueue --note` overrides it for one job. `--mode later` only says the transcript exists.
+cc-tree chooses between messaging a healthy session, starting a fresh one or holding the work for
+you; a held job shows as `held` with the cc-tree id. If cc-tree is missing or fails, only the deliver
+step fails: the transcript stays pushed and `jobs retry` re-delivers without a new commit.
+`runner --deliver-plan` (or `PLAUD_DELIVER_PLAN=1`) asks cc-tree what it would do and sends nothing.
+
+One-time setup: the LaunchAgent has no shell, so the runner loads its credentials with
+`direnv exec` in this repo. Run `direnv allow` here once, and make sure `ELEVENLABS_API_KEY` is in
+the sops-encrypted credentials the `.envrc` reads (add it yourself; the runner only reads it).
+
+### Plan screen
+
+`plaud-transcribe plan` is `enqueue` as one keyboard-driven screen: recordings, project, node, mode, a
+note to the node and instructions for the summarizer. It only writes a job file (the same one
+`enqueue` would, printed as its id on Enter); the runner does the work, and Esc writes nothing.
+It needs Textual, which is optional:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-plan.txt
+```
+
+`plan` finds `.venv/bin/python` by itself when the Python that started it has no Textual (override with
+`PLAUD_PLAN_PYTHON` or config `plan.python`). Without Textual anywhere it says so and points to `enqueue`.
+
+| Key | Does |
+|-----|------|
+| Enter | show a one-line summary; Enter again saves the job and exits (`ctrl+s` instead of the first Enter inside a text area, where Enter is a newline) |
+| Esc | quit, nothing written (asks once, "Esc again", if you changed anything; goes back from the summary) |
+| Space | select or unselect the recording under the cursor (the first row starts selected; a live Wispr meeting is first) |
+| `m` / `c` | merge the selected recordings / cut a span out of the highlighted one (not together) |
+| `a` | arm: select only the highlighted row (works on the live Wispr meeting only) |
+| `p` / `n` / `x` | pick the project / pick a node from `cc-tree show <tree>` / clear the node |
+| Tab | next field: recordings, mode, note, instructions |
+
+The common case (newest recording, suggested project, its node) is Enter, Enter. The SwiftBar menu has
+"Plan a transcript…", which opens a terminal on this screen; `swiftbar.terminal_cmd` in the config
+(for example `["open", "-na", "Ghostty", "--args", "-e"]`) picks another terminal, see
+`plaud-transcribe install-swiftbar --help`. Tests: `.venv/bin/pytest` (the Homebrew run skips the screen tests).
+
+### Plan it during the meeting
+
+Decide what happens to a transcript while the meeting is still running, then forget it:
+
+1. While Wispr is recording and autocapture is watching, pick **Arm current meeting…** in the SwiftBar
+   menu. It opens the plan screen with the live meeting selected (`plaud-transcribe plan --arm-live`).
+   Choose project, node and note as usual and press Enter, Enter. Without the menu:
+   `plaud-transcribe enqueue --arm-wispr live --project "…"` (or `--arm-wispr <uuid>`).
+2. The job is `armed` and shows in the menu as "waiting for '<title>' to end", with Cancel. It is not
+   counted in the title's ⟳ number and does nothing yet.
+3. After the meeting ends and Wispr's transcript is ready, the runner (every 60 s, or
+   `plaud-transcribe jobs promote`) turns it into a normal queued job; it then transcribes, pushes and
+   hands off like any other. Nothing more to do. A deleted meeting, or one that never ends within
+   `arm.max_hours` (default 3), fails the job with a notification.
+
+Caveat: Wispr writes no "ended" marker, and a pause looks like an end. A meeting whose last marker is
+`paused` therefore waits up to `wispr.live_fallback_minutes` (default 30) before the job starts, so a
+quick resume keeps the meeting whole; a meeting that really ended on a pause starts that much later.
+The live meeting cannot be combined with other recordings, `m` or `c`, and Plaud or Recorder
+recordings cannot be armed at all. With no live meeting, `plan --arm-live` says so and is a normal plan.
 
 ---
 
@@ -479,6 +561,9 @@ continuously during a meeting, and keeps the cost bounded with one filter at eac
   is main and shift when a monitor is plugged in. An ignored display logs one `ignored`
   event (ending its scene) and nothing else. Config is read when capture starts, so restart
   a running watcher (`stop`, then `start --watch`) after changing it.
+  Between meetings the watcher also lists the monitors in `status.json` (`displays`), so the
+  SwiftBar menu can switch one off before a meeting starts; one macOS query every
+  `display_refresh_s` seconds (default 300) and at once when `displays.json` changes.
 
 ```bash
 python3 autocapture.py watch          # capture while a Wispr Flow meeting is recording
@@ -603,7 +688,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 
 | Key | Used by | Description |
 |-----|---------|-------------|
-| `projects` | transcribe | `{ "label": "~/path" }` — classification targets. Claude picks the best-matching label; unknown → `default` |
+| `projects` | transcribe | `{ "label": "~/path" }` — classification targets. Claude picks the best-matching label; unknown → `default`. A value may also be an object: `{ "dir": "~/path", "push": "main\|pr\|none", "node": "tree:id", "hints": "…", "deliver_ask": "…" }` — `push` defaults to `none` and an unknown value is rejected at load time; `node` and `deliver_ask` are stored for the planned cc-tree hand-off. See `plaud-transcribe --help` |
 | `folder_mapping` | sync | `{ "Plaud Folder": "~/path" }` — routes by exact Plaud folder name (use `null` to skip). Also used as a fallback source of `projects` by transcribe |
 | `project_hints` | transcribe | `{ "label": "topics, systems, people" }` — extra evidence for classification. Optional; recent recordings per project are used regardless |
 | `default_output` | both | Where unmatched recordings go (defaults to this tool's `docs/transcripts/`) |

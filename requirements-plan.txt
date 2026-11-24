@@ -1,0 +1,4 @@
+# Optional: the `plaud-transcribe plan` screen. Textual is not needed for anything else.
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements-plan.txt
+-r requirements.txt
+textual==8.2.8

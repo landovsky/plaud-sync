@@ -22,7 +22,10 @@ Capture is started by hand (`run`) or follows Wispr Flow (`watch`): a meeting is
 live while its Meetings row has no endedAt, or after a resume while its live
 transcript ends on a `resumed` marker. `install-agent` keeps the watcher
 alive across logins, reboots and crashes — without it a restart silently ends
-capture (2026-10-27: one reboot cost two days of meetings). macOS notifications say when capture
+capture (2026-10-27: one reboot cost two days of meetings). macOS lists a
+LaunchAgent in Login Items by ProgramArguments[0], so the agent runs a named
+launcher, ~/.plaud-sync/bin/plaud-autocapture-watchdog, not a bare "python3.15".
+macOS notifications say when capture
 starts, when the first frame proves Screen Recording permission works, and when
 it stops — the screen gives no other sign that it is being recorded.
 
@@ -75,6 +78,10 @@ DEFAULTS = {
     "manual_gap_s": 20,       # a deliberate screenshot this close to a pointed-at scene wins
     "fresh_s": 60,            # pointing within this long after a screen change is the strongest signal
     "wispr_poll_s": 10,
+    # While watching (not capturing) the displays are recorded in status.json, so the
+    # SwiftBar menu can pre-set a monitor between meetings. One JXA call per refresh;
+    # also refreshed at once when displays.json changes.
+    "display_refresh_s": 300,
     # A resumed meeting keeps its endedAt (Wispr sets it at the pause and never
     # clears it), so it counts as live while live.ndjson ends on a `resumed`
     # marker — unless the file has been silent this long (Wispr crashed mid-segment).
@@ -181,6 +188,16 @@ def notify(title, message, sound=None):
         subprocess.run(cmd, capture_output=True, timeout=10)
     except (subprocess.SubprocessError, OSError):
         pass
+
+
+def _displays_status(names, patterns, overrides):
+    """status.json `displays`: [{name, captured, source}] so the menu bar never
+    calls JXA. [] when the names are not known."""
+    out = []
+    for n in names:
+        captured, source = display_state(n, patterns, overrides)
+        out.append({"name": n, "captured": captured, "source": source})
+    return out
 
 
 def _write_status(**fields):
@@ -330,6 +347,64 @@ def _screens():
 def _ignored_display(name, patterns):
     """Whether a monitor is one config says never to capture (part of its name)."""
     return bool(name) and any(p and p.lower() in name.lower() for p in patterns)
+
+
+OVERRIDES_FILE = STATE_DIR / "displays.json"
+_overrides_cache = {"key": None, "data": {}}
+
+
+def load_overrides():
+    """{display name: True|False} set by `display <name|n> on|off`. Re-read only
+    when the file's mtime changes, so the capture loop can call it every sample
+    and a toggle applies from the next frame without a restart."""
+    try:
+        st = OVERRIDES_FILE.stat()
+    except OSError:
+        _overrides_cache.update(key=None, data={})
+        return {}
+    key = (str(OVERRIDES_FILE), st.st_mtime_ns, st.st_size)
+    if _overrides_cache["key"] != key:
+        try:
+            raw = json.loads(OVERRIDES_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        data = {k: v for k, v in raw.items() if isinstance(v, bool)} if isinstance(raw, dict) else {}
+        _overrides_cache.update(key=key, data=data)
+    return dict(_overrides_cache["data"])
+
+
+def set_override(name, on):
+    """Store an override under the display's NAME (not its index), atomically."""
+    data = load_overrides()
+    data[name] = bool(on)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = OVERRIDES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, OVERRIDES_FILE)
+
+
+def display_state(name, patterns, overrides):
+    """(captured, source): an override wins over ignore_displays in both
+    directions; source is "override", "config" (a pattern skips it) or "default"."""
+    if name and name in (overrides or {}):
+        return bool(overrides[name]), "override"
+    if _ignored_display(name, patterns):
+        return False, "config"
+    return True, "default"
+
+
+def resolve_display(target, names):
+    """A display number (as `displays` shows it) or exact name -> the NAME, which
+    is what gets stored so an unplugged monitor keeps its override. ValueError
+    lists the current displays when the target matches none."""
+    listing = ", ".join(f"{i}={n}" for i, n in enumerate(names, 1)) or "none found"
+    if target.isdigit():
+        if 1 <= int(target) <= len(names):
+            return names[int(target) - 1]
+        raise ValueError(f"no display {target}; current displays: {listing}")
+    if target in names:
+        return target
+    raise ValueError(f"unknown display {target!r}; current displays: {listing}")
 
 
 def _sources(urls=True):
@@ -521,12 +596,13 @@ def _private(src, s):
     return any(w in title for w in s["private_words"])
 
 
-def capture(config, should_continue, reason):
+def capture(config, should_continue, reason, meeting=None):
     """Capture until should_continue() is false or max_hours passes.
 
     A frame becomes a scene when it differs from the current scene *and* the next
     sample agrees with it — so the settled screen is kept, not the blur of a
-    scroll or a tab switch. Returns (scenes_saved, revisits).
+    scroll or a tab switch. Returns (scenes_saved, revisits). `meeting` ({id, title}) is
+    published in status.json so the menu can offer "Arm current meeting...".
     """
     s = settings(config)
     width = int(((config or {}).get("visuals") or {}).get("max_width", 1600))
@@ -599,16 +675,18 @@ def capture(config, should_continue, reason):
                            f"autocapture. ({err[:80]})", sound="Basso")
                     error_notified = True
                 _write_status(state="error", error=err, session=str(session), reason=reason,
-                              started=started, saved=tracker.saved, revisits=tracker.revisits)
+                              meeting=meeting, started=started, saved=tracker.saved, revisits=tracker.revisits)
                 time.sleep(s["interval_s"])
                 continue
 
             cur = None
-            if len(shots) > 1 or s["ignore_displays"]:
+            overrides = load_overrides()  # mtime-cached: a toggle applies from this sample on
+            if len(shots) > 1 or s["ignore_displays"] or overrides:
                 cur, got = _screens()
                 if len(got) == len(shots):
                     names = got
-                elif len(names) != len(shots) and s["ignore_displays"] and not names_warned:
+                elif (len(names) != len(shots) and (s["ignore_displays"] or overrides)
+                      and not names_warned):
                     # Unknown names: capture rather than lose the meeting, as _private does.
                     _log("display names unknown — ignore_displays not applied until they are")
                     names_warned = True
@@ -627,12 +705,13 @@ def capture(config, should_continue, reason):
 
             for idx, path in shots:
                 name = names[idx - 1] if len(names) == len(shots) else None
-                if _ignored_display(name, s["ignore_displays"]):
+                captured, why = display_state(name, s["ignore_displays"], overrides)
+                if not captured:
                     path.unlink(missing_ok=True)
                     if idx not in ignored:
                         ignored.add(idx)
-                        _event(timeline, t=t0, display=idx, event="ignored", name=name)
-                        _log(f"display {idx} ({name}): ignored by config, not capturing")
+                        _event(timeline, t=t0, display=idx, event="ignored", name=name, by=why)
+                        _log(f"display {idx} ({name}): ignored by {why}, not capturing")
                         tracker.forget(idx)
                     continue
                 if idx in ignored:
@@ -667,8 +746,11 @@ def capture(config, should_continue, reason):
                 if src:
                     _event(timeline, t=t_event, display=idx, source=dict(src, front=sources.get("front")))
 
-            _write_status(state="capturing", session=str(session), reason=reason, started=started,
-                          saved=tracker.saved, revisits=tracker.revisits, displays=len(shots),
+            _write_status(state="capturing", session=str(session), reason=reason, meeting=meeting,
+                          started=started,
+                          saved=tracker.saved, revisits=tracker.revisits,
+                          displays=_displays_status(names if len(names) == len(shots) else [],
+                                                    s["ignore_displays"], overrides),
                           ignored=sorted(names[i - 1] for i in ignored if i <= len(names)),
                           focus=focus, raw=bool(raw_dir))
             time.sleep(max(0.0, s["interval_s"] - (time.time() - t0)))
@@ -772,6 +854,20 @@ def wispr_live_meeting(config, max_hours):
     return None
 
 
+def meeting_title(config, meeting_id):
+    """The Wispr title of a meeting ("" when unknown); read-only, never raises."""
+    import wispr_flow
+    try:
+        conn = sqlite3.connect(f"file:{wispr_flow.wispr_db_path(config)}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT title FROM Meetings WHERE id = ?", (meeting_id,)).fetchone()
+        finally:
+            conn.close()
+        return (row[0] or "") if row else ""
+    except Exception:  # noqa: BLE001  a missing title must not stop capture
+        return ""
+
+
 def _resumed_after_end(meeting_dir, stale_s):
     """True when the meeting's last pause/resume marker is `resumed` and the live
     transcript is still being written."""
@@ -809,9 +905,29 @@ def _wispr_files(config, meeting_id):
     return out
 
 
+def _refresh_idle_displays(s, cache, now=None):
+    """While watching, keep status.json `displays` current: at watch start, every
+    display_refresh_s, and when displays.json changes (a toggle shows up at once).
+    One _screens() (JXA) call per refresh; `cache` is {"t", "mt"} owned by watch()."""
+    now = time.time() if now is None else now
+    try:
+        mt = OVERRIDES_FILE.stat().st_mtime_ns
+    except OSError:
+        mt = None
+    if cache.get("t") is not None and mt == cache.get("mt") \
+            and now - cache["t"] < s["display_refresh_s"]:
+        return False
+    cache.update(t=now, mt=mt)
+    _, names = _screens()
+    _write_status(state="watching",
+                  displays=_displays_status(names, s["ignore_displays"], load_overrides()))
+    return True
+
+
 def watch(config, stopping):
     """Follow Wispr Flow: capture while a meeting is live, idle otherwise."""
     s = settings(config)
+    idle_displays = {"t": None, "mt": None}
     done = set()  # meetings that hit max_hours — don't restart them
     _log("watching Wispr Flow for meetings")
     notify("Autocapture armed", "Will capture the screen while a Wispr Flow meeting is recording.")
@@ -834,10 +950,13 @@ def watch(config, stopping):
                     last["files_t"] = now
                 return last["live"]
 
-            capture(config, still_live, reason=f"Wispr meeting {m['id'][:8]}")
+            capture(config, still_live, reason=f"Wispr meeting {m['id'][:8]}",
+                    meeting={"id": m["id"], "title": meeting_title(config, m["id"])})
             if wispr_live_meeting(config, s["max_hours"]):
                 done.add(m["id"])  # stopped by max_hours or a signal while still live
             _write_status(state="watching")
+            idle_displays["t"] = None  # that write dropped `displays`; refresh below
+        _refresh_idle_displays(s, idle_displays)
         for _ in range(int(s["wispr_poll_s"])):  # in steps, so `stop` is prompt
             if stopping():
                 break
@@ -1179,8 +1298,37 @@ def ensure(wait_s=ENSURE_WAIT_S):
     _alert_not_running(f"restart attempted {how} but no watcher was alive after {wait_s:g}s")
 
 
-def install_agent(interval_s):
+WATCHDOG_NAME = "plaud-autocapture-watchdog"
+
+
+def _agent_bin_dir(bin_dir=None):
+    """Where the named launcher lives: --bin-dir, else $PLAUD_AGENT_BIN_DIR, else ~/.plaud-sync/bin."""
+    return Path(bin_dir or os.environ.get("PLAUD_AGENT_BIN_DIR") or Path.home() / ".plaud-sync" / "bin").expanduser()
+
+
+def _write_watchdog(bin_dir=None):
+    """Atomically write the executable launcher whose name Login Items shows."""
+    d = _agent_bin_dir(bin_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    script = d / WATCHDOG_NAME
+    repo = Path(__file__).resolve().parent
+    tmp = d / f".{WATCHDOG_NAME}.tmp"
+    tmp.write_text("#!/bin/bash\n"
+                   "# Plaud autocapture watchdog: restarts the Wispr screen-capture watcher;"
+                   " installed by autocapture.py install-agent\n"
+                   f"# repo: {repo}\n"
+                   f'exec "{sys.executable}" "{Path(__file__).resolve()}" ensure "$@"\n',
+                   encoding="utf-8")
+    tmp.chmod(0o755)
+    os.replace(tmp, script)
+    return script
+
+
+def install_agent(interval_s, bin_dir=None):
     """LaunchAgent: `ensure` at login and every interval_s, in the user's GUI session.
+
+    ProgramArguments is a named launcher script (see _write_watchdog), because
+    Login Items shows ProgramArguments[0] and Tomas will not approve "python3.15".
 
     launchd starts only `ensure` (plain Python, no screen access); the watcher
     itself is opened through the app exactly as `start --watch` does, so the
@@ -1189,9 +1337,10 @@ def install_agent(interval_s):
     AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     import plistlib
+    script = _write_watchdog(bin_dir)
     plist = {
         "Label": AGENT_ID,
-        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "ensure"],
+        "ProgramArguments": [str(script)],
         "RunAtLoad": True,
         "StartInterval": int(interval_s),
         "ProcessType": "Background",
@@ -1207,9 +1356,10 @@ def install_agent(interval_s):
     print(f"installed {AGENT_PLIST} — checks every {int(interval_s)}s and at login")
 
 
-def uninstall_agent():
+def uninstall_agent(bin_dir=None):
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_ID}"], capture_output=True)
     AGENT_PLIST.unlink(missing_ok=True)
+    (_agent_bin_dir(bin_dir) / WATCHDOG_NAME).unlink(missing_ok=True)
     print("agent removed — the watcher now runs only when started by hand")
 
 
@@ -1246,9 +1396,25 @@ def _foreground(mode, config, hours):
         PID_FILE.unlink(missing_ok=True)
 
 
+NOTIFY_ERRORS_HELP = ("show a macOS notification if the command fails (SwiftBar runs it with "
+                      "terminal=false, so a failure would otherwise be invisible)")
+
+
 def main():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import plaud_transcribe as pt
+    """`--notify-errors` (display, start, stop): a failure also becomes a notification."""
+    try:
+        return _main()
+    except SystemExit as e:
+        if "--notify-errors" in sys.argv and e.code not in (None, 0):
+            notify("Autocapture action failed", str(e.code)[:200], sound="Basso")
+        raise
+    except Exception as e:  # noqa: BLE001
+        if "--notify-errors" in sys.argv:
+            notify("Autocapture action failed", f"{type(e).__name__}: {e}"[:200], sound="Basso")
+        raise
+
+
+def build_parser():
     ap = argparse.ArgumentParser(
         description="Continuous, change-driven screen capture for meeting visuals.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1256,8 +1422,16 @@ def main():
   one-time setup:   install-app, grant Screen Recording to Plaud Autocapture, install-agent
   is it working?    status   (process, state, agent); check  (permission probes via the app)
   pause / resume:   stop  (agent stays paused until `start`);  start --watch
-  skip a monitor:   displays  (names), then config visuals.autocapture.ignore_displays,
+  switch a monitor off for now:  display 2 off   (back on: display 2 on; applies from the next
+                    frame, survives restarts; stored by name in ~/.cache/plaud-autocapture/displays.json)
+  skip a monitor:   displays  (names, state, source), then config visuals.autocapture.ignore_displays,
                     e.g. ["built-in"]; then stop + start --watch (config is read at start)
+  between meetings: status.json lists the displays (what the SwiftBar menu shows), refreshed every
+                    visuals.autocapture.display_refresh_s (default 300) and when displays.json changes
+  menu "Arm current meeting...": while capturing a Wispr meeting, status.json carries its id and
+                    title ("meeting"); a meeting paused for more than visuals.autocapture.
+                    wispr_resume_stale_min (default 15) minutes without a live transcript is not
+                    treated as resumed
   re-tune offline:  replay <session> --set change=0.04
 log: ~/.cache/plaud-autocapture/autocapture.log""")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1267,14 +1441,24 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     st = sub.add_parser("start", help="like run/watch, but in the background")
     st.add_argument("--watch", action="store_true", help="follow Wispr Flow instead of capturing now")
     st.add_argument("--hours", type=float)
-    sub.add_parser("stop", help="stop a background capture/watch")
+    st.add_argument("--notify-errors", action="store_true", help=NOTIFY_ERRORS_HELP)
+    sp = sub.add_parser("stop", help="stop a background capture/watch")
+    sp.add_argument("--notify-errors", action="store_true", help=NOTIFY_ERRORS_HELP)
     sub.add_parser("status", help="show what autocapture is doing")
-    sub.add_parser("displays", help="list monitors by name and whether ignore_displays skips them")
+    sub.add_parser("displays", help="list monitors by name, whether they are captured, and why (override/config)")
+    dp = sub.add_parser("display", help="switch one monitor's capture on or off, no restart (stored by name)")
+    dp.add_argument("target", help="display name, or its number as shown by `displays`")
+    dp.add_argument("state", choices=["on", "off"])
+    dp.add_argument("--notify-errors", action="store_true", help=NOTIFY_ERRORS_HELP)
     sub.add_parser("install-app", help="build ~/Applications/Plaud Autocapture.app (named permission prompt)")
     ia = sub.add_parser("install-agent", help="keep the Wispr watcher running across logins, reboots and crashes")
     ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
                     help="how often the agent checks the watcher is alive (default 300)")
-    sub.add_parser("uninstall-agent", help="remove the login agent")
+    bin_help = ("directory for the named launcher plaud-autocapture-watchdog, which is what macOS Login Items"
+                " shows (default $PLAUD_AGENT_BIN_DIR, else ~/.plaud-sync/bin)")
+    ia.add_argument("--bin-dir", metavar="DIR", help=bin_help)
+    ua = sub.add_parser("uninstall-agent", help="remove the login agent and its launcher script")
+    ua.add_argument("--bin-dir", metavar="DIR", help=bin_help)
     en = sub.add_parser("ensure", help="start the watcher unless running or paused (what the agent runs);"
                         " notifies if it still is not running")
     en.add_argument("--wait", type=float, default=ENSURE_WAIT_S, metavar="SECONDS",
@@ -1285,7 +1469,13 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     rp.add_argument("session", help="session directory (or its name under the capture dir)")
     rp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a detection setting, e.g. --set change=0.04")
-    args = ap.parse_args()
+    return ap
+
+
+def _main():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import plaud_transcribe as pt
+    args = build_parser().parse_args()
     if args.cmd == "ensure":  # before config: a broken config must not silence the alert
         try:
             ensure(args.wait)
@@ -1293,7 +1483,8 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
             _alert_not_running(f"the agent's check crashed ({type(e).__name__}: {e})")
             raise
         return
-    config = pt.load_config()
+    # validate=False: autocapture never reads `projects`, so a typo there must not stop capture
+    config = pt.load_config(validate=False)
 
     if args.cmd in ("run", "watch"):
         _foreground(args.cmd, config, getattr(args, "hours", None))
@@ -1320,9 +1511,9 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     elif args.cmd == "install-app":
         install_app()
     elif args.cmd == "install-agent":
-        install_agent(args.interval)
+        install_agent(args.interval, args.bin_dir)
     elif args.cmd == "uninstall-agent":
-        uninstall_agent()
+        uninstall_agent(args.bin_dir)
     elif args.cmd == "check":
         if args.here or not APP_PATH.exists():
             _log(f"check ({'app' if args.here else 'terminal'}): " + json.dumps(_permission_probes()))
@@ -1381,9 +1572,22 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
         _, names = _screens()
         if not names:
             sys.exit("could not ask macOS for the displays")
+        overrides = load_overrides()
         for i, n in enumerate(names, 1):
-            print(f"{i}  {n:32} {'ignored' if _ignored_display(n, patterns) else 'captured'}")
+            captured, source = display_state(n, patterns, overrides)
+            print(f"{i}  {n:32} {'captured' if captured else 'ignored':9} {source}")
         print(f"ignore_displays: {patterns}  (part of a name, case-insensitive)")
+        gone = sorted(k for k in overrides if k not in names)
+        if gone:
+            print(f"overrides for displays not connected now: {gone}")
+    elif args.cmd == "display":
+        _, names = _screens()
+        try:
+            name = resolve_display(args.target, names)
+        except ValueError as e:
+            sys.exit(str(e))
+        set_override(name, args.state == "on")
+        print(f"display {name!r}: capture {args.state} (applies from the next frame)")
 
 
 if __name__ == "__main__":
