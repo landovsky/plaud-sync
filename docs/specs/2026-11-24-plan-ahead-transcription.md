@@ -441,8 +441,8 @@ _Managed via `/manage feature`; updated per chunk._
 | Chunk | Parts | Status | Commit | Notes |
 |-------|-------|--------|--------|-------|
 | K1 | A | done | 0d0cf3a | `project_specs()` + `ConfigError` validated in `load_config()`, `project_hints` merges per-project hints, epilog in `--help`, example/README updated, 15 tests; deviations: `main()` turns ConfigError into a clean exit 2; `load_config(validate=False)` used by autocapture so a project typo cannot stop capture; `cmd_init` template `project-b` is now object-form (`push` none) |
-| K2 | B (store, enqueue, jobs list/show/cancel/seen), G3 | done | | `jobs.py` (atomic store, validate, schema 1), `jobs_cli.py` (`enqueue`, `jobs list/show/cancel/seen`), dispatched at top of `main()`, 39 tests; deviations: cancel sets new state `cancelled`; `deliver` gained an `ask` field (project deliver_ask); job ids accept a unique prefix; `jobs_cli.main(argv, host=)` takes the plaud_transcribe module to avoid a second import of `__main__` |
-| K3 | B3, B5 | pending | | Non-interactive pipeline hooks: forced project, no prompts, richer results |
+| K2 | B (store, enqueue, jobs list/show/cancel/seen), G3 | done | 6937115 | `jobs.py` (atomic store, validate, schema 1), `jobs_cli.py` (`enqueue`, `jobs list/show/cancel/seen`), dispatched at top of `main()`, 39 tests; deviations: cancel sets new state `cancelled`; `deliver` gained an `ask` field (project deliver_ask); job ids accept a unique prefix; `jobs_cli.main(argv, host=)` takes the plaud_transcribe module to avoid a second import of `__main__` |
+| K3 | B3, B5 | done | | `forced_project`/`interactive` keyword-only on both process functions, `visuals.set_interactive`/`PLAUD_NONINTERACTIVE`, richer result dict, 12 tests in `tests/test_noninteractive_pipeline.py`; uncommitted |
 | K4 | B2, B6, B8, B9, B7 retry | pending | | Runner core: flock, step machine, resume, failure notify |
 | K5 | B1, B4 | pending | | Credentials preflight/env + `install-runner` LaunchAgent |
 | K6 | C1, C2, C3, C5, C7 | pending | | Worktree commit + push to main + safe ff |

@@ -705,7 +705,7 @@ def format_project_list(projects, config, state):
 
 
 def claude_summarize(transcript_text, recording_meta, projects, language="en", want_clean=True,
-                     extra_instructions=None, config=None, state=None):
+                     extra_instructions=None, config=None, state=None, forced_project=None):
     project_list = format_project_list(projects, config or {}, state or {})
     duration_min = recording_meta.get("duration", 0) // 60000
 
@@ -742,6 +742,16 @@ def claude_summarize(transcript_text, recording_meta, projects, language="en", w
             'They do NOT replace anything above: keep the same output format, '
             'sentinels, JSON metadata and section structure.\n\n'
             f'{extra_instructions.strip()}\n'
+        )
+
+    # The project was chosen up front (a job): the summary must not argue with it.
+    if forced_project:
+        prompt += (
+            '\n\n## Project already decided\n'
+            f'This recording belongs to the project "{forced_project}"; it was chosen '
+            'by the user and will be filed there. Set "project" to exactly that value '
+            'and write the summary from that project\'s point of view. Still return '
+            'the name, type and tags as specified.\n'
         )
 
     timeout = max(300, duration_min * 30)
@@ -1133,8 +1143,51 @@ def resolve_output_dir(state, file_ids, target_base, dir_name):
     return target_base / dir_name
 
 
+def summary_first_line(classification, limit=200):
+    """First line of prose in the summary (no heading), for commit messages."""
+    for line in strip_leading_h1(classification.get("summary", "") or "").splitlines():
+        line = line.strip().lstrip("#>-*• ").strip()
+        if line:
+            return line[:limit]
+    return ""
+
+
+def _output_files(output_dir):
+    return sorted(p.name for p in Path(output_dir).iterdir() if p.is_file())
+
+
+def _check_forced_project(forced_project, projects):
+    if forced_project and forced_project != "default" and forced_project not in projects:
+        raise ValueError(f"forced project '{forced_project}' is not in the config "
+                         f"(known: {', '.join(sorted(projects)) or 'none'})")
+
+
 def process_recording(recording, token, config, folders, projects, state, language,
-                      extra_instructions=None, cuts=None):
+                      extra_instructions=None, cuts=None, *, forced_project=None,
+                      interactive=True):
+    """Transcribe, summarize and write one recording; returns a result dict or None.
+
+    forced_project: file under that project and ignore the classifier's pick (it
+    still runs for name/summary). interactive=False: never prompt, even on a TTY.
+    """
+    _check_forced_project(forced_project, projects)
+    with visuals.interactive_scope(interactive):
+        return _process_recording(recording, token, config, folders, projects, state,
+                                  language, extra_instructions, cuts, forced_project)
+
+
+def process_merged_recordings(recordings, token, config, folders, projects, state, language,
+                              extra_instructions=None, *, forced_project=None,
+                              interactive=True):
+    """Process multiple recordings as a single merged session (no cuts, by design)."""
+    _check_forced_project(forced_project, projects)
+    with visuals.interactive_scope(interactive):
+        return _process_merged(recordings, token, config, folders, projects, state,
+                               language, extra_instructions, forced_project)
+
+
+def _process_recording(recording, token, config, folders, projects, state, language,
+                       extra_instructions=None, cuts=None, forced_project=None):
     file_id = recording["id"]
     source = recording.get("source", "plaud")
     filename = recording.get("filename", "untitled")
@@ -1235,7 +1288,7 @@ def process_recording(recording, token, config, folders, projects, state, langua
                                       want_clean=(source != "wispr"),
                                       extra_instructions=with_visual_instructions(
                                           extra_instructions, visual_ctx),
-                                      config=config, state=state)
+                                      config=config, state=state, forced_project=forced_project)
     if not classification:
         print("FAILED")
         state.setdefault("transcribed", {})[file_id] = {
@@ -1248,7 +1301,9 @@ def process_recording(recording, token, config, folders, projects, state, langua
     # Normalize: only keep the project label if it matches a real config key,
     # otherwise mark it "default" so unmatched recordings aren't mislabeled.
     project_key = classification.get("project", "default")
-    if project_key not in projects:
+    if forced_project:
+        project_key = forced_project
+    elif project_key not in projects:
         project_key = "default"
     classification["project"] = project_key
     rec_name = classification.get("name", filename)
@@ -1299,12 +1354,15 @@ def process_recording(recording, token, config, folders, projects, state, langua
     }
     save_state(state)
 
-    return {"file_id": file_id, "name": rec_name, "project": project_key, "output_dir": str(output_dir)}
+    return {"file_id": file_id, "name": rec_name, "title": rec_name, "project": project_key,
+            "date": date_str, "duration": duration,
+            "sources": [{"id": file_id, "source": source, "filename": filename}],
+            "summary_first_line": summary_first_line(classification),
+            "files": _output_files(output_dir), "output_dir": str(output_dir)}
 
 
-def process_merged_recordings(recordings, token, config, folders, projects, state, language,
-                              extra_instructions=None):
-    """Process multiple recordings as a single merged session."""
+def _process_merged(recordings, token, config, folders, projects, state, language,
+                    extra_instructions=None, forced_project=None):
     recordings = sorted(recordings, key=lambda r: r.get("start_time", 0))
 
     first = recordings[0]
@@ -1414,7 +1472,7 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
                                       want_clean=(merged_source != "wispr"),
                                       extra_instructions=with_visual_instructions(
                                           extra_instructions, visual_ctx),
-                                      config=config, state=state)
+                                      config=config, state=state, forced_project=forced_project)
     if not classification:
         print("FAILED")
         for fid in file_ids:
@@ -1428,7 +1486,9 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
     # Normalize: only keep the project label if it matches a real config key,
     # otherwise mark it "default" so unmatched recordings aren't mislabeled.
     project_key = classification.get("project", "default")
-    if project_key not in projects:
+    if forced_project:
+        project_key = forced_project
+    elif project_key not in projects:
         project_key = "default"
     classification["project"] = project_key
     rec_name = classification.get("name", first.get("filename", "untitled"))
@@ -1475,7 +1535,12 @@ def process_merged_recordings(recordings, token, config, folders, projects, stat
         }
     save_state(state)
 
-    return {"file_id": file_ids[0], "name": rec_name, "project": project_key, "output_dir": str(output_dir)}
+    return {"file_id": file_ids[0], "name": rec_name, "title": rec_name, "project": project_key,
+            "date": date_str, "duration": total_duration,
+            "sources": [{"id": r["id"], "source": r.get("source", "plaud"),
+                         "filename": r.get("filename", "untitled")} for r in recordings],
+            "summary_first_line": summary_first_line(classification),
+            "files": _output_files(output_dir), "output_dir": str(output_dir)}
 
 
 # --- Commands ---

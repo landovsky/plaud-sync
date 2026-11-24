@@ -24,6 +24,7 @@ Everything degrades: no images, no phone, no `adb`, no `sips`, a failed caption 
 each is a warning and an empty result, never a blocked transcript.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -183,8 +184,49 @@ def _device_state(adb):
     return adb_link.find_phone(adb, _pair_hint)
 
 
+_interactive = True
+
+
+def set_interactive(flag):
+    """Module switch for unattended runs (the job runner). When off, nothing in
+    this module ever reads stdin, even if stdin is a TTY. Returns the previous
+    value so callers can restore it. Env `PLAUD_NONINTERACTIVE=1` forces it off."""
+    global _interactive
+    prev = _interactive
+    _interactive = bool(flag)
+    return prev
+
+
+@contextlib.contextmanager
+def interactive_scope(interactive):
+    """interactive=False switches prompts off for the block; True leaves the
+    module state alone, so a runner that called set_interactive(False) stays off."""
+    prev = _interactive
+    if not interactive:
+        set_interactive(False)
+    try:
+        yield
+    finally:
+        set_interactive(prev)
+
+
+def is_interactive():
+    """False when the switch is off, when PLAUD_NONINTERACTIVE is set, or when
+    stdin/stderr is not a terminal."""
+    if not _interactive or os.environ.get("PLAUD_NONINTERACTIVE", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stderr.isatty())
+    except (ValueError, AttributeError):  # closed or missing stream
+        return False
+
+
 def _timed_input(prompt, timeout):
-    """input() that returns None if nothing is entered within `timeout` seconds."""
+    """input() that returns None if nothing is entered within `timeout` seconds.
+    Returns None at once, without touching stdin, when non-interactive."""
+    if not is_interactive():
+        return None
     print(prompt, end="", flush=True)
     ready, _, _ = select.select([sys.stdin], [], [], timeout)
     if not ready:
@@ -206,7 +248,7 @@ def _await_phone(adb):
     state = _device_state(adb)
     if state == "ready":
         return True
-    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+    if not is_interactive():
         print(f"  Note: phone {state} — skipping phone photos (non-interactive run)",
               file=sys.stderr)
         return False
