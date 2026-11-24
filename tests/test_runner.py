@@ -10,6 +10,8 @@ import plaud_transcribe as pt
 import runner
 import visuals
 
+REAL_PREFLIGHT = runner.preflight
+
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
@@ -21,6 +23,9 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(pt, "STATE_FILE", tmp_path / "cfg" / "state.json")
     monkeypatch.setattr(pt, "CONFIG_FILE", tmp_path / "cfg" / "config.json")
     monkeypatch.setattr(visuals, "_interactive", True)
+    # never run the real env command (direnv + sops) or check the real machine's credentials
+    monkeypatch.setattr(runner, "load_runner_env", lambda *a, **k: "env: stubbed")
+    monkeypatch.setattr(runner, "preflight", lambda *a, **k: None)
     sent = []
     monkeypatch.setattr(runner, "notify", lambda title, msg, **k: sent.append((title, msg)))
     calls = []
@@ -360,3 +365,161 @@ class TestRunnerCommand:
         with pytest.raises(SystemExit) as e:
             pt.main()
         assert e.value.code == 0
+
+
+class TestRunnerCredentials:
+    """launchd starts the runner with no shell, so no .envrc: a missing key used
+    to surface halfway through a job, after the paid transcription had started."""
+
+    @pytest.fixture
+    def creds(self, env, monkeypatch):
+        monkeypatch.setattr(runner, "preflight", REAL_PREFLIGHT)
+        for k in runner.REQUIRED_ENV + ("PLAUD_RUNNER_CLAUDE_LOGIN", "PLAUD_RUNNER_ENV_CMD"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setattr(runner.shutil, "which", lambda name, path=None: "/bin/claude")
+        monkeypatch.setattr(runner, "STEP_FUNCS", {**runner.STEP_FUNCS})
+        return env
+
+    def fake_env(self, pairs, rc=0):
+        def run(cmd, **kw):
+            self.cmd = cmd
+            out = b"\0".join(f"{k}={v}".encode() for k, v in pairs.items()) + b"\0"
+            return SimpleNamespace(returncode=rc, stdout=out, stderr=b"")
+        return run
+
+    def test_existing_environment_wins_and_the_env_command_is_not_even_run(self):
+        environ = {k: "mine" for k in runner.REQUIRED_ENV}
+        runner.load_runner_env({}, environ, run=lambda *a, **k: pytest.fail("ran"))
+        assert environ["CLAUDE_CODE_OAUTH_TOKEN"] == "mine"
+
+    def test_a_variable_already_set_is_not_overwritten_by_the_command(self):
+        environ = {"ELEVENLABS_API_KEY": "mine"}
+        runner.load_runner_env({}, environ, run=self.fake_env(
+            {"ELEVENLABS_API_KEY": "theirs", "CLAUDE_CODE_OAUTH_TOKEN": "c", "PLAUD_BEARER_TOKEN": "p"}))
+        assert environ["ELEVENLABS_API_KEY"] == "mine" and environ["CLAUDE_CODE_OAUTH_TOKEN"] == "c"
+
+    def test_only_the_needed_variables_are_imported_not_the_whole_env(self):
+        environ = {"PATH": "/usr/bin"}
+        status = runner.load_runner_env({}, environ, run=self.fake_env(
+            {"CLAUDE_CODE_OAUTH_TOKEN": "dummy-c", "AWS_SECRET_ACCESS_KEY": "nope", "HOME": "/h",
+             "PATH": "/usr/bin:/opt/x/bin"}))
+        assert set(environ) == {"PATH", "CLAUDE_CODE_OAUTH_TOKEN"}
+        assert environ["PATH"] == "/usr/bin:/opt/x/bin"
+        assert "dummy-c" not in status   # values never reach the log
+
+    def test_default_command_is_direnv_exec_in_the_repo_with_nul_output(self):
+        runner.load_runner_env({}, {}, run=self.fake_env({}))
+        assert self.cmd == ["direnv", "exec", str(runner.REPO_DIR), "env", "-0"]
+
+    def test_env_var_beats_config_beats_default_for_the_command(self, monkeypatch):
+        cfg = {"runner": {"env_cmd": "from-config --x"}}
+        runner.load_runner_env(cfg, {}, run=self.fake_env({}))
+        assert self.cmd == ["from-config", "--x"]
+        monkeypatch.setenv("PLAUD_RUNNER_ENV_CMD", "from-env")
+        runner.load_runner_env(cfg, {}, run=self.fake_env({}))
+        assert self.cmd == ["from-env"]
+
+    def test_a_failing_env_command_is_not_fatal_here(self):
+        environ = {}
+        assert "exited 1" in runner.load_runner_env({}, environ, run=self.fake_env({}, rc=1))
+        def boom(*a, **k):
+            raise FileNotFoundError("direnv")
+        assert "failed" in runner.load_runner_env({}, environ, run=boom)
+        assert environ == {}
+
+    def test_preflight_names_each_missing_variable_for_a_plaud_job(self, creds):
+        job = jobs.new_job(recordings=["plaud-id-1"])
+        with pytest.raises(runner.PreflightError) as e:
+            REAL_PREFLIGHT(job, {}, {})
+        for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ELEVENLABS_API_KEY", "PLAUD_BEARER_TOKEN"):
+            assert name in str(e.value)
+
+    def test_wispr_job_needs_neither_elevenlabs_nor_a_plaud_token(self, creds):
+        job = jobs.new_job(recordings=["wispr:abc"])
+        REAL_PREFLIGHT(job, {}, {"CLAUDE_CODE_OAUTH_TOKEN": "x"})
+
+    def test_recorder_job_needs_elevenlabs_but_no_plaud_token(self, creds):
+        job = jobs.new_job(recordings=["recorder:7"])
+        with pytest.raises(runner.PreflightError) as e:
+            REAL_PREFLIGHT(job, {}, {"CLAUDE_CODE_OAUTH_TOKEN": "x"})
+        assert "ELEVENLABS_API_KEY" in str(e.value) and "PLAUD_BEARER_TOKEN" not in str(e.value)
+
+    def test_plaud_token_may_come_from_the_config_as_get_token_allows(self, creds):
+        job = jobs.new_job(recordings=["plaud-id-1"])
+        REAL_PREFLIGHT(job, {"token": "t"}, {"CLAUDE_CODE_OAUTH_TOKEN": "x", "ELEVENLABS_API_KEY": "e"})
+
+    def test_a_logged_in_claude_is_accepted_only_when_asked_for(self, creds):
+        job = jobs.new_job(recordings=["wispr:abc"])
+        REAL_PREFLIGHT(job, {}, {"PLAUD_RUNNER_CLAUDE_LOGIN": "1"})
+
+    def test_missing_claude_binary_is_named(self, creds, monkeypatch):
+        monkeypatch.setattr(runner.shutil, "which", lambda name, path=None: None)
+        with pytest.raises(runner.PreflightError, match="claude"):
+            REAL_PREFLIGHT(jobs.new_job(recordings=["wispr:a"]), {}, {"CLAUDE_CODE_OAUTH_TOKEN": "x"})
+
+    def test_a_missing_key_fails_the_job_before_the_paid_step_is_called(self, creds):
+        job = make_job(recordings=["plaud-id-1"])
+        run_all()
+        saved = jobs.load_job(job["id"])
+        assert creds.calls == []                        # no step ran, so nothing was paid for
+        assert saved["state"] == "failed" and saved["failed_step"] == "preflight"
+        assert "ELEVENLABS_API_KEY" in saved["error"]
+        assert len(creds.sent) == 1
+
+    def test_retry_after_fixing_the_environment_runs_the_job(self, creds, monkeypatch):
+        job = make_job(recordings=["wispr:a"])
+        run_all()
+        assert jobs.load_job(job["id"])["state"] == "failed"
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "x")
+        jobs.retry_job(job["id"])
+        run_all()
+        assert jobs.load_job(job["id"])["state"] == "done"
+
+    def test_runner_start_loads_the_env_once_after_taking_the_lock(self, env, monkeypatch):
+        calls = []
+        monkeypatch.setattr(runner, "load_runner_env", lambda cfg: calls.append(1) or "env: x")
+        make_job()
+        runner.main(["--lock-file", str(env.tmp / "l")], host=pt)
+        assert calls == [1]
+
+
+class TestWisprOnlyJobNeedsNoPlaud:
+    """K4 always asked for a Plaud token and listed Plaud recordings, so a job
+    over a local Wispr meeting failed on a machine without Plaud credentials."""
+
+    def test_wispr_job_runs_with_get_token_and_the_plaud_api_patched_to_raise(self, env, monkeypatch):
+        rec = {"id": "wispr:abc", "source": "wispr", "filename": "Standup", "start_time": 5}
+        monkeypatch.setattr(runner, "STEP_FUNCS", {**runner.STEP_FUNCS, "transcribe": runner.step_transcribe})
+        for name in ("get_token", "list_all_recordings", "fetch_folders", "list_recordings"):
+            monkeypatch.setattr(pt, name, lambda *a, **k: pytest.fail("Plaud API touched"))
+        monkeypatch.setattr(pt.wispr_flow, "list_meetings", lambda c, d: [rec])
+        monkeypatch.setattr(pt.google_recorder, "list_recordings", lambda c, d: [])
+        monkeypatch.setattr(pt, "get_projects", lambda c: {})
+        monkeypatch.setattr(pt, "prefetch_phone_files", lambda *a: None)
+        seen = {}
+
+        def fake(r, token, config, folders, projects, state, language, **kw):
+            seen.update(token=token, folders=folders)
+            return {"file_id": r["id"], "output_dir": "/o"}
+
+        monkeypatch.setattr(pt, "process_recording", fake)
+        job = make_job(recordings=["wispr:abc"])
+        (env.tmp / "cfg").mkdir()
+        run_all()
+        assert jobs.load_job(job["id"])["state"] == "done"
+        assert seen == {"token": None, "folders": {}}
+
+    def test_recorder_job_is_found_through_the_phone_lister(self, env, monkeypatch):
+        rec = {"id": "recorder:7", "source": "recorder", "filename": "R", "start_time": 5}
+        monkeypatch.setattr(runner, "STEP_FUNCS", {**runner.STEP_FUNCS, "transcribe": runner.step_transcribe})
+        monkeypatch.setattr(pt, "get_token", lambda: pytest.fail("Plaud token"))
+        monkeypatch.setattr(pt.wispr_flow, "list_meetings", lambda c, d: [])
+        monkeypatch.setattr(pt.google_recorder, "list_recordings", lambda c, d: [rec])
+        monkeypatch.setattr(pt, "get_projects", lambda c: {})
+        monkeypatch.setattr(pt, "prefetch_phone_files", lambda *a: None)
+        monkeypatch.setattr(pt, "process_recording",
+                            lambda r, *a, **k: {"file_id": r["id"], "output_dir": "/o"})
+        job = make_job(recordings=["recorder:7"])
+        (env.tmp / "cfg").mkdir()
+        run_all()
+        assert jobs.load_job(job["id"])["state"] == "done"

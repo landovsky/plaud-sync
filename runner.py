@@ -19,6 +19,9 @@ once (B9); the launchd WatchPaths re-trigger relies on that.
 import argparse
 import fcntl
 import os
+import shlex
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +33,9 @@ import visuals
 STEPS = ("transcribe", "commit", "push", "deliver")
 DONE_STEPS = ("done", "skipped")
 DEFAULT_DAYS = 30
+REPO_DIR = Path(__file__).resolve().parent
+REQUIRED_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ELEVENLABS_API_KEY", "PLAUD_BEARER_TOKEN")
+NON_PLAUD_PREFIXES = ("wispr:", "recorder:", "local:")
 LOCK_FILE = Path(os.environ.get("PLAUD_RUNNER_LOCK") or "~/.plaud-sync/runner.lock").expanduser()
 
 
@@ -51,6 +57,91 @@ def acquire_lock(path=None):
         f.close()
         return None
     return f
+
+
+# ---------------------------------------------------------------- credentials (B4)
+
+class PreflightError(RuntimeError):
+    """A credential the job needs is missing; the message names the variable."""
+
+
+def env_command(config=None):
+    """The command that prints the credentials as NUL-separated KEY=VALUE.
+    Env PLAUD_RUNNER_ENV_CMD, else config runner.env_cmd, else direnv in the repo
+    (the .envrc decrypts the sops files; it is not a plain file to parse)."""
+    cmd = os.environ.get("PLAUD_RUNNER_ENV_CMD") or ((config or {}).get("runner") or {}).get("env_cmd")
+    if cmd:
+        return shlex.split(cmd) if isinstance(cmd, str) else [str(c) for c in cmd]
+    return ["direnv", "exec", str(REPO_DIR), "env", "-0"]
+
+
+def load_runner_env(config=None, environ=None, run=subprocess.run):
+    """Make the credentials available without an interactive shell.
+
+    Variables already in the environment win. Only if one of REQUIRED_ENV is
+    missing is the env command run (launchd starts us with no .envrc loaded);
+    from its output only the REQUIRED_ENV variables that are still unset are
+    imported, plus PATH entries we lack (the command's PATH may know `claude`).
+    Nothing else is copied and no value is ever printed. A failing command is
+    not fatal: preflight names what is still missing. Returns a status line."""
+    environ = os.environ if environ is None else environ
+    if all(environ.get(k) for k in REQUIRED_ENV):
+        return "env: credentials already in the environment"
+    cmd = env_command(config)
+    try:
+        proc = run(cmd, capture_output=True, timeout=60, cwd=str(REPO_DIR))
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"env: command {cmd[0]!r} failed ({type(e).__name__})"
+    if proc.returncode != 0:
+        return f"env: command {cmd[0]!r} exited {proc.returncode}"
+    found = {}
+    for item in (proc.stdout or b"").split(b"\0"):
+        key, sep, val = item.decode("utf-8", "replace").partition("=")
+        if sep and key:
+            found[key] = val
+    imported = []
+    for key in REQUIRED_ENV:
+        if not environ.get(key) and found.get(key):
+            environ[key] = found[key]
+            imported.append(key)
+    have = [d for d in (environ.get("PATH") or "").split(os.pathsep) if d]
+    extra = [d for d in (found.get("PATH") or "").split(os.pathsep) if d and d not in have]
+    if extra:
+        environ["PATH"] = os.pathsep.join(have + extra)
+        imported.append("PATH")
+    return "env: imported " + (", ".join(imported) if imported else "nothing")
+
+
+def _is_plaud(rec_id):
+    return not rec_id.startswith(NON_PLAUD_PREFIXES)
+
+
+def preflight(job, config=None, environ=None):
+    """Check what this job needs before any paid or network call; raise
+    PreflightError naming every missing variable.
+
+    - claude: summarization shells out to `claude -p` (plaud_transcribe.claude_summarize),
+      which authenticates with CLAUDE_CODE_OAUTH_TOKEN. A login kept only in the
+      Claude keychain cannot be checked without a paid call, so the token is
+      required, unless PLAUD_RUNNER_CLAUDE_LOGIN=1 says "trust the CLI's own login".
+      The `claude` binary must also be on PATH (launchd's PATH is short).
+    - ELEVENLABS_API_KEY: every recording but Wispr ones is transcribed there.
+    - PLAUD_BEARER_TOKEN (or config "token", as get_token does): Plaud ids only."""
+    environ = os.environ if environ is None else environ
+    ids = job.get("recordings") or []
+    missing = []
+    if not environ.get("CLAUDE_CODE_OAUTH_TOKEN") and environ.get("PLAUD_RUNNER_CLAUDE_LOGIN") != "1":
+        missing.append("CLAUDE_CODE_OAUTH_TOKEN (or PLAUD_RUNNER_CLAUDE_LOGIN=1 for a logged-in claude)")
+    if not shutil.which("claude", path=environ.get("PATH")):
+        missing.append("`claude` CLI on PATH")
+    if any(not i.startswith("wispr:") for i in ids) and not environ.get("ELEVENLABS_API_KEY"):
+        missing.append("ELEVENLABS_API_KEY")
+    if any(_is_plaud(i) for i in ids) and not environ.get("PLAUD_BEARER_TOKEN") \
+            and not (config or {}).get("token"):
+        missing.append("PLAUD_BEARER_TOKEN (or 'token' in the config)")
+    if missing:
+        raise PreflightError("missing before start: " + "; ".join(missing)
+                             + " - the runner loads them via direnv (see `runner --help`)")
 
 
 # ---------------------------------------------------------------- steps
@@ -84,10 +175,17 @@ def step_transcribe(job, ctx, checkpoint=None):
     pt = ctx.host
     config = pt.load_config()
     projects = pt.get_projects(config)
-    token = _token(pt)
-    recordings = _resolve_recordings(job["recordings"],
-                                     pt.list_all_recordings(token, config, ctx.days))
-    folders = pt.fetch_folders(token, config)
+    if any(_is_plaud(i) for i in job["recordings"]):
+        token = _token(pt)
+        listing = pt.list_all_recordings(token, config, ctx.days)
+        folders = pt.fetch_folders(token, config)
+    else:
+        # Wispr / recorder / local only: their listers read the local store or the
+        # phone, so no Plaud token and no Plaud API call (K4 gap).
+        token, folders = None, {}
+        listing = pt.wispr_flow.list_meetings(config, ctx.days) \
+            + pt.google_recorder.list_recordings(config, ctx.days)
+    recordings = _resolve_recordings(job["recordings"], listing)
     language = config.get("language", "cs")
     project = job.get("project")
     result = job.setdefault("result", {})
@@ -167,6 +265,20 @@ def run_job(job, ctx):
     job["state"] = "running"
     try:
         _save(job)
+        pending = next((s for s in job["steps"] if s["name"] == "transcribe"), None)
+        if not (pending and pending["state"] in DONE_STEPS):
+            try:
+                config = ctx.host.load_config(validate=False)
+            except (OSError, ValueError):
+                config = {}
+            try:
+                preflight(job, config)
+            except PreflightError as e:
+                jobs.set_step(job, "preflight", "failed", error=str(e))
+                job.update(state="failed", error=str(e), failed_step="preflight")
+                _save(job)
+                ctx.notify("Plaud job failed", f"{job['id']}: {str(e)[:200]}", sound="Basso")
+                return "failed"
         for name in STEPS:
             if _fresh_state(job["id"]) == "cancelled":
                 raise Cancelled(job["id"])
@@ -243,6 +355,17 @@ behaviour:
   'running' by a crash is resumed from its first unfinished step. It never
   prompts. A failed job gets one notification and the queue goes on.
   Env: PLAUD_RUNNER_LOCK sets the default lock file, PLAUD_JOBS_DIR the jobs dir.
+
+credentials:
+  Started by launchd there is no shell, so at start the runner fills in what is
+  missing (CLAUDE_CODE_OAUTH_TOKEN, ELEVENLABS_API_KEY, PLAUD_BEARER_TOKEN) by
+  running `direnv exec <repo> env -0` (needs `direnv allow` once; the .envrc
+  runs sops). Variables already set win; nothing else is imported.
+    PLAUD_RUNNER_ENV_CMD="..."   or config {"runner": {"env_cmd": "..."}}
+                                 other command printing NUL-separated KEY=VALUE
+    PLAUD_RUNNER_CLAUDE_LOGIN=1  accept a logged-in `claude` instead of the token
+  Before any paid call a job whose credentials are missing fails naming them.
+  Wispr-only jobs need no ElevenLabs key and no Plaud token.
 """
 
 
@@ -277,6 +400,11 @@ def main(argv=None, host=None):
         print("runner: another runner holds the lock; exiting")
         return 0
     try:
+        try:
+            cfg = host.load_config(validate=False)
+        except (OSError, ValueError):
+            cfg = {}
+        print("runner: " + load_runner_env(cfg))
         days = args.days
         if days is None:
             try:

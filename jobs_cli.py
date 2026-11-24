@@ -6,11 +6,43 @@ argparse subparsers, so `--help` and `enqueue` never touch the Plaud API.
 
 import argparse
 import json
+import os
+import plistlib
+import subprocess
 import sys
+from pathlib import Path
 
 import jobs
 
-COMMANDS = ("enqueue", "jobs", "runner")
+COMMANDS = ("enqueue", "jobs", "runner", "install-runner", "uninstall-runner")
+
+REPO_DIR = Path(__file__).resolve().parent
+RUNNER_ID = "local.plaud-sync.runner"
+RUNNER_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{RUNNER_ID}.plist"
+RUNNER_LOG = Path.home() / ".plaud-sync" / "runner.log"
+DEFAULT_INTERVAL = 60
+# launchd's own PATH has none of claude, gh, cc-tree, terminal-notifier or Homebrew git
+AGENT_PATH = ["/opt/homebrew/bin", str(Path.home() / ".local" / "bin"),
+              "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+INSTALL_EPILOG = """\
+recipes:
+  install the runner agent (starts at login, on a new job file, and every 60 s)
+    plaud-transcribe install-runner
+  poll less often (the interval is what promotes armed jobs when a meeting ends)
+    plaud-transcribe install-runner --interval 120
+  remove it
+    plaud-transcribe uninstall-runner
+
+what it installs:
+  ~/Library/LaunchAgents/local.plaud-sync.runner.plist running
+  `python plaud_transcribe.py runner` from this repo, with RunAtLoad, WatchPaths
+  on the jobs dir (PLAUD_JOBS_DIR / ~/.plaud-sync/jobs; created if missing) and
+  StartInterval. Errors go to ~/.plaud-sync/runner.log. Re-triggers are harmless:
+  a second runner exits at once while one holds the lock.
+  Credentials come from `direnv exec` at runner start; run `direnv allow` in the
+  repo once (see `plaud-transcribe runner --help`).
+"""
 
 ENQUEUE_EPILOG = """\
 recipes:
@@ -49,7 +81,7 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Job queue commands (offline: they only read/write job files).")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner,install-runner,uninstall-runner}")
 
     e = sub.add_parser(
         "enqueue", help="write a job file for the runner (no network)",
@@ -88,7 +120,53 @@ def build_parser():
         s.add_argument("id", help="job id or unique prefix")
     sub.add_parser("runner", help="process queued jobs, then exit (see runner --help)",
                    add_help=False)
+    i = sub.add_parser("install-runner", help="install the LaunchAgent that runs the runner",
+                       description="Install and load the runner LaunchAgent.",
+                       epilog=INSTALL_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    i.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, metavar="SECONDS",
+                   help=f"also start the runner every N seconds (default {DEFAULT_INTERVAL}); "
+                        "this is what picks up armed jobs")
+    sub.add_parser("uninstall-runner", help="unload and remove the runner LaunchAgent",
+                   description="Unload and remove the runner LaunchAgent.")
     return p
+
+
+def runner_plist(interval_s):
+    return {
+        "Label": RUNNER_ID,
+        "ProgramArguments": [sys.executable, str(REPO_DIR / "plaud_transcribe.py"), "runner"],
+        "RunAtLoad": True,
+        "WatchPaths": [str(jobs.JOBS_DIR)],
+        "StartInterval": int(interval_s),
+        "WorkingDirectory": str(REPO_DIR),   # the summarizer reads only below its cwd
+        "EnvironmentVariables": {"PATH": os.pathsep.join(AGENT_PATH)},
+        "ProcessType": "Background",
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": str(RUNNER_LOG),
+    }
+
+
+def install_runner(interval_s=DEFAULT_INTERVAL):
+    if interval_s < 1:
+        raise jobs.JobError("--interval must be at least 1 second")
+    RUNNER_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    RUNNER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    jobs.JOBS_DIR.mkdir(parents=True, exist_ok=True)   # WatchPaths needs a target
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{RUNNER_ID}"], capture_output=True)
+    with open(RUNNER_PLIST, "wb") as f:
+        plistlib.dump(runner_plist(interval_s), f)
+    subprocess.run(["launchctl", "bootstrap", domain, str(RUNNER_PLIST)], check=True)
+    print(f"installed {RUNNER_PLIST} - runs at login, on job-file changes in "
+          f"{jobs.JOBS_DIR} and every {int(interval_s)}s; log: {RUNNER_LOG}")
+    return 0
+
+
+def uninstall_runner():
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{RUNNER_ID}"], capture_output=True)
+    RUNNER_PLIST.unlink(missing_ok=True)
+    print("runner agent removed - queued jobs wait until `plaud-transcribe runner` is run by hand")
+    return 0
 
 
 def _host(host):
@@ -178,6 +256,10 @@ def main(argv=None, host=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "install-runner":
+            return install_runner(args.interval)
+        if args.command == "uninstall-runner":
+            return uninstall_runner()
         if args.command == "enqueue":
             return cmd_enqueue(args, _host(host))
         return cmd_jobs(args)
