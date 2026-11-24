@@ -397,15 +397,6 @@ class TestWhatTheCommitStepRefuses:
         with pytest.raises(publish.PublishError, match="no 'origin' remote"):
             publish.step_commit(job, ctx_for(solo))
 
-    def test_pr_mode_is_not_built_yet_and_says_so(self, repo):
-        job = make_job([make_transcript(repo.user, "Weekly")], push="pr")
-        ctx = ctx_for(repo.user, push="pr")
-        publish.step_commit(job, ctx)
-
-        with pytest.raises(publish.PublishError, match="pr lands in K7"):
-            publish.step_push(job, ctx)
-        assert origin_subjects(repo) == ["seed"]
-
 
 class TestPushModeComesFromTheProject:
     """The job's push/node/ask are null when the classifier routes; they resolve from the

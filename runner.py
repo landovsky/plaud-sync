@@ -358,6 +358,20 @@ behaviour:
   prompts. A failed job gets one notification and the queue goes on.
   Env: PLAUD_RUNNER_LOCK sets the default lock file, PLAUD_JOBS_DIR the jobs dir.
 
+publishing (push = main | pr, see publish.py):
+  main  commits go to origin/main from a temporary worktree; the checkout is
+        only fast-forwarded when that is harmless. A rejected push fails the job
+        at `push` and keeps the local branch transcripts/<job-id>; there is no
+        fallback to a PR. `jobs retry` then pushes the same commits.
+  pr    the branch transcripts/<job-id> is pushed to origin under that name and
+        `gh pr create --base main --head <branch>` runs in the repo root; the URL
+        lands in result.pr. main and the checkout are never written. A retry
+        reuses the pushed branch and the open PR.
+    PLAUD_PUSH_RETRIES=N   rebase-and-retry rounds after a non-fast-forward
+                           (default 3); config {"runner": {"push_retries": N}}
+    GH_BIN=/path/to/gh     gh binary for pr mode (default gh);
+                           config {"runner": {"gh": "/path/to/gh"}}
+
 credentials:
   Started by launchd there is no shell, so at start the runner fills in what is
   missing (CLAUDE_CODE_OAUTH_TOKEN, ELEVENLABS_API_KEY, PLAUD_BEARER_TOKEN) by

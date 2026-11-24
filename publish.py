@@ -23,13 +23,18 @@ Knobs
                        config {"runner": {"push_retries": N}} sets the same.
   push mode            per job (`enqueue --push`), else the project's `push` in config.
   push none            nothing is pushed; today's `auto_commit` behaviour applies.
-  push pr              lands in K7: the push step fails saying so.
+  push pr              the branch is pushed under the same name and `gh pr create` opens
+                       a PR against main (run in the repo root); main is never written.
+  GH_BIN               the gh binary for pr mode (default `gh`); config
+                       {"runner": {"gh": "/path/to/gh"}} sets the same.
+  (runner --help repeats these knobs.)
 
 A rejected push that is not a non-fast-forward (protected branch, no network)
 fails the push step with the first 500 characters of git's stderr and keeps the
 branch `transcripts/<job-id>` (D8: there is no fallback to a PR).
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -339,12 +344,92 @@ def fast_forward_checkout(root, ours=()):
     return f"fast-forwarded to {git(root, 'rev-parse', '--short', 'HEAD').stdout.strip()}"
 
 
+def _gh_bin(config):
+    return os.environ.get("GH_BIN") or ((config or {}).get("runner") or {}).get("gh") or "gh"
+
+
+def _gh(gh, root, *args):
+    """Run gh in the repo root (it finds the repo from there); stdout, or PublishError
+    carrying the first 500 chars of stderr."""
+    try:
+        proc = subprocess.run([gh, *args], cwd=str(root), capture_output=True, text=True,
+                              timeout=120, env=_env())
+    except FileNotFoundError:
+        raise PublishError(f"gh not found ({gh!r}): install the GitHub CLI or set GH_BIN / "
+                           f"config runner.gh; branch kept, `jobs retry` resumes at push")
+    except (OSError, subprocess.SubprocessError) as e:
+        raise PublishError(f"gh {args[0]} {args[1]} failed: {type(e).__name__}: {e}"[:500])
+    if proc.returncode != 0:
+        raise PublishError(((proc.stderr or proc.stdout).strip() or f"gh exited {proc.returncode}")[:500])
+    return proc.stdout
+
+
+def pr_text(job, items):
+    """(title, body) for a PR holding `items` = [(result, repo-relative path)]."""
+    if len(items) == 1:
+        title = commit_message(items[0][0])[0]
+    else:
+        title = f"Add {len(items)} transcripts ({items[0][0].get('date')})"
+    blocks = []
+    for res, rel in items:
+        blocks.append("\n".join([
+            f"- {res.get('title') or res.get('name') or 'untitled'}",
+            f"  Date: {res.get('date')}",
+            f"  Duration: {_duration(res.get('duration'))}",
+            f"  Path: {rel}/"]))
+    return title, "\n\n".join(blocks) + f"\n\nJob {job['id']}"
+
+
+def _pr_url(text):
+    urls = [l.strip() for l in (text or "").splitlines() if l.strip().startswith("https://")]
+    return urls[-1] if urls else None
+
+
+def push_pr(job, root, branch, items, gh):
+    """Push the kept branch under its own name, then open (or find) its PR. Both halves
+    are idempotent, so a retry after a half-done attempt repeats neither."""
+    tip = git(root, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+    remote = git(root, "ls-remote", "origin", f"refs/heads/{branch}").stdout.split()
+    if not remote or remote[0] != tip:
+        git(root, "push", "origin", f"{branch}:refs/heads/{branch}")
+    listed = _gh(gh, root, "pr", "list", "--head", branch, "--json", "url")
+    try:
+        existing = [e["url"] for e in json.loads(listed or "[]") if e.get("url")]
+    except (ValueError, TypeError, KeyError):
+        existing = []
+    if existing:
+        return existing[0]
+    title, body = pr_text(job, items)
+    out = _gh(gh, root, "pr", "create", "--base", BASE, "--head", branch,
+              "--title", title, "--body", body)
+    url = _pr_url(out)
+    if not url:
+        raise PublishError(f"gh pr create printed no URL: {out.strip()}"[:500])
+    return url
+
+
+def _step_push_pr(job, ctx):
+    out = job["result"]
+    branch = out.get("branch")
+    repos = out.get("repos") or {}
+    if not branch or not repos:
+        raise PublishError("nothing to push: the commit step recorded no branch")
+    gh = _gh_bin(ctx.host.load_config(validate=False))
+    urls = {}
+    for root in repos:
+        items = [(r, Path(r["output_dir"]).resolve().relative_to(root)) for r in _results(job)
+                 if Path(r["output_dir"]).resolve().is_relative_to(root)]
+        urls[root] = push_pr(job, root, branch, items, gh)
+    out["pr"] = next(iter(urls.values())) if len(urls) == 1 else urls
+    return "done"
+
+
 def step_push(job, ctx, checkpoint=None):
     mode = job.get("push") or "none"
     if mode == "none":
         return "skipped"
     if mode == "pr":
-        raise PublishError("push: pr lands in K7")
+        return _step_push_pr(job, ctx)
     out = job["result"]
     branch = out.get("branch")
     repos = out.get("repos") or {}

@@ -453,8 +453,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K3 | B3, B5 | done | 3ec0a21 | `forced_project`/`interactive` keyword-only on both process functions, `visuals.set_interactive`/`PLAUD_NONINTERACTIVE`, richer result dict, 12 tests in `tests/test_noninteractive_pipeline.py` |
 | K4 | B2, B6, B8, B9, B7 retry | done | 1f87447 | `runner.py` (flock, step machine, resume, failure notify, `--once/--job/--lock-file/--days`), `jobs retry`, 26 tests in `tests/test_runner.py` |
 | K5 | B1, B4 | done | af01afa | `load_runner_env` (direnv exec, only 3 keys + PATH), `preflight` before any paid call, Wispr/recorder jobs resolved without the Plaud API, `install-runner`/`uninstall-runner` (WatchPaths + StartInterval 60), shared `--help` test; uncommitted. B1 (starts within 10 s after enqueue, live) pending a manual check by the manager after install |
-| K6 | C1, C2, C3, C5, C7 | done | | `publish.py` commit/push steps registered in runner (worktree on `transcripts/<id>`, push to main with rebase retry, safe ff), 22 tests in `tests/test_publish_main.py`; uncommitted; pr mode fails with "pr lands in K7" |
-| K7 | C4, C6, D8 | pending | | PR mode, kept branch, retry without re-commit |
+| K6 | C1, C2, C3, C5, C7 | done | `3fb2919` | `publish.py` commit/push steps registered in runner (worktree on `transcripts/<id>`, push to main with rebase retry, safe ff), 22 tests in `tests/test_publish_main.py`; uncommitted; pr mode fails with "pr lands in K7" |
+| K7 | C4, C6, D8 | done | | `publish.push_pr` (push branch if origin tip differs, reuse open PR via `gh pr list --head`, else `gh pr create`), `GH_BIN`/`runner.gh`, knobs in `runner --help`, 12 tests in `tests/test_publish_pr.py`; uncommitted |
 | K8 | D1-D4 | pending | | cc-tree deliver step + stage-1 e2e test + README |
 | K9 | F1, F2, F3 | pending | | Display overrides + `display` command |
 | K10 | F4, F6, F7 | pending | | SwiftBar plugin, read-only status + install-swiftbar |
@@ -471,3 +471,4 @@ _(out-of-scope proposals from implementation are logged here)_
 - Cuts combined with merge: extend merged mode (`process_merged_recordings` gains a `cuts` parameter) so a job can have `merge=true` and cuts. Today `validate_job` rejects the combination.
 - `local:<hash>` recordings cannot be enqueued usefully: the runner cannot map the hash back to a file (K4). `enqueue` could reject them, or jobs could carry the source path.
 - Cancelling a `running` job (`jobs cancel` refuses it today; the runner already stops between steps if the file says `cancelled`).
+- PR mode retry after the earlier PR was closed or merged opens a new PR for the same branch (`gh pr list` sees open PRs only, K7).
