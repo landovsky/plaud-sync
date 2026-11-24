@@ -533,6 +533,11 @@ launchd runs only `autocapture.py ensure`, which opens the watcher through the a
 Screen Recording grant stays with **Plaud Autocapture**. macOS lists the agent under Login
 Items & Extensions as "python3.15"; switching it off there disables the restart.
 
+`ensure` waits up to 30 s (`--wait`) for the restarted watcher to write its pid. If it is still
+not alive — launch failed, lost Screen Recording grant, broken Python or config — a macOS
+notification "Plaud Autocapture is not running" fires (sound: Basso), and again on every
+5-minute check until the watcher stays up. A paused watcher (`stop`) never alerts.
+
 Frames go to `~/Pictures/plaud-autocapture/<session>/` with a `timeline.jsonl` of which scene
 was on which display when — never to `~/Desktop`, which visuals treats as deliberate
 screenshots. Capture pauses while the screen is locked, stops after `max_hours`, and sessions

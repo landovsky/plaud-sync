@@ -1143,12 +1143,40 @@ def _launch_watch():
     return "in the background"
 
 
-def ensure():
-    """What the agent runs: start the watcher unless it is running or paused by `stop`."""
+ENSURE_WAIT_S = 30  # `ensure --wait`: how long a fresh watcher gets to write its pid file
+
+
+def _alert_not_running(why):
+    _log(f"watcher is NOT running — {why} (agent)")
+    notify("Plaud Autocapture is not running",
+           f"{why}. Meetings get no screens until fixed. Log: {LOG_FILE}", sound="Basso")
+
+
+def ensure(wait_s=ENSURE_WAIT_S):
+    """What the agent runs: start the watcher unless it is running or paused by `stop`.
+
+    A launch is only trusted once the watcher's pid file shows a live process:
+    `open` returns before the app runs, so a watcher that dies on start (lost
+    Screen Recording grant, broken Python, bad config) would otherwise look
+    restarted. If it is still not up after wait_s, a macOS notification says so —
+    and again on every agent run (every 5 min) until it is.
+    """
     if PAUSED_FILE.exists() or _running_pid():
         return
-    how = _launch_watch()
-    _log(f"watcher was not running — started it {how} (agent)")
+    try:
+        how = _launch_watch()
+    except Exception as e:  # noqa: BLE001 — any launch failure must reach the user
+        _alert_not_running(f"could not launch the watcher ({e})")
+        return
+    deadline = time.monotonic() + wait_s
+    while True:
+        if _running_pid():
+            _log(f"watcher was not running — started it {how} (agent)")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    _alert_not_running(f"restart attempted {how} but no watcher was alive after {wait_s:g}s")
 
 
 def install_agent(interval_s):
@@ -1247,7 +1275,10 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
                     help="how often the agent checks the watcher is alive (default 300)")
     sub.add_parser("uninstall-agent", help="remove the login agent")
-    sub.add_parser("ensure", help="start the watcher unless running or paused (what the agent runs)")
+    en = sub.add_parser("ensure", help="start the watcher unless running or paused (what the agent runs);"
+                        " notifies if it still is not running")
+    en.add_argument("--wait", type=float, default=ENSURE_WAIT_S, metavar="SECONDS",
+                    help=f"how long a restarted watcher gets to come up before the alert (default {ENSURE_WAIT_S})")
     ck = sub.add_parser("check", help="ask whether Screen Recording is granted, as capture would (via the app)")
     ck.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
     rp = sub.add_parser("replay", help="re-run scene detection over a session's raw frames")
@@ -1255,6 +1286,13 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     rp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a detection setting, e.g. --set change=0.04")
     args = ap.parse_args()
+    if args.cmd == "ensure":  # before config: a broken config must not silence the alert
+        try:
+            ensure(args.wait)
+        except Exception as e:  # noqa: BLE001
+            _alert_not_running(f"the agent's check crashed ({type(e).__name__}: {e})")
+            raise
+        return
     config = pt.load_config()
 
     if args.cmd in ("run", "watch"):
@@ -1285,8 +1323,6 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
         install_agent(args.interval)
     elif args.cmd == "uninstall-agent":
         uninstall_agent()
-    elif args.cmd == "ensure":
-        ensure()
     elif args.cmd == "check":
         if args.here or not APP_PATH.exists():
             _log(f"check ({'app' if args.here else 'terminal'}): " + json.dumps(_permission_probes()))
