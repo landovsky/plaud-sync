@@ -108,6 +108,8 @@ Then edit `~/.plaud-sync/config.json` — `projects` maps a classification label
 }
 ```
 
+A project may also be an object, e.g. `"playgrove": {"dir": "~/git/playgrove/docs/transcripts", "push": "pr", "node": "playgrove:root"}`. `push` is `main`, `pr` or `none` (default); a typo is rejected at startup with the project's name. `plaud-transcribe --help` documents every key.
+
 `default_output` (where unmatched recordings go) is optional — it defaults to this tool's own `docs/transcripts/`.
 
 **How a recording finds its project.** Meetings rarely say the project name out
@@ -603,7 +605,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 
 | Key | Used by | Description |
 |-----|---------|-------------|
-| `projects` | transcribe | `{ "label": "~/path" }` — classification targets. Claude picks the best-matching label; unknown → `default` |
+| `projects` | transcribe | `{ "label": "~/path" }` — classification targets. Claude picks the best-matching label; unknown → `default`. A value may also be an object: `{ "dir": "~/path", "push": "main\|pr\|none", "node": "tree:id", "hints": "…", "deliver_ask": "…" }` — `push` defaults to `none` and an unknown value is rejected at load time; `node` and `deliver_ask` are stored for the planned cc-tree hand-off. See `plaud-transcribe --help` |
 | `folder_mapping` | sync | `{ "Plaud Folder": "~/path" }` — routes by exact Plaud folder name (use `null` to skip). Also used as a fallback source of `projects` by transcribe |
 | `project_hints` | transcribe | `{ "label": "topics, systems, people" }` — extra evidence for classification. Optional; recent recordings per project are used regardless |
 | `default_output` | both | Where unmatched recordings go (defaults to this tool's `docs/transcripts/`) |

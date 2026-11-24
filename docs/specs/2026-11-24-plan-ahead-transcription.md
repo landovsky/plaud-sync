@@ -440,7 +440,7 @@ _Managed via `/manage feature`; updated per chunk._
 
 | Chunk | Parts | Status | Commit | Notes |
 |-------|-------|--------|--------|-------|
-| K1 | A | pending | | Config: per-project object form, validation, help |
+| K1 | A | done | | `project_specs()` + `ConfigError` validated in `load_config()`, `project_hints` merges per-project hints, epilog in `--help`, example/README updated, 15 tests; deviations: `main()` turns ConfigError into a clean exit 2; `load_config(validate=False)` used by autocapture so a project typo cannot stop capture; `cmd_init` template `project-b` is now object-form (`push` none) |
 | K2 | B (store, enqueue, jobs list/show/cancel/seen), G3 | pending | | Job model, atomic store, offline `enqueue`, CLI dispatch |
 | K3 | B3, B5 | pending | | Non-interactive pipeline hooks: forced project, no prompts, richer results |
 | K4 | B2, B6, B8, B9, B7 retry | pending | | Runner core: flock, step machine, resume, failure notify |

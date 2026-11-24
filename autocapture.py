@@ -1293,7 +1293,8 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
             _alert_not_running(f"the agent's check crashed ({type(e).__name__}: {e})")
             raise
         return
-    config = pt.load_config()
+    # validate=False: autocapture never reads `projects`, so a typo there must not stop capture
+    config = pt.load_config(validate=False)
 
     if args.cmd in ("run", "watch"):
         _foreground(args.cmd, config, getattr(args, "hours", None))

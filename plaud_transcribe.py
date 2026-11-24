@@ -74,11 +74,21 @@ AUTO_SKIP_DURATION_MS = 10_000
 
 # --- Config & State ---
 
-def load_config():
+class ConfigError(ValueError):
+    """The config file is readable JSON but a value in it cannot be used."""
+
+
+PUSH_MODES = ("main", "pr", "none")
+
+
+def load_config(validate=True):
+    config = {}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
+            config = json.load(f)
+    if validate:  # fail at load time, naming the project (A3)
+        project_specs(config)
+    return config
 
 
 def load_state():
@@ -103,12 +113,49 @@ def save_state(state):
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-def get_projects(config):
+def project_specs(config):
+    """Full per-project settings: {name: {dir, push, node, hints, deliver_ask}}.
+
+    A `projects` value is either a path string (the original form: push "none",
+    no node) or an object with `dir` plus optional `push` (main|pr|none),
+    `node` (cc-tree ref), `hints` and `deliver_ask`. Raises ConfigError naming
+    the project when a value is unusable. Per-project `hints` win over the
+    top-level `project_hints` entry for the same project."""
     projects = config.get("projects")
-    if projects:
-        return projects
-    fm = config.get("folder_mapping", {})
-    return {k: v for k, v in fm.items() if v is not None}
+    if not projects:
+        fm = config.get("folder_mapping") or {}
+        projects = {k: v for k, v in fm.items() if v is not None}
+    top_hints = config.get("project_hints") or {}
+    specs = {}
+    for name, value in projects.items():
+        if isinstance(value, str):
+            value = {"dir": value}
+        if not isinstance(value, dict):
+            raise ConfigError(f"project '{name}': expected a path string or an object, "
+                              f"got {type(value).__name__}")
+        d = value.get("dir")
+        if not isinstance(d, str) or not d.strip():
+            raise ConfigError(f"project '{name}': 'dir' is required and must be a path string")
+        push = value.get("push", "none")
+        if push not in PUSH_MODES:
+            raise ConfigError(f"project '{name}': push must be main|pr|none, got {push!r}")
+        for key in ("node", "hints", "deliver_ask"):
+            if value.get(key) is not None and not isinstance(value[key], str):
+                raise ConfigError(f"project '{name}': {key} must be a string")
+        hints = value.get("hints") or top_hints.get(name)
+        specs[name] = {
+            "dir": d,
+            "push": push,
+            "node": value.get("node") or None,
+            "hints": hints if isinstance(hints, str) and hints.strip() else None,
+            "deliver_ask": value.get("deliver_ask") or None,
+        }
+    return specs
+
+
+def get_projects(config):
+    """{name: dir-string}; the shape every existing call site expects."""
+    return {name: spec["dir"] for name, spec in project_specs(config).items()}
 
 
 def default_output_dir(config):
@@ -611,7 +658,12 @@ def project_hints(config):
     Purely additive — projects without hints still work off their name, path and
     recent-recording history."""
     hints = config.get("project_hints") or {}
-    return {k: v for k, v in hints.items() if isinstance(v, str) and v.strip()}
+    merged = {k: v for k, v in hints.items() if isinstance(v, str) and v.strip()}
+    # Object-form projects may carry their own hints (they win on a clash).
+    for name, spec in project_specs(config).items():
+        if spec["hints"]:
+            merged[name] = spec["hints"]
+    return merged
 
 
 def recent_examples(state, limit=4):
@@ -2063,7 +2115,10 @@ def cmd_file(args, config, state):
 EXAMPLE_CONFIG = {
     "projects": {
         "project-a": "~/git/project-a/docs/transcripts",
-        "project-b": "~/git/project-b/docs/transcripts",
+        "project-b": {
+            "dir": "~/git/project-b/docs/transcripts",
+            "push": "none",
+        },
     },
     # Optional per-project topic keywords. Classification also learns from the
     # names of recordings already filed under each project, so this is only
@@ -2100,10 +2155,34 @@ def cmd_init(force=False):
     print("Edit 'projects' to map classification labels to your repo paths.")
 
 
+CONFIG_HELP = """\
+config: projects  (~/.plaud-sync/config.json)
+  A project is a path string (files land there, nothing is pushed) or an object:
+
+    "projects": {
+      "Hriste Hrou": {"dir": "~/git/hriste/docs/transcripts", "push": "pr",
+                      "node": "hriste:root", "hints": "BOM, pricing",
+                      "deliver_ask": "pull the action items into ..."},
+      "AI Jam": "~/git/ai-jam/docs/transcripts"
+    }
+
+  dir          where transcripts are written (required in object form)
+  push         main | pr | none (default none): push straight to main, open a
+               PR from a branch, or only write files. Other values are
+               rejected when the config loads, naming the project.
+  node         default cc-tree ref ("tree" or "tree:id") to hand transcripts to
+  hints        topic keywords for classification (also read from "project_hints")
+  deliver_ask  default "process it" request sent to the node; a note given
+               when planning a job overrides it
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Download, transcribe, classify and summarize Plaud recordings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=CONFIG_HELP,
     )
     parser.add_argument("command", nargs="?", default="process",
                         choices=["list", "process", "move", "init", "file"])
@@ -2131,7 +2210,10 @@ def main():
     if args.cuts and not (args.command == "process" and args.extra):
         parser.error("--cut needs one recording: process <ref> --cut START-END")
 
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        parser.exit(2, f"{parser.prog}: config error: {e}\n")
     state = load_state()
 
     # Resolve language: CLI flag > config "language" > cs
