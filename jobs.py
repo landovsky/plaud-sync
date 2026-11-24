@@ -200,6 +200,24 @@ def cancel_job(job_id):
     return job
 
 
+RETRYABLE = ("failed", "held")
+
+
+def retry_job(job_id):
+    """failed/held -> queued. Clears the error, keeps steps that are done/skipped
+    so the runner resumes where the job stopped."""
+    job = load_job(job_id)
+    if job["state"] not in RETRYABLE:
+        raise JobError(f"job {job['id']} is {job['state']}: only "
+                       f"{'/'.join(RETRYABLE)} jobs can be retried")
+    job["state"] = "queued"
+    job["error"] = None
+    job.pop("failed_step", None)
+    job["steps"] = [s for s in job["steps"] if s.get("state") in ("done", "skipped")]
+    save_job(job)
+    return job
+
+
 def mark_seen(job_id):
     job = load_job(job_id)
     job["seen"] = True

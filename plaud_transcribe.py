@@ -2244,7 +2244,7 @@ config: projects  (~/.plaud-sync/config.json)
 
 def main():
     # Job-queue commands have their own parser and never touch the network.
-    if len(sys.argv) > 1 and sys.argv[1] in ("enqueue", "jobs"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("enqueue", "jobs", "runner"):
         import jobs_cli
         sys.exit(jobs_cli.main(sys.argv[1:], host=sys.modules[__name__]))
 
@@ -2255,7 +2255,7 @@ def main():
         epilog=CONFIG_HELP,
     )
     parser.add_argument("command", nargs="?", default="process",
-                        choices=["list", "process", "move", "init", "file", "enqueue", "jobs"])
+                        choices=["list", "process", "move", "init", "file", "enqueue", "jobs", "runner"])
     parser.add_argument("extra", nargs="*",
                         help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...; "
                              "for 'process': one recording (id, id prefix or title words)")

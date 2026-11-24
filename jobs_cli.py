@@ -10,7 +10,7 @@ import sys
 
 import jobs
 
-COMMANDS = ("enqueue", "jobs")
+COMMANDS = ("enqueue", "jobs", "runner")
 
 ENQUEUE_EPILOG = """\
 recipes:
@@ -39,6 +39,7 @@ JOBS_EPILOG = """\
 recipes:
   plaud-transcribe jobs list                what is queued, running, failed
   plaud-transcribe jobs show 20261124-1702  full JSON (a unique id prefix works)
+  plaud-transcribe jobs retry <id>          failed/held job back to queued, done steps kept
   plaud-transcribe jobs cancel <id>         only queued/failed/held/armed jobs
   plaud-transcribe jobs seen <id>           clear the warning, keep the job
 """
@@ -48,7 +49,7 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Job queue commands (offline: they only read/write job files).")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner}")
 
     e = sub.add_parser(
         "enqueue", help="write a job file for the runner (no network)",
@@ -77,13 +78,16 @@ def build_parser():
     j = sub.add_parser("jobs", help="list and manage jobs",
                        description="List and manage job files.", epilog=JOBS_EPILOG,
                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    js = j.add_subparsers(dest="jobs_command", required=True, metavar="{list,show,cancel,seen}")
+    js = j.add_subparsers(dest="jobs_command", required=True, metavar="{list,show,retry,cancel,seen}")
     js.add_parser("list", help="one line per job", description="One line per job, oldest first.")
     for name, text in (("show", "print one job as JSON"),
+                       ("retry", "requeue a failed or held job; steps already done are kept"),
                        ("cancel", "cancel a queued, failed, held or armed job"),
                        ("seen", "mark a failed/held job as seen; keeps the job")):
         s = js.add_parser(name, help=text, description=text)
         s.add_argument("id", help="job id or unique prefix")
+    sub.add_parser("runner", help="process queued jobs, then exit (see runner --help)",
+                   add_help=False)
     return p
 
 
@@ -155,6 +159,9 @@ def cmd_jobs(args):
             print(_summary(job))
     elif args.jobs_command == "show":
         print(json.dumps(jobs.load_job(args.id), indent=2, ensure_ascii=False))
+    elif args.jobs_command == "retry":
+        job = jobs.retry_job(args.id)
+        print(f"requeued {job['id']} (the runner resumes from the first unfinished step)")
     elif args.jobs_command == "cancel":
         job = jobs.cancel_job(args.id)
         print(f"cancelled {job['id']}")
@@ -165,6 +172,9 @@ def cmd_jobs(args):
 
 
 def main(argv=None, host=None):
+    if argv and argv[0] == "runner":   # own parser; --help must not build jobs parsers' required args
+        import runner
+        return runner.main(argv[1:], host=_host(host))
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
