@@ -25,6 +25,32 @@ DEFAULT_INTERVAL = 60
 AGENT_PATH = ["/opt/homebrew/bin", str(Path.home() / ".local" / "bin"),
               "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
+LAUNCHER_NAME = "plaud-transcribe-runner"   # what macOS Login Items shows for the agent
+DEFAULT_BIN_DIR = Path.home() / ".plaud-sync" / "bin"
+
+# carried from the installing shell into the plist: paths only, never secrets
+CARRIED_ENV = ("SOPS_AGE_KEY_FILE", "SOPS_CONFIG", "XDG_CONFIG_HOME")
+_SECRET_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
+
+def _refuse_secret_name(name):
+    up = name.upper()
+    if name != "SOPS_AGE_KEY_FILE" and any(w in up for w in _SECRET_WORDS):
+        raise jobs.JobError(f"refusing to carry {name}: names containing TOKEN, KEY, SECRET or "
+                            "PASSWORD hold secrets and must not be written to the plist "
+                            "(only SOPS_AGE_KEY_FILE, a path, is allowed)")
+
+
+def carried_env(extra=()):
+    """Variables (name -> value) copied from this environment into the plist."""
+    names = list(CARRIED_ENV)
+    for n in extra:
+        _refuse_secret_name(n)
+        if n not in names:
+            names.append(n)
+    return {n: os.environ[n] for n in names if os.environ.get(n)}
+
+
 INSTALL_EPILOG = """\
 recipes:
   install the runner agent (starts at login, on a new job file, and every 60 s)
@@ -33,6 +59,16 @@ recipes:
     plaud-transcribe install-runner --interval 120
   remove it
     plaud-transcribe uninstall-runner
+
+the runner has no shell: install-runner carries SOPS_AGE_KEY_FILE so sops can decrypt
+  (also SOPS_CONFIG and XDG_CONFIG_HOME when set; --env NAME adds more, repeatable).
+  Names containing TOKEN, KEY, SECRET or PASSWORD (and SOPS_AGE_KEY) are refused.
+  Only variable names are printed, never values.
+    plaud-transcribe install-runner --env SOPS_AGE_RECIPIENTS
+
+launcher: the agent runs ~/.plaud-sync/bin/plaud-transcribe-runner (a small bash script that
+  execs python on plaud_transcribe.py runner) so macOS Login Items shows a named item,
+  not "python3.x". Directory: --bin-dir or PLAUD_RUNNER_BIN_DIR. uninstall-runner removes it.
 
 what it installs:
   ~/Library/LaunchAgents/local.plaud-sync.runner.plist running
@@ -126,45 +162,76 @@ def build_parser():
     i.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, metavar="SECONDS",
                    help=f"also start the runner every N seconds (default {DEFAULT_INTERVAL}); "
                         "this is what picks up armed jobs")
-    sub.add_parser("uninstall-runner", help="unload and remove the runner LaunchAgent",
-                   description="Unload and remove the runner LaunchAgent.")
+    i.add_argument("--env", action="append", default=[], metavar="NAME",
+                   help="also carry this environment variable into the agent (repeatable); "
+                        "secret-looking names are refused")
+    i.add_argument("--bin-dir", metavar="DIR", default=None,
+                   help="where to write the named launcher script "
+                        f"(env PLAUD_RUNNER_BIN_DIR; default {DEFAULT_BIN_DIR})")
+    u = sub.add_parser("uninstall-runner", help="unload and remove the runner LaunchAgent",
+                       description="Unload and remove the runner LaunchAgent and its launcher script.")
+    u.add_argument("--bin-dir", metavar="DIR", default=None,
+                   help="launcher directory used at install time (env PLAUD_RUNNER_BIN_DIR)")
     return p
 
 
-def runner_plist(interval_s):
+def launcher_path(bin_dir=None):
+    return Path(bin_dir or os.environ.get("PLAUD_RUNNER_BIN_DIR") or DEFAULT_BIN_DIR) / LAUNCHER_NAME
+
+
+def write_launcher(path):
+    """Named wrapper script so Login Items shows plaud-transcribe-runner, not python3.x."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = (f"#!/bin/bash\n"
+            f"# plaud-sync runner launcher, written by `plaud-transcribe install-runner`\n"
+            f"# repo: {REPO_DIR}  agent plist: {RUNNER_PLIST}\n"
+            f'exec "{sys.executable}" "{REPO_DIR / "plaud_transcribe.py"}" runner "$@"\n')
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(body)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+
+
+def runner_plist(interval_s, extra_env=(), launcher=None):
     return {
         "Label": RUNNER_ID,
-        "ProgramArguments": [sys.executable, str(REPO_DIR / "plaud_transcribe.py"), "runner"],
+        "ProgramArguments": [str(launcher or launcher_path())],
         "RunAtLoad": True,
         "WatchPaths": [str(jobs.JOBS_DIR)],
         "StartInterval": int(interval_s),
         "WorkingDirectory": str(REPO_DIR),   # the summarizer reads only below its cwd
-        "EnvironmentVariables": {"PATH": os.pathsep.join(AGENT_PATH)},
+        "EnvironmentVariables": {"PATH": os.pathsep.join(AGENT_PATH), **carried_env(extra_env)},
         "ProcessType": "Background",
         "StandardOutPath": "/dev/null",
         "StandardErrorPath": str(RUNNER_LOG),
     }
 
 
-def install_runner(interval_s=DEFAULT_INTERVAL):
+def install_runner(interval_s=DEFAULT_INTERVAL, extra_env=(), bin_dir=None):
     if interval_s < 1:
         raise jobs.JobError("--interval must be at least 1 second")
+    launcher = launcher_path(bin_dir)
+    plist = runner_plist(interval_s, extra_env, launcher)   # validates --env before anything is touched
     RUNNER_PLIST.parent.mkdir(parents=True, exist_ok=True)
     RUNNER_LOG.parent.mkdir(parents=True, exist_ok=True)
     jobs.JOBS_DIR.mkdir(parents=True, exist_ok=True)   # WatchPaths needs a target
     domain = f"gui/{os.getuid()}"
     subprocess.run(["launchctl", "bootout", f"{domain}/{RUNNER_ID}"], capture_output=True)
+    write_launcher(launcher)
     with open(RUNNER_PLIST, "wb") as f:
-        plistlib.dump(runner_plist(interval_s), f)
+        plistlib.dump(plist, f)
     subprocess.run(["launchctl", "bootstrap", domain, str(RUNNER_PLIST)], check=True)
     print(f"installed {RUNNER_PLIST} - runs at login, on job-file changes in "
           f"{jobs.JOBS_DIR} and every {int(interval_s)}s; log: {RUNNER_LOG}")
+    carried = [n for n in plist["EnvironmentVariables"] if n != "PATH"]
+    print("carried environment variables: " + (", ".join(carried) if carried else "none"))
     return 0
 
 
-def uninstall_runner():
+def uninstall_runner(bin_dir=None):
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{RUNNER_ID}"], capture_output=True)
     RUNNER_PLIST.unlink(missing_ok=True)
+    launcher_path(bin_dir).unlink(missing_ok=True)
     print("runner agent removed - queued jobs wait until `plaud-transcribe runner` is run by hand")
     return 0
 
@@ -257,9 +324,9 @@ def main(argv=None, host=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "install-runner":
-            return install_runner(args.interval)
+            return install_runner(args.interval, args.env, args.bin_dir)
         if args.command == "uninstall-runner":
-            return uninstall_runner()
+            return uninstall_runner(args.bin_dir)
         if args.command == "enqueue":
             return cmd_enqueue(args, _host(host))
         return cmd_jobs(args)
