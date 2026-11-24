@@ -12,3 +12,4 @@ docs/working/
 docs/transcripts/
 tmp/
 .claude/
+.venv/

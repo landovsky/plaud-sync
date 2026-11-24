@@ -331,7 +331,9 @@ class TestDisplayToggleItems:
         assert a[1:] == ["display", "2", "off", "--notify-errors"]
 
     def test_every_emitted_command_is_accepted_by_the_real_parser(self):
-        for _, p, a in menu_items(self._out()):
+        for label, p, a in menu_items(self._out()):
+            if label.startswith("Plan a transcript"):
+                continue   # interactive: runs in a terminal, which shows its own errors (TestPlanItem)
             ns = parse_for_real(p, a)
             assert ns.notify_errors is True
 
@@ -387,7 +389,7 @@ class TestJobActions:
         held = job("held", id="h1", result={"delivered": {"outcome": "held", "id": "9xq1"}})
         for j in (self._failed(), held, job("queued", id="q1")):
             for label, p, a in menu_items(render([j], actions=ACT)):
-                if p["bash"] == PY and a[0].endswith("plaud_transcribe.py"):
+                if p["bash"] == PY and a[0].endswith("plaud_transcribe.py") and a[1] != "plan":
                     ns = parse_for_real(p, a)
                     assert ns.command == "jobs" and ns.jobs_command in ("retry", "cancel", "seen")
                     assert ns.id == j["id"] and ns.notify_errors is True
@@ -413,9 +415,9 @@ class TestJobActions:
         acts = [l for l, p, a in menu_items(out) if "—" in l]
         assert len(acts) == 1 and acts[0].startswith("⟳")
 
-    def test_plugin_has_no_plan_or_arm_entries_yet(self):
+    def test_plugin_has_no_arm_entry_yet(self):
         out = render([self._failed()], actions=ACT)
-        assert "Plan a transcript" not in out and "Arm current" not in out
+        assert "Arm current" not in out
 
 
 class TestFailuresAreNotInvisible:
@@ -463,3 +465,45 @@ class TestInstallRecordsTheInterpreter:
         assert plug.load_actions(f) is None
         f.write_text("{nope")
         assert plug.load_actions(f) is None
+
+
+class TestPlanItem:
+    """K13: planning a transcript is one click, in a terminal, because the screen is
+    interactive (SwiftBar's terminal=false would give it no tty)."""
+
+    def test_default_opens_swiftbars_own_terminal_on_the_plan_command(self):
+        (p, a), = by_label(render(actions=ACT), "Plan a transcript")
+        assert p["terminal"] == "true" and p["bash"] == PY
+        assert a == [f"{REPO}/plaud_transcribe.py", "plan"]
+        assert parse_for_real(p, a).command == "plan"
+
+    def test_a_configured_terminal_launches_the_same_command_with_swiftbar_terminal_off(self):
+        act = {**ACT, "terminal_cmd": ["open", "-na", "Ghostty", "--args", "-e"]}
+        (p, a), = by_label(render(actions=act), "Plan a transcript")
+        assert p["bash"] == "open" and p["terminal"] == "false"
+        assert a == ["-na", "Ghostty", "--args", "-e", PY, f"{REPO}/plaud_transcribe.py", "plan"]
+
+    def test_without_the_recorded_interpreter_there_is_no_item_to_click(self):
+        assert "Plan a transcript" not in render()
+
+    def test_load_actions_keeps_terminal_cmd_only_when_it_is_a_list_of_strings(self, tmp_path):
+        good, bad = tmp_path / "g.json", tmp_path / "b.json"
+        base = {"python": PY, "repo": REPO}
+        good.write_text(json.dumps({**base, "terminal_cmd": ["open", "-a", "iTerm"]}))
+        bad.write_text(json.dumps({**base, "terminal_cmd": "open -a iTerm"}))
+        assert plug.load_actions(good)["terminal_cmd"] == ["open", "-a", "iTerm"]
+        assert "terminal_cmd" not in plug.load_actions(bad)
+
+    def test_install_copies_terminal_cmd_from_config_so_the_plugin_never_reads_config_json(
+            self, tmp_path, monkeypatch):
+        import plaud_transcribe as pt
+        monkeypatch.setattr(pt, "CONFIG_FILE", tmp_path / "config.json")
+        (tmp_path / "config.json").write_text(json.dumps(
+            {"swiftbar": {"terminal_cmd": ["open", "-na", "Ghostty", "--args", "-e"]}}))
+        path = jobs_cli.write_swiftbar_config(pt)
+        assert json.loads(path.read_text())["terminal_cmd"] == ["open", "-na", "Ghostty", "--args", "-e"]
+
+    def test_install_help_documents_the_terminal_knob(self, capsys):
+        with pytest.raises(SystemExit):
+            jobs_cli.main(["install-swiftbar", "--help"])
+        assert "terminal_cmd" in capsys.readouterr().out

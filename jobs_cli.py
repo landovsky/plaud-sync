@@ -15,7 +15,7 @@ from pathlib import Path
 import jobs
 
 COMMANDS = ("enqueue", "jobs", "runner", "install-runner", "uninstall-runner",
-            "install-swiftbar", "uninstall-swiftbar")
+            "install-swiftbar", "uninstall-swiftbar", "plan")
 
 REPO_DIR = Path(__file__).resolve().parent
 RUNNER_ID = "local.plaud-sync.runner"
@@ -128,6 +128,32 @@ the Python that ran install-swiftbar. That path is recorded in ~/.plaud-sync/swi
 (env PLAUD_SWIFTBAR_CONFIG moves it): {"python": "<abs interpreter>", "repo": "<abs repo dir>"}.
 Re-run install-swiftbar after moving the repo or switching Python; without the file the menu
 shows no actions. Actions pass --notify-errors, so a failure becomes a notification.
+
+"Plan a transcript..." opens a terminal running `plaud-transcribe plan`. By default that is
+SwiftBar's own terminal=true. To use another terminal, set `swiftbar.terminal_cmd` in
+~/.plaud-sync/config.json (a list: the command line that precedes the command to run) and
+re-run install-swiftbar, which copies it into swiftbar.json:
+    {"swiftbar": {"terminal_cmd": ["open", "-na", "Ghostty", "--args", "-e"]}}
+"""
+
+
+PLAN_EPILOG = """\
+recipes:
+  open the screen (first recording is pre-selected; Enter saves, Esc quits and writes nothing)
+    plaud-transcribe plan
+  look further back
+    plaud-transcribe plan --days 60
+
+keys: Space select, m merge, c cut a span out of the highlighted recording, p project,
+  n node (fuzzy over `cc-tree show <tree>`), x clear the node, Tab next field, Enter save
+  (ctrl+s inside a text area, where Enter is a newline), Esc quit. On save the job id is printed.
+  The screen only writes the job file; the runner does the work (same job as `enqueue`).
+
+needs Textual, which Homebrew python does not have:
+    python3 -m venv .venv && .venv/bin/pip install -r requirements-plan.txt
+  `plan` re-runs itself with the first of: env PLAUD_PLAN_PYTHON, config plan.python
+  (~/.plaud-sync/config.json: {"plan": {"python": "/path/to/python"}}), <repo>/.venv/bin/python.
+  Without Textual anywhere it prints this hint and exits 2; `enqueue` does the same job by flags.
 """
 
 
@@ -135,7 +161,7 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Job queue commands (offline: they only read/write job files).")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner,install-runner,uninstall-runner,install-swiftbar,uninstall-swiftbar}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner,install-runner,uninstall-runner,install-swiftbar,uninstall-swiftbar,plan}")
 
     e = sub.add_parser(
         "enqueue", help="write a job file for the runner (no network)",
@@ -205,6 +231,11 @@ def build_parser():
                          epilog=SWIFTBAR_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     usw.add_argument("--dir", metavar="DIR", default=None,
                      help="plugin folder used at install time (env PLAUD_SWIFTBAR_DIR)")
+    pl = sub.add_parser("plan", help="one screen to plan a transcript job (Textual)",
+                        description="Pick recordings, project, node and notes on one screen and "
+                                    "save a job. Nothing is processed here.",
+                        epilog=PLAN_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    pl.add_argument("--days", type=int, default=30, help="how far back to list recordings (default 30)")
     return p
 
 
@@ -237,18 +268,35 @@ def swiftbar_config_path():
                 or Path.home() / ".plaud-sync" / "swiftbar.json").expanduser()
 
 
-def write_swiftbar_config():
+def terminal_cmd_from_config(host=None):
+    """config swiftbar.terminal_cmd: a list of strings, else None (SwiftBar's terminal=true)."""
+    try:
+        cfg = _host(host).load_config(validate=False)
+    except Exception:  # noqa: BLE001  a broken config must not stop the install
+        return None
+    cmd = (cfg.get("swiftbar") or {}).get("terminal_cmd") if isinstance(cfg, dict) else None
+    if isinstance(cmd, list) and cmd and all(isinstance(c, str) and c for c in cmd):
+        return cmd
+    return None
+
+
+def write_swiftbar_config(host=None):
     """Record the interpreter and repo the menu actions run: SwiftBar has no PATH and the
-    plugin itself runs on /usr/bin/python3, which cannot import this repo's dependencies."""
+    plugin itself runs on /usr/bin/python3, which cannot import this repo's dependencies.
+    Also copies config swiftbar.terminal_cmd, so the plugin never reads config.json."""
     path = swiftbar_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps({"python": sys.executable, "repo": str(REPO_DIR)}, indent=2) + "\n")
+    data = {"python": sys.executable, "repo": str(REPO_DIR)}
+    terminal = terminal_cmd_from_config(host)
+    if terminal:
+        data["terminal_cmd"] = terminal
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
     os.replace(tmp, path)
     return path
 
 
-def install_swiftbar(directory=None):
+def install_swiftbar(directory=None, host=None):
     target_dir, found = swiftbar_dir(directory)
     if not found:
         print("SwiftBar does not look installed (brew install --cask swiftbar), so no plugin was "
@@ -257,7 +305,7 @@ def install_swiftbar(directory=None):
         return 0
     link = target_dir / SWIFTBAR_PLUGIN.name
     target_dir.mkdir(parents=True, exist_ok=True)
-    print(f"menu actions will run {sys.executable} (recorded in {write_swiftbar_config()})")
+    print(f"menu actions will run {sys.executable} (recorded in {write_swiftbar_config(host)})")
     if link.is_symlink() or link.exists():
         if link.is_symlink() and Path(os.readlink(link)) == SWIFTBAR_PLUGIN:
             print(f"already linked: {link}")
@@ -403,6 +451,48 @@ def cmd_jobs(args):
     return 0
 
 
+PLAN_HINT = """\
+plaud-transcribe plan needs Textual, which this Python ({python}) does not have.
+Install it once, next to the repo:
+    python3 -m venv .venv && .venv/bin/pip install -r requirements-plan.txt
+(plan then finds .venv/bin/python by itself; or set PLAUD_PLAN_PYTHON / config plan.python.)
+Without a screen: `plaud-transcribe enqueue --help` makes the same job from flags."""
+REEXEC_ENV = "PLAUD_PLAN_REEXEC"
+
+
+def plan_python_candidates(host):
+    """Interpreters that may have Textual, best first: env, config plan.python, repo .venv."""
+    found = [os.environ.get("PLAUD_PLAN_PYTHON")]
+    try:
+        cfg = host.load_config(validate=False)
+        found.append((cfg.get("plan") or {}).get("python"))
+    except Exception:  # noqa: BLE001
+        pass
+    venv = REPO_DIR / ".venv" / "bin" / "python"
+    found.append(str(venv) if venv.exists() else None)
+    return [str(Path(c).expanduser()) for c in found if c]
+
+
+def cmd_plan(args, host):
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        if not os.environ.get(REEXEC_ENV):
+            for cand in plan_python_candidates(host):
+                if Path(cand).exists() and Path(cand) != Path(sys.executable):
+                    os.environ[REEXEC_ENV] = "1"   # one hop only: no loop if that Python lacks it too
+                    os.execv(cand, [cand, str(REPO_DIR / "plaud_transcribe.py"), "plan",
+                                    "--days", str(args.days)])
+                    return 0   # not reached: execv replaces this process
+        print(PLAN_HINT.format(python=sys.executable), file=sys.stderr)
+        return 2
+    import plan_app
+    job_id = plan_app.PlanApp(host=host, days=args.days).run()
+    if job_id:
+        print(job_id)
+    return 0
+
+
 def _notify_failure(args, message):
     """--notify-errors: terminal=false menu actions have nowhere to print an error."""
     if getattr(args, "notify_errors", False):
@@ -423,9 +513,11 @@ def main(argv=None, host=None):
         if args.command == "uninstall-runner":
             return uninstall_runner(args.bin_dir)
         if args.command == "install-swiftbar":
-            return install_swiftbar(args.dir)
+            return install_swiftbar(args.dir, _host(host))
         if args.command == "uninstall-swiftbar":
             return uninstall_swiftbar(args.dir)
+        if args.command == "plan":
+            return cmd_plan(args, _host(host))
         if args.command == "enqueue":
             return cmd_enqueue(args, _host(host))
         return cmd_jobs(args)

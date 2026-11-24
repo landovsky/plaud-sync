@@ -168,6 +168,34 @@ One-time setup: the LaunchAgent has no shell, so the runner loads its credential
 `direnv exec` in this repo. Run `direnv allow` here once, and make sure `ELEVENLABS_API_KEY` is in
 the sops-encrypted credentials the `.envrc` reads (add it yourself; the runner only reads it).
 
+### Plan screen
+
+`plaud-transcribe plan` is `enqueue` as one keyboard-driven screen: recordings, project, node, mode, a
+note to the node and instructions for the summarizer. It only writes a job file (the same one
+`enqueue` would, printed as its id on Enter); the runner does the work, and Esc writes nothing.
+It needs Textual, which is optional:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-plan.txt
+```
+
+`plan` finds `.venv/bin/python` by itself when the Python that started it has no Textual (override with
+`PLAUD_PLAN_PYTHON` or config `plan.python`). Without Textual anywhere it says so and points to `enqueue`.
+
+| Key | Does |
+|-----|------|
+| Enter | show a one-line summary; Enter again saves the job and exits (`ctrl+s` instead of the first Enter inside a text area, where Enter is a newline) |
+| Esc | quit, nothing written (asks once, "Esc again", if you changed anything; goes back from the summary) |
+| Space | select or unselect the recording under the cursor (the first row starts selected; a live Wispr meeting is first) |
+| `m` / `c` | merge the selected recordings / cut a span out of the highlighted one (not together) |
+| `p` / `n` / `x` | pick the project / pick a node from `cc-tree show <tree>` / clear the node |
+| Tab | next field: recordings, mode, note, instructions |
+
+The common case (newest recording, suggested project, its node) is Enter, Enter. The SwiftBar menu has
+"Plan a transcript…", which opens a terminal on this screen; `swiftbar.terminal_cmd` in the config
+(for example `["open", "-na", "Ghostty", "--args", "-e"]`) picks another terminal, see
+`plaud-transcribe install-swiftbar --help`. Tests: `.venv/bin/pytest` (the Homebrew run skips the screen tests).
+
 ---
 
 ## Usage

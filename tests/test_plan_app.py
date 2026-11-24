@@ -1,0 +1,312 @@
+"""The plan screen (plan_app.py) driven with Textual's Pilot: keys in, job files out.
+
+Needs Textual, which Homebrew python lacks: run with .venv/bin/pytest (requirements-plan.txt).
+Nothing touches ~/.plaud-sync, the network, cc-tree or a real Wispr database.
+"""
+import asyncio
+import json
+
+import pytest
+
+pytest.importorskip("textual")
+
+from textual import events                               # noqa: E402
+from textual.widgets import SelectionList, Static, TextArea   # noqa: E402
+
+import jobs                                              # noqa: E402
+import plan_app                                          # noqa: E402
+import plan_logic                                        # noqa: E402
+import plaud_transcribe as pt                            # noqa: E402
+
+MIN = 60_000
+NODES = [{"ref": "hriste:a1b", "title": "Backlog", "state": "open", "depth": 0},
+         {"ref": "hriste:c2d", "title": "Release notes", "state": "open", "depth": 1}]
+
+
+def rec(rid, name, start, minutes=30, source="plaud"):
+    return {"id": rid, "source": source, "filename": name, "duration": minutes * MIN,
+            "start_time": start, "filetag_id_list": []}
+
+
+RECS = [rec("r-new", "Hřiště Hrou weekly sync", 3_000_000),
+        rec("r-mid", "Hřiště Hrou retro", 2_000_000),
+        rec("r-old", "Dentist call", 1_000_000)]
+PROJECTS = {"Hřiště Hrou": {"dir": "/tmp/hriste", "push": "main", "node": "hriste:root"},
+            "Private": {"dir": "/tmp/private", "push": "none"}}
+
+
+@pytest.fixture
+def env(monkeypatch, tmp_path):
+    """Config, state, jobs and every source in tmp_path or stubbed; offline by construction."""
+    monkeypatch.setattr(pt, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(pt, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(pt, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path / "jobs")
+    (tmp_path / "config.json").write_text(json.dumps({"projects": PROJECTS}))
+    (tmp_path / "state.json").write_text(json.dumps({"downloaded": {}, "transcribed": {
+        "old1": {"status": "done", "project": "Hřiště Hrou", "title": "Hřiště Hrou weekly"}}}))
+    monkeypatch.setattr(pt, "get_token", lambda: "tok")
+    monkeypatch.setattr(pt, "list_recordings", lambda *a: [dict(r) for r in RECS])
+    monkeypatch.setattr(pt, "fetch_folders", lambda *a: {})
+    monkeypatch.setattr(pt.wispr_flow, "list_meetings", lambda *a: [])
+    monkeypatch.setattr(pt.google_recorder, "list_recordings", lambda *a: [])
+    monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: None)
+    monkeypatch.setattr(plan_logic, "list_nodes", lambda tree, config=None: list(NODES))
+    return tmp_path
+
+
+def run(scenario):
+    """Run `async def scenario(app, pilot)` against a fresh PlanApp; returns (app, exit value)."""
+    app = plan_app.PlanApp(host=pt)
+
+    async def go():
+        async with app.run_test(size=(120, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await scenario(app, pilot)
+            await pilot.pause()
+        return app.return_value
+    return app, asyncio.run(go())
+
+
+def saved_jobs():
+    return jobs.list_jobs()
+
+
+def same_job(saved, fields):
+    """The saved job equals build_job of the same fields (G3), except id and timestamp."""
+    expected = plan_logic.build_job(fields, host=pt, config=pt.load_config())
+    strip = lambda j: {k: v for k, v in j.items() if k not in ("id", "created")}  # noqa: E731
+    return strip(saved) == strip(expected)
+
+
+class TestOneRecordingDefaultsAccepted:
+    """G1: the common case must not turn into a form to fill in."""
+
+    def test_enter_asks_to_confirm_and_a_second_enter_saves_the_job_for_the_newest_recording(self, env):
+        keys = ["enter", "enter"]
+
+        async def scenario(app, pilot):
+            await pilot.press(keys[0])
+            assert saved_jobs() == [], "one Enter must not create a job that spends money"
+            assert "Hřiště Hrou weekly sync" in str(app.screen.query_one("#confirm-summary", Static).render())
+            await pilot.press(keys[1])
+        app, job_id = run(scenario)
+        assert keys == ["enter", "enter"]
+        (job,) = saved_jobs()
+        assert job_id == job["id"] and job["recordings"] == ["r-new"]
+        assert len(keys) <= 5, "spec G1: launch to saved job in at most 5 keystrokes"
+        assert same_job(job, {"recordings": ["r-new"], "project": "Hřiště Hrou"})
+
+    def test_the_project_is_the_suggestion_from_earlier_similar_titles(self, env):
+        async def scenario(app, pilot):
+            assert app.project == "Hřiště Hrou"
+            assert "push: main" in str(app.query_one("#project", Static).render())
+        run(scenario)
+
+    def test_node_and_mode_follow_the_project_so_the_hand_off_needs_no_typing(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["deliver"]["node"] == "hriste:root" and job["deliver"]["mode"] == "now"
+
+
+class TestSelectingAndMerging:
+    """G4: two recordings of one meeting become one transcript."""
+
+    def test_space_adds_a_second_recording_and_m_merges_them(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "m", "enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["recordings"] == ["r-new", "r-mid"] and job["merge"] is True
+        assert same_job(job, {"recordings": ["r-new", "r-mid"], "merge": True,
+                              "project": "Hřiště Hrou"})
+
+    def test_merge_with_a_single_recording_is_refused_with_a_message(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("m", "enter")
+            assert "two or more" in str(app.query_one("#error", Static).render())
+        run(scenario)
+        assert saved_jobs() == []
+
+    def test_merge_plus_cut_shows_the_error_build_job_gives_and_writes_nothing(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("down", "space")
+            await pilot.press("c")
+            await pilot.press(*"29:16-34:55", "enter")
+            await pilot.press("m", "enter")
+            assert "merge and cuts cannot be combined" in str(app.query_one("#error", Static).render())
+        _, result = run(scenario)
+        assert saved_jobs() == [] and result is None
+
+
+class TestCuts:
+    def test_a_cut_on_the_highlighted_recording_lands_in_the_job(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("c")
+            await pilot.press(*"29:16-34:55", "enter")
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["cuts"] == {"r-new": ["29:16-34:55"]}
+
+    def test_a_malformed_span_is_reported_instead_of_stored(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("c")
+            await pilot.press(*"nonsense", "enter")
+            assert app.cuts == {} and str(app.query_one("#error", Static).render())
+        run(scenario)
+
+
+class TestNodeOverride:
+    """G4: the project's node is only a default; the tree's other nodes are one picker away."""
+
+    def test_n_opens_a_fuzzy_picker_and_the_chosen_node_is_saved(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("n")
+            await pilot.press(*"release")          # filters the list; Enter takes the first match
+            await pilot.press("enter")
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["deliver"]["node"] == "hriste:c2d"
+        assert same_job(job, {"recordings": ["r-new"], "project": "Hřiště Hrou",
+                              "node": "hriste:c2d"})
+
+    def test_x_clears_the_node_and_the_job_hands_nothing_over(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("x", "enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["deliver"]["node"] is None and job["deliver"]["mode"] == "none"
+
+    def test_escape_inside_the_picker_closes_only_the_picker(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("n", "escape")
+            assert len(app.screen_stack) == 1
+            await pilot.press("enter", "enter")
+        run(scenario)
+        assert len(saved_jobs()) == 1
+
+
+class TestQuittingWritesNothing:
+    """G2: the screen never starts work and an abandoned form leaves no trace."""
+
+    def test_escape_in_the_middle_of_the_form_asks_once_then_leaves_the_jobs_dir_empty(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "tab", "tab")   # selected two; focus in the note
+            await pilot.press(*"half-written")
+            await pilot.press("escape")
+            assert app.is_running and "Discard this plan" in str(app.query_one("#error", Static).render())
+            await pilot.press("escape")
+        _, result = run(scenario)
+        assert result is None
+        assert not (env / "jobs").exists() or list((env / "jobs").iterdir()) == []
+
+    def test_escape_on_an_untouched_form_quits_at_once(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not app.is_running
+        run(scenario)
+        assert saved_jobs() == []
+
+    def test_changing_the_recordings_alone_also_asks_before_discarding(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "escape")
+            assert app.is_running and "Discard this plan" in str(app.query_one("#error", Static).render())
+        run(scenario)
+
+    def test_going_back_from_the_confirmation_writes_nothing_and_keeps_the_form(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("enter", "escape")
+            assert len(app.screen_stack) == 1 and app.is_running
+        run(scenario)
+        assert saved_jobs() == []
+
+
+class TestTextAreas:
+    """Pasted paragraphs are the norm for the note and the instructions."""
+
+    def test_a_pasted_multi_paragraph_note_keeps_its_blank_lines(self, env):
+        text = "First paragraph.\n\nSecond one, with: punctuation & ‘quotes’."
+
+        async def scenario(app, pilot):
+            await pilot.press("tab", "tab")
+            app.post_message(events.Paste(text))   # as a terminal delivers it: to the app, then the focused widget
+            await pilot.pause()
+            await pilot.press("ctrl+s", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["deliver"]["note"] == text
+
+    def test_enter_in_a_text_area_is_a_newline_and_does_not_save(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("tab", "tab", "tab")
+            await pilot.press("a", "enter", "b")
+            assert app.query_one("#instructions", TextArea).text == "a\nb"
+        run(scenario)
+        assert saved_jobs() == []
+
+    def test_instructions_reach_the_job(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("tab", "tab", "tab")
+            await pilot.press(*"short", "ctrl+s", "enter")
+        run(scenario)
+        assert saved_jobs()[0]["instructions"] == "short"
+
+
+class TestLiveMeeting:
+    def test_the_meeting_in_progress_is_the_first_row_marked_live_and_preselected(
+            self, env, monkeypatch):
+        live = {"id": "wispr:m1", "source": "wispr", "filename": "Standup", "start_time": 4_000_000,
+                "duration": 0, "live": True, "filetag_id_list": []}
+        monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: live)
+
+        async def scenario(app, pilot):
+            recs = app.query_one("#recs", SelectionList)
+            assert app.rows[0]["id"] == "wispr:m1"
+            assert "LIVE" in str(recs.get_option_at_index(0).prompt)
+            await pilot.press("enter", "enter")
+        run(scenario)
+        assert saved_jobs()[0]["recordings"] == ["wispr:m1"]
+
+
+class TestOffline:
+    """The laptop is on a plane: the screen must explain, not crash."""
+
+    def test_plaud_unreachable_shows_the_note_and_still_lists_local_recordings(
+            self, env, monkeypatch):
+        def down(*a):
+            raise OSError("network is unreachable")
+        monkeypatch.setattr(pt, "list_recordings", down)
+        monkeypatch.setattr(pt.wispr_flow, "list_meetings",
+                            lambda *a: [rec("wispr:z", "Local meeting", 5_000_000, source="wispr")])
+
+        async def scenario(app, pilot):
+            assert "Plaud not reachable" in str(app.query_one("#notes", Static).render())
+            assert [r["id"] for r in app.rows] == ["wispr:z"]
+        run(scenario)
+
+    def test_no_token_is_a_note_and_the_network_is_never_tried(self, env, monkeypatch):
+        def no_token():
+            raise SystemExit(1)
+        monkeypatch.setattr(pt, "get_token", no_token)
+        monkeypatch.setattr(pt, "list_recordings", lambda *a: pytest.fail("network call"))
+
+        async def scenario(app, pilot):
+            assert "No Plaud token" in str(app.query_one("#notes", Static).render())
+            assert app.rows == []
+            await pilot.press("enter")
+            assert "Select at least one" in str(app.query_one("#error", Static).render())
+        run(scenario)
+        assert saved_jobs() == []
+
+    def test_nothing_pending_says_so(self, env, monkeypatch):
+        monkeypatch.setattr(pt, "list_recordings", lambda *a: [])
+
+        async def scenario(app, pilot):
+            assert "No pending recordings" in str(app.query_one("#notes", Static).render())
+        run(scenario)
