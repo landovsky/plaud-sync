@@ -22,7 +22,10 @@ Capture is started by hand (`run`) or follows Wispr Flow (`watch`): a meeting is
 live while its Meetings row has no endedAt, or after a resume while its live
 transcript ends on a `resumed` marker. `install-agent` keeps the watcher
 alive across logins, reboots and crashes — without it a restart silently ends
-capture (2026-10-27: one reboot cost two days of meetings). macOS notifications say when capture
+capture (2026-10-27: one reboot cost two days of meetings). macOS lists a
+LaunchAgent in Login Items by ProgramArguments[0], so the agent runs a named
+launcher, ~/.plaud-sync/bin/plaud-autocapture-watchdog, not a bare "python3.15".
+macOS notifications say when capture
 starts, when the first frame proves Screen Recording permission works, and when
 it stops — the screen gives no other sign that it is being recorded.
 
@@ -1252,8 +1255,37 @@ def ensure(wait_s=ENSURE_WAIT_S):
     _alert_not_running(f"restart attempted {how} but no watcher was alive after {wait_s:g}s")
 
 
-def install_agent(interval_s):
+WATCHDOG_NAME = "plaud-autocapture-watchdog"
+
+
+def _agent_bin_dir(bin_dir=None):
+    """Where the named launcher lives: --bin-dir, else $PLAUD_AGENT_BIN_DIR, else ~/.plaud-sync/bin."""
+    return Path(bin_dir or os.environ.get("PLAUD_AGENT_BIN_DIR") or Path.home() / ".plaud-sync" / "bin").expanduser()
+
+
+def _write_watchdog(bin_dir=None):
+    """Atomically write the executable launcher whose name Login Items shows."""
+    d = _agent_bin_dir(bin_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    script = d / WATCHDOG_NAME
+    repo = Path(__file__).resolve().parent
+    tmp = d / f".{WATCHDOG_NAME}.tmp"
+    tmp.write_text("#!/bin/bash\n"
+                   "# Plaud autocapture watchdog: restarts the Wispr screen-capture watcher;"
+                   " installed by autocapture.py install-agent\n"
+                   f"# repo: {repo}\n"
+                   f'exec "{sys.executable}" "{Path(__file__).resolve()}" ensure "$@"\n',
+                   encoding="utf-8")
+    tmp.chmod(0o755)
+    os.replace(tmp, script)
+    return script
+
+
+def install_agent(interval_s, bin_dir=None):
     """LaunchAgent: `ensure` at login and every interval_s, in the user's GUI session.
+
+    ProgramArguments is a named launcher script (see _write_watchdog), because
+    Login Items shows ProgramArguments[0] and Tomas will not approve "python3.15".
 
     launchd starts only `ensure` (plain Python, no screen access); the watcher
     itself is opened through the app exactly as `start --watch` does, so the
@@ -1262,9 +1294,10 @@ def install_agent(interval_s):
     AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     import plistlib
+    script = _write_watchdog(bin_dir)
     plist = {
         "Label": AGENT_ID,
-        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "ensure"],
+        "ProgramArguments": [str(script)],
         "RunAtLoad": True,
         "StartInterval": int(interval_s),
         "ProcessType": "Background",
@@ -1280,9 +1313,10 @@ def install_agent(interval_s):
     print(f"installed {AGENT_PLIST} — checks every {int(interval_s)}s and at login")
 
 
-def uninstall_agent():
+def uninstall_agent(bin_dir=None):
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_ID}"], capture_output=True)
     AGENT_PLIST.unlink(missing_ok=True)
+    (_agent_bin_dir(bin_dir) / WATCHDOG_NAME).unlink(missing_ok=True)
     print("agent removed — the watcher now runs only when started by hand")
 
 
@@ -1352,7 +1386,11 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     ia = sub.add_parser("install-agent", help="keep the Wispr watcher running across logins, reboots and crashes")
     ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
                     help="how often the agent checks the watcher is alive (default 300)")
-    sub.add_parser("uninstall-agent", help="remove the login agent")
+    bin_help = ("directory for the named launcher plaud-autocapture-watchdog, which is what macOS Login Items"
+                " shows (default $PLAUD_AGENT_BIN_DIR, else ~/.plaud-sync/bin)")
+    ia.add_argument("--bin-dir", metavar="DIR", help=bin_help)
+    ua = sub.add_parser("uninstall-agent", help="remove the login agent and its launcher script")
+    ua.add_argument("--bin-dir", metavar="DIR", help=bin_help)
     en = sub.add_parser("ensure", help="start the watcher unless running or paused (what the agent runs);"
                         " notifies if it still is not running")
     en.add_argument("--wait", type=float, default=ENSURE_WAIT_S, metavar="SECONDS",
@@ -1399,9 +1437,9 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     elif args.cmd == "install-app":
         install_app()
     elif args.cmd == "install-agent":
-        install_agent(args.interval)
+        install_agent(args.interval, args.bin_dir)
     elif args.cmd == "uninstall-agent":
-        uninstall_agent()
+        uninstall_agent(args.bin_dir)
     elif args.cmd == "check":
         if args.here or not APP_PATH.exists():
             _log(f"check ({'app' if args.here else 'terminal'}): " + json.dumps(_permission_probes()))

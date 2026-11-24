@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import autocapture
 
 
@@ -94,3 +97,51 @@ class TestUserHearsWhenTheRestartDidNotTakeHold:
         autocapture.ensure(wait_s=0)
 
         assert sent == []
+
+
+class TestLoginItemHasARecognisableName:
+    """macOS Login Items names an agent by ProgramArguments[0]; Tomas will not
+    approve an anonymous python3.15 login item, so the agent runs a named script."""
+
+    def _install(self, monkeypatch, tmp_path):
+        import subprocess
+        monkeypatch.setattr(autocapture, "STATE_DIR", tmp_path / "state")
+        monkeypatch.setattr(autocapture, "LOG_FILE", tmp_path / "state" / "autocapture.log")
+        monkeypatch.setattr(autocapture, "PAUSED_FILE", tmp_path / "state" / "paused")
+        monkeypatch.setattr(autocapture, "AGENT_PLIST", tmp_path / "LaunchAgents" / "x.plist")
+        calls = []
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a[0]))
+        bin_dir = tmp_path / "bin"
+        autocapture.install_agent(300, bin_dir=str(bin_dir))
+        return bin_dir / "plaud-autocapture-watchdog", calls
+
+    def test_plist_points_at_the_named_watchdog_not_python(self, monkeypatch, tmp_path):
+        import plistlib
+        script, _ = self._install(monkeypatch, tmp_path)
+        plist = plistlib.loads((tmp_path / "LaunchAgents" / "x.plist").read_bytes())
+
+        assert plist["ProgramArguments"] == [str(script)]
+        assert not Path(plist["ProgramArguments"][0]).name.startswith("python")
+        assert plist["RunAtLoad"] is True and plist["StartInterval"] == 300
+
+    def test_watchdog_is_executable_and_execs_ensure_with_this_interpreter(self, monkeypatch, tmp_path):
+        import sys
+        script, _ = self._install(monkeypatch, tmp_path)
+        lines = script.read_text().splitlines()
+
+        assert os.access(script, os.X_OK) and (script.stat().st_mode & 0o777) == 0o755
+        assert lines[0] == "#!/bin/bash" and "Plaud autocapture watchdog" in lines[1]
+        assert lines[-1] == (f'exec "{sys.executable}" "{Path(autocapture.__file__).resolve()}" ensure "$@"')
+
+    def test_uninstall_removes_the_script_so_no_stale_login_item_target_remains(self, monkeypatch, tmp_path):
+        script, _ = self._install(monkeypatch, tmp_path)
+
+        autocapture.uninstall_agent(bin_dir=str(script.parent))
+
+        assert not script.exists()
+        assert not (tmp_path / "LaunchAgents" / "x.plist").exists()
+
+    def test_bin_dir_env_var_overrides_the_default(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PLAUD_AGENT_BIN_DIR", str(tmp_path / "envbin"))
+
+        assert autocapture._agent_bin_dir() == tmp_path / "envbin"
