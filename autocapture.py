@@ -78,6 +78,10 @@ DEFAULTS = {
     "manual_gap_s": 20,       # a deliberate screenshot this close to a pointed-at scene wins
     "fresh_s": 60,            # pointing within this long after a screen change is the strongest signal
     "wispr_poll_s": 10,
+    # While watching (not capturing) the displays are recorded in status.json, so the
+    # SwiftBar menu can pre-set a monitor between meetings. One JXA call per refresh;
+    # also refreshed at once when displays.json changes.
+    "display_refresh_s": 300,
     # A resumed meeting keeps its endedAt (Wispr sets it at the pause and never
     # clears it), so it counts as live while live.ndjson ends on a `resumed`
     # marker — unless the file has been silent this long (Wispr crashed mid-segment).
@@ -885,9 +889,29 @@ def _wispr_files(config, meeting_id):
     return out
 
 
+def _refresh_idle_displays(s, cache, now=None):
+    """While watching, keep status.json `displays` current: at watch start, every
+    display_refresh_s, and when displays.json changes (a toggle shows up at once).
+    One _screens() (JXA) call per refresh; `cache` is {"t", "mt"} owned by watch()."""
+    now = time.time() if now is None else now
+    try:
+        mt = OVERRIDES_FILE.stat().st_mtime_ns
+    except OSError:
+        mt = None
+    if cache.get("t") is not None and mt == cache.get("mt") \
+            and now - cache["t"] < s["display_refresh_s"]:
+        return False
+    cache.update(t=now, mt=mt)
+    _, names = _screens()
+    _write_status(state="watching",
+                  displays=_displays_status(names, s["ignore_displays"], load_overrides()))
+    return True
+
+
 def watch(config, stopping):
     """Follow Wispr Flow: capture while a meeting is live, idle otherwise."""
     s = settings(config)
+    idle_displays = {"t": None, "mt": None}
     done = set()  # meetings that hit max_hours — don't restart them
     _log("watching Wispr Flow for meetings")
     notify("Autocapture armed", "Will capture the screen while a Wispr Flow meeting is recording.")
@@ -914,6 +938,8 @@ def watch(config, stopping):
             if wispr_live_meeting(config, s["max_hours"]):
                 done.add(m["id"])  # stopped by max_hours or a signal while still live
             _write_status(state="watching")
+            idle_displays["t"] = None  # that write dropped `displays`; refresh below
+        _refresh_idle_displays(s, idle_displays)
         for _ in range(int(s["wispr_poll_s"])):  # in steps, so `stop` is prompt
             if stopping():
                 break
@@ -1353,9 +1379,25 @@ def _foreground(mode, config, hours):
         PID_FILE.unlink(missing_ok=True)
 
 
+NOTIFY_ERRORS_HELP = ("show a macOS notification if the command fails (SwiftBar runs it with "
+                      "terminal=false, so a failure would otherwise be invisible)")
+
+
 def main():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import plaud_transcribe as pt
+    """`--notify-errors` (display, start, stop): a failure also becomes a notification."""
+    try:
+        return _main()
+    except SystemExit as e:
+        if "--notify-errors" in sys.argv and e.code not in (None, 0):
+            notify("Autocapture action failed", str(e.code)[:200], sound="Basso")
+        raise
+    except Exception as e:  # noqa: BLE001
+        if "--notify-errors" in sys.argv:
+            notify("Autocapture action failed", f"{type(e).__name__}: {e}"[:200], sound="Basso")
+        raise
+
+
+def build_parser():
     ap = argparse.ArgumentParser(
         description="Continuous, change-driven screen capture for meeting visuals.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1367,6 +1409,8 @@ def main():
                     frame, survives restarts; stored by name in ~/.cache/plaud-autocapture/displays.json)
   skip a monitor:   displays  (names, state, source), then config visuals.autocapture.ignore_displays,
                     e.g. ["built-in"]; then stop + start --watch (config is read at start)
+  between meetings: status.json lists the displays (what the SwiftBar menu shows), refreshed every
+                    visuals.autocapture.display_refresh_s (default 300) and when displays.json changes
   re-tune offline:  replay <session> --set change=0.04
 log: ~/.cache/plaud-autocapture/autocapture.log""")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1376,12 +1420,15 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     st = sub.add_parser("start", help="like run/watch, but in the background")
     st.add_argument("--watch", action="store_true", help="follow Wispr Flow instead of capturing now")
     st.add_argument("--hours", type=float)
-    sub.add_parser("stop", help="stop a background capture/watch")
+    st.add_argument("--notify-errors", action="store_true", help=NOTIFY_ERRORS_HELP)
+    sp = sub.add_parser("stop", help="stop a background capture/watch")
+    sp.add_argument("--notify-errors", action="store_true", help=NOTIFY_ERRORS_HELP)
     sub.add_parser("status", help="show what autocapture is doing")
     sub.add_parser("displays", help="list monitors by name, whether they are captured, and why (override/config)")
     dp = sub.add_parser("display", help="switch one monitor's capture on or off, no restart (stored by name)")
     dp.add_argument("target", help="display name, or its number as shown by `displays`")
     dp.add_argument("state", choices=["on", "off"])
+    dp.add_argument("--notify-errors", action="store_true", help=NOTIFY_ERRORS_HELP)
     sub.add_parser("install-app", help="build ~/Applications/Plaud Autocapture.app (named permission prompt)")
     ia = sub.add_parser("install-agent", help="keep the Wispr watcher running across logins, reboots and crashes")
     ia.add_argument("--interval", type=int, default=300, metavar="SECONDS",
@@ -1401,7 +1448,13 @@ log: ~/.cache/plaud-autocapture/autocapture.log""")
     rp.add_argument("session", help="session directory (or its name under the capture dir)")
     rp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a detection setting, e.g. --set change=0.04")
-    args = ap.parse_args()
+    return ap
+
+
+def _main():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import plaud_transcribe as pt
+    args = build_parser().parse_args()
     if args.cmd == "ensure":  # before config: a broken config must not silence the alert
         try:
             ensure(args.wait)

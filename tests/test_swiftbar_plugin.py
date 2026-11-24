@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import shlex
 import subprocess
 import sys
 import time
@@ -6,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import autocapture
 import jobs
 import jobs_cli
 
@@ -23,6 +26,12 @@ def _load():
 plug = _load()
 
 
+@pytest.fixture(autouse=True)
+def _own_swiftbar_config(monkeypatch, tmp_path):
+    """install/uninstall-swiftbar write and delete the sidecar: never the real one."""
+    monkeypatch.setenv("PLAUD_SWIFTBAR_CONFIG", str(tmp_path / "swiftbar.json"))
+
+
 def _iso(age_s=0):
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(NOW - age_s))
 
@@ -35,9 +44,9 @@ def job(state="done", age=60, **kw):
     return j
 
 
-def render(jobs_=(), status=None, pid_alive=True, paused=False, overrides=None):
+def render(jobs_=(), status=None, pid_alive=True, paused=False, overrides=None, actions=None):
     return plug.render(NOW, list(jobs_), status if status is not None else {"state": "watching"},
-                       pid_alive, paused, overrides or {})
+                       pid_alive, paused, overrides or {}, actions)
 
 
 def title(out):
@@ -118,7 +127,8 @@ class TestJobList:
         many = [job("done", age=i, id=f"d{i}") for i in range(30)]
         many.append(job("failed", age=3000, id="f", project="keepme", error="e"))
         out = render(many)
-        assert len(out.split("Jobs\n")[1].strip().splitlines()) == plug.MAX_JOBS
+        listed = out.split("Jobs\n")[1].split("\n---\n")[0].strip().splitlines()
+        assert len([l for l in listed if not l.startswith("----")]) == plug.MAX_JOBS
         assert "keepme" in out
 
     def test_delivered_job_says_so(self):
@@ -255,3 +265,201 @@ class TestInstallSwiftbar:
         jobs_cli.main(["install-swiftbar", "--dir", str(tmp_path)], host=None)
         jobs_cli.main(["uninstall-swiftbar", "--dir", str(tmp_path)], host=None)
         assert not (tmp_path / "plaud.5s.py").exists() and PLUGIN.exists()
+
+
+# --- K11: actions ---
+
+PY, REPO = "/opt/venv/bin/python3", "/Users/x/my repo"   # a space in the path must survive too
+ACT = {"python": PY, "repo": REPO}
+
+
+def menu_items(out):
+    """[(label, argv)] for every line carrying a bash= action, the way SwiftBar splits it:
+    label before ' | ', then key=value pairs (double quotes keep spaces together)."""
+    items = []
+    for line in out.splitlines():
+        label, sep, rest = line.rpartition(" | bash=")
+        if not sep:
+            continue
+        params = dict(p.split("=", 1) for p in shlex.split("bash=" + rest))
+        argv = [params[f"param{i}"] for i in range(1, len(params)) if f"param{i}" in params]
+        items.append((label.lstrip("-"), params, argv))
+    return items
+
+
+def by_label(out, startswith):
+    return [(p, a) for l, p, a in menu_items(out) if l.startswith(startswith)]
+
+
+def parse_for_real(params, argv):
+    """Dry: run the emitted command line through the target command's own argparse."""
+    script = Path(argv[0]).name
+    if script == "autocapture.py":
+        return autocapture.build_parser().parse_args(argv[1:])
+    assert script == "plaud_transcribe.py"
+    return jobs_cli.build_parser().parse_args(argv[1:])
+
+
+class TestDisplayToggleItems:
+    """F1 UI: clicking a monitor in the menu flips it, without opening a terminal."""
+
+    DISPLAYS = [{"name": "PHL 272B7QU", "captured": True},
+                {"name": "Built-in Retina Display", "captured": False}]
+
+    def _out(self, displays=None):
+        return render(status={"state": "watching", "displays": displays or self.DISPLAYS}, actions=ACT)
+
+    def test_click_turns_a_captured_monitor_off_and_an_off_one_on(self):
+        out = self._out()
+        (p1, a1), = by_label(out, "✓ PHL")
+        (p2, a2), = by_label(out, "  Built-in")
+        assert a1[1:] == ["display", "PHL 272B7QU", "off", "--notify-errors"]
+        assert a2[1:] == ["display", "Built-in Retina Display", "on", "--notify-errors"]
+        assert p1["terminal"] == "false" and p1["refresh"] == "true" and p1["bash"] == PY
+
+    def test_names_and_repo_paths_with_spaces_survive_swiftbars_param_splitting(self):
+        (p, a), = by_label(self._out(), "  Built-in")
+        assert a[0] == f"{REPO}/autocapture.py"
+        assert "Built-in Retina Display" in a
+
+    def test_a_name_with_a_pipe_is_passed_by_number_not_corrupted(self):
+        """'|' would end the parameter list; the number is resolved by `display` itself."""
+        weird = [{"name": "A", "captured": True}, {"name": 'Odd | "TV"', "captured": True}]
+        out = self._out(weird)
+        assert len([l for l in out.splitlines() if "Odd" in l]) == 1
+        (p, a), = by_label(out, "✓ Odd")
+        assert a[1:] == ["display", "2", "off", "--notify-errors"]
+
+    def test_every_emitted_command_is_accepted_by_the_real_parser(self):
+        for _, p, a in menu_items(self._out()):
+            ns = parse_for_real(p, a)
+            assert ns.notify_errors is True
+
+    def test_without_the_recorded_interpreter_the_lines_are_plain_text(self):
+        out = render(status={"state": "watching", "displays": self.DISPLAYS})
+        assert "bash=" not in out and "PHL 272B7QU" in out
+        assert "install-swiftbar" in out
+
+
+class TestPauseResumeItem:
+    """Pause is `stop` (which leaves PAUSED_FILE so the agent respects it); resume is `start --watch`."""
+
+    def test_running_watcher_offers_pause(self):
+        (p, a), = by_label(render(actions=ACT), "Pause")
+        assert a[1:] == ["stop", "--notify-errors"]
+        assert parse_for_real(p, a).cmd == "stop"
+
+    def test_paused_watcher_offers_resume(self):
+        out = render(pid_alive=False, paused=True, actions=ACT)
+        assert "Pause" not in out
+        (p, a), = by_label(out, "Resume")
+        assert a[1:] == ["start", "--watch", "--notify-errors"]
+        ns = parse_for_real(p, a)
+        assert ns.cmd == "start" and ns.watch is True
+
+    def test_dead_unpaused_watcher_offers_start(self):
+        (p, a), = by_label(render(pid_alive=False, actions=ACT), "Start")
+        assert a[1:3] == ["start", "--watch"]
+
+    def test_state_comes_from_the_paused_file_on_disk(self, tmp_path):
+        state, jd = tmp_path / "s", tmp_path / "j"
+        state.mkdir(); jd.mkdir()
+        (state / "paused").touch()
+        got = plug.gather(state, jd)
+        assert "Resume" in plug.render(NOW, **got)
+
+
+class TestJobActions:
+    """F5/D2/D9: a failed or held job can be dealt with from the menu."""
+
+    def _failed(self, **kw):
+        return job("failed", id="20261124-1702", error="push rejected", failed_step="push", **kw)
+
+    def test_failed_job_gets_retry_log_cancel_and_mark_seen(self):
+        out = render([self._failed()], actions=ACT)
+        labels = [l for l, _, _ in menu_items(out) if l in ("Retry", "Show log", "Cancel", "Mark seen")]
+        assert labels == ["Retry", "Show log", "Cancel", "Mark seen"]
+        (p, a), = by_label(out, "Retry")
+        assert a[1:] == ["jobs", "retry", "20261124-1702", "--notify-errors"]
+        assert a[0] == f"{REPO}/plaud_transcribe.py"
+
+    def test_every_job_action_parses_through_the_real_jobs_parser(self):
+        held = job("held", id="h1", result={"delivered": {"outcome": "held", "id": "9xq1"}})
+        for j in (self._failed(), held, job("queued", id="q1")):
+            for label, p, a in menu_items(render([j], actions=ACT)):
+                if p["bash"] == PY and a[0].endswith("plaud_transcribe.py"):
+                    ns = parse_for_real(p, a)
+                    assert ns.command == "jobs" and ns.jobs_command in ("retry", "cancel", "seen")
+                    assert ns.id == j["id"] and ns.notify_errors is True
+
+    def test_show_log_opens_the_runner_log_in_console_and_needs_no_python(self):
+        (p, a), = by_label(render([self._failed()]), "Show log")
+        assert p["bash"] == "/usr/bin/open" and a[:2] == ["-a", "Console"]
+        assert a[2].endswith(".plaud-sync/runner.log")
+
+    def test_held_job_shows_its_id_and_how_to_release_it(self):
+        held = job("held", id="h1", result={"delivered": {"outcome": "held", "id": "9xq1"}})
+        out = render([held], actions=ACT)
+        assert "Held for you: 9xq1" in out
+        assert "cc-tree deliver --release 9xq1" in out
+
+    def test_a_seen_job_loses_the_warning_and_the_mark_seen_item_but_keeps_retry(self):
+        out = render([self._failed(seen=True)], actions=ACT)
+        assert title(out) == "○"
+        assert not by_label(out, "Mark seen") and by_label(out, "Retry")
+
+    def test_finished_jobs_have_no_actions_and_running_ones_open_the_log(self):
+        out = render([job("done", id="d"), job("running", id="r")], actions=ACT)
+        acts = [l for l, p, a in menu_items(out) if "—" in l]
+        assert len(acts) == 1 and acts[0].startswith("⟳")
+
+    def test_plugin_has_no_plan_or_arm_entries_yet(self):
+        out = render([self._failed()], actions=ACT)
+        assert "Plan a transcript" not in out and "Arm current" not in out
+
+
+class TestFailuresAreNotInvisible:
+    """terminal=false hides stderr; --notify-errors turns a failure into a notification."""
+
+    def test_failing_jobs_action_notifies_and_still_returns_an_error(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path)
+        seen = []
+        monkeypatch.setattr(autocapture, "notify", lambda *a, **k: seen.append(a))
+        assert jobs_cli.main(["jobs", "retry", "nope", "--notify-errors"], host=None) == 2
+        assert len(seen) == 1 and "retry" in seen[0][1]
+
+    def test_without_the_flag_a_terminal_user_gets_no_popup(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path)
+        monkeypatch.setattr(autocapture, "notify", lambda *a, **k: pytest.fail("notified"))
+        assert jobs_cli.main(["jobs", "retry", "nope"], host=None) == 2
+
+    def test_display_action_on_an_unknown_monitor_notifies(self, monkeypatch, tmp_path):
+        import plaud_transcribe
+        monkeypatch.setattr(autocapture, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(autocapture, "OVERRIDES_FILE", tmp_path / "displays.json")
+        monkeypatch.setattr(autocapture, "_screens", lambda: (None, ["Only One"]))
+        monkeypatch.setattr(plaud_transcribe, "load_config", lambda **k: {})
+        monkeypatch.setattr(sys, "argv", ["autocapture.py", "display", "Gone", "off", "--notify-errors"])
+        seen = []
+        monkeypatch.setattr(autocapture, "notify", lambda *a, **k: seen.append(a))
+        with pytest.raises(SystemExit):
+            autocapture.main()
+        assert len(seen) == 1 and "unknown display" in seen[0][1]
+        assert not (tmp_path / "displays.json").exists()
+
+
+class TestInstallRecordsTheInterpreter:
+    def test_install_writes_the_sidecar_the_plugin_reads(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(jobs_cli.subprocess, "run",
+                            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=""))
+        jobs_cli.main(["install-swiftbar", "--dir", str(tmp_path / "plugins")], host=None)
+        cfg = json.loads((tmp_path / "swiftbar.json").read_text())
+        assert cfg == {"python": sys.executable, "repo": str(jobs_cli.REPO_DIR)}
+        assert plug.load_actions(tmp_path / "swiftbar.json") == cfg
+
+    def test_relative_or_garbage_config_means_no_actions(self, tmp_path):
+        f = tmp_path / "c.json"
+        f.write_text('{"python": "python3", "repo": "x"}')
+        assert plug.load_actions(f) is None
+        f.write_text("{nope")
+        assert plug.load_actions(f) is None

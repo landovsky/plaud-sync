@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <xbar.title>plaud-sync</xbar.title>
-# <xbar.desc>Autocapture state and the transcription job queue (read-only)</xbar.desc>
+# <xbar.desc>Autocapture state, the transcription job queue and their actions</xbar.desc>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 """SwiftBar plugin: autocapture + transcription jobs in the menu bar.
@@ -19,7 +19,14 @@ folder; the "5s" in the file name is SwiftBar's refresh interval.
 Title glyph, highest priority first:
   x watcher down (pid dead, not paused)  >  warn failed/held job not yet seen
   >  runner busy + count  >  capturing  >  watching.  Paused shows "paused".
-render(now, jobs, status, pid_alive, paused, overrides) is pure: no I/O.
+render(now, jobs, status, pid_alive, paused, overrides, actions) is pure: no I/O.
+
+Actions (toggle a monitor, pause/resume, retry/cancel/mark seen a job) are menu lines with
+`bash=<python> param1=<script> ... terminal=false refresh=true`. The interpreter and repo come
+from ~/.plaud-sync/swiftbar.json (env PLAUD_SWIFTBAR_CONFIG), written by `install-swiftbar`:
+this plugin runs on the system python, the actions need the repo's. Without that file the
+menu has no actions (only "Show log"). Every action passes --notify-errors, because
+terminal=false would hide a failure.
 """
 
 import json
@@ -31,6 +38,9 @@ from pathlib import Path
 
 JOBS_DIR = Path(os.environ.get("PLAUD_JOBS_DIR") or "~/.plaud-sync/jobs").expanduser()
 STATE_DIR = Path.home() / ".cache" / "plaud-autocapture"
+CONFIG_FILE = Path(os.environ.get("PLAUD_SWIFTBAR_CONFIG")
+                   or Path.home() / ".plaud-sync" / "swiftbar.json").expanduser()
+RUNNER_LOG = Path.home() / ".plaud-sync" / "runner.log"
 
 MAX_JOBS = 10
 DONE_HIDE_S = 24 * 3600    # finished jobs older than this leave the menu
@@ -43,6 +53,32 @@ def clean(text, limit=LABEL_MAX):
     """SwiftBar treats '|' as the parameter separator and newlines end a line."""
     text = " ".join(str(text if text is not None else "").replace("|", "/").split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _q(value):
+    """One SwiftBar parameter value: double-quoted when it holds whitespace."""
+    value = str(value)
+    return f'"{value}"' if any(c.isspace() for c in value) else value
+
+
+def _param_safe(value):
+    """SwiftBar splits a line on '|' and parses quotes itself; a value holding
+    those (or a backslash or newline) cannot be passed through intact."""
+    return not any(c in str(value) for c in '|"\\\n\r')
+
+
+def act(actions, *argv, script="autocapture.py"):
+    """' | bash=... param1=...' that runs `<python> <repo>/<script> argv... --notify-errors`;
+    '' without a recorded interpreter (so the line stays plain text)."""
+    if not actions or not actions.get("python") or not actions.get("repo"):
+        return ""
+    args = [str(Path(actions["repo"]) / script), *argv, "--notify-errors"]
+    params = " ".join(f"param{i}={_q(a)}" for i, a in enumerate(args, 1))
+    return f" | bash={_q(actions['python'])} {params} terminal=false refresh=true"
+
+
+def log_action():
+    return f" | bash=/usr/bin/open param1=-a param2=Console param3={_q(RUNNER_LOG)} terminal=false"
 
 
 def _ts(iso):
@@ -116,8 +152,34 @@ def visible_jobs(jobs, now):
     return [j for j in shown if j in keep]
 
 
-def render(now, jobs, status, pid_alive, paused, overrides):
-    """The whole plugin output as one string. `now` is epoch seconds."""
+def job_menu(job, actions):
+    """The job's line plus its submenu: Retry / Show log / Cancel / Mark seen, and for a
+    held job the id and the command that releases it (D2). Running jobs: click = log."""
+    state = job.get("state")
+    line = "--" + job_line(job)
+    jid = job.get("id", "")
+    if state in ("failed", "held", "queued", "armed"):
+        sub = []
+        delivered = (job.get("result") or {}).get("delivered") or {}
+        if state == "held" and delivered.get("id"):
+            hid = clean(delivered["id"], 20)
+            sub.append(f"----Held for you: {hid}")
+            sub.append(f"----Release it: cc-tree deliver --release {hid}")
+        if state in ("failed", "held"):
+            sub.append("----Retry" + act(actions, "jobs", "retry", jid, script="plaud_transcribe.py"))
+        sub.append("----Show log" + log_action())
+        sub.append("----Cancel" + act(actions, "jobs", "cancel", jid, script="plaud_transcribe.py"))
+        if state in ("failed", "held") and not job.get("seen"):
+            sub.append("----Mark seen" + act(actions, "jobs", "seen", jid, script="plaud_transcribe.py"))
+        return [line] + sub
+    if state == "running":
+        return [line + log_action()]
+    return [line]
+
+
+def render(now, jobs, status, pid_alive, paused, overrides, actions=None):
+    """The whole plugin output as one string. `now` is epoch seconds; `actions` is
+    {"python", "repo"} from swiftbar.json, or None for a menu without actions."""
     status = status or {}
     overrides = overrides or {}
     jobs = [j for j in (jobs or []) if isinstance(j, dict)]
@@ -155,19 +217,28 @@ def render(now, jobs, status, pid_alive, paused, overrides):
     shown = status.get("displays") if isinstance(status.get("displays"), list) else []
     seen_names = set()
     disp = []
-    for d in shown:
+    for pos, d in enumerate(shown, 1):
         if not isinstance(d, dict) or not d.get("name"):
             continue
         seen_names.add(d["name"])
         mark = "✓" if d.get("captured") else " "
         suffix = "" if d.get("captured") else " (off)"
-        disp.append(f"--{mark} {clean(d['name'])}{suffix}")
+        # a name SwiftBar cannot carry is passed as its number, which `display` resolves
+        target = d["name"] if _param_safe(d["name"]) else str(pos)
+        disp.append(f"--{mark} {clean(d['name'])}{suffix}"
+                    + act(actions, "display", target, "off" if d.get("captured") else "on"))
     for name, on in sorted(overrides.items()):   # F3: an unplugged monitor keeps its override
         if name not in seen_names:
             disp.append(f"--  {clean(name)} (not connected, override {'on' if on else 'off'})")
     if disp:
         lines.append("Displays")
         lines.extend(disp)
+    if paused:
+        lines.append("Resume autocapture" + act(actions, "start", "--watch"))
+    elif down:
+        lines.append("Start autocapture" + act(actions, "start", "--watch"))
+    else:
+        lines.append("Pause autocapture" + act(actions, "stop"))
 
     lines.append("---")
     lines.append("Jobs")
@@ -175,7 +246,10 @@ def render(now, jobs, status, pid_alive, paused, overrides):
     if not listed:
         lines.append("--No recent jobs")
     for j in listed:
-        lines.append("--" + job_line(j))
+        lines.extend(job_menu(j, actions))
+    if not actions:
+        lines.append("---")
+        lines.append("Menu actions off: run plaud-transcribe install-swiftbar")
     return "\n".join(lines) + "\n"
 
 
@@ -198,7 +272,15 @@ def _pid_alive(pid_file):
         return False
 
 
-def gather(state_dir=None, jobs_dir=None):
+def load_actions(path=None):
+    cfg = _read_json(path or CONFIG_FILE)
+    if isinstance(cfg, dict) and cfg.get("python") and cfg.get("repo") \
+            and os.path.isabs(cfg["python"]) and os.path.isabs(cfg["repo"]):
+        return {"python": cfg["python"], "repo": cfg["repo"]}
+    return None
+
+
+def gather(state_dir=None, jobs_dir=None, config_file=None):
     state_dir = Path(state_dir or STATE_DIR)
     jobs_dir = Path(jobs_dir or JOBS_DIR)
     jobs = []
@@ -213,7 +295,8 @@ def gather(state_dir=None, jobs_dir=None):
                 status=status if isinstance(status, dict) else {},
                 pid_alive=_pid_alive(state_dir / "autocapture.pid"),
                 paused=(state_dir / "paused").exists(),
-                overrides=overrides if isinstance(overrides, dict) else {})
+                overrides=overrides if isinstance(overrides, dict) else {},
+                actions=load_actions(config_file))
 
 
 def main():

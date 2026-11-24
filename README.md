@@ -511,6 +511,9 @@ continuously during a meeting, and keeps the cost bounded with one filter at eac
   is main and shift when a monitor is plugged in. An ignored display logs one `ignored`
   event (ending its scene) and nothing else. Config is read when capture starts, so restart
   a running watcher (`stop`, then `start --watch`) after changing it.
+  Between meetings the watcher also lists the monitors in `status.json` (`displays`), so the
+  SwiftBar menu can switch one off before a meeting starts; one macOS query every
+  `display_refresh_s` seconds (default 300) and at once when `displays.json` changes.
 
 ```bash
 python3 autocapture.py watch          # capture while a Wispr Flow meeting is recording

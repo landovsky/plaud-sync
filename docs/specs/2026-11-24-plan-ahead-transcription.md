@@ -457,8 +457,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K7 | C4, C6, D8 | done | `e557513` | `publish.push_pr` (push branch if origin tip differs, reuse open PR via `gh pr list --head`, else `gh pr create`), `GH_BIN`/`runner.gh`, knobs in `runner --help`, 12 tests in `tests/test_publish_pr.py` |
 | K8 | D1-D4 | done | `de1510c` | `deliver.py` (work text, parsed outcome message/fresh/held/unknown/plan, held step state so retry re-delivers only), `runner --deliver-plan`, README stage-1 section, 34 tests in `tests/test_deliver.py` + `tests/test_runner_e2e.py`; uncommitted |
 | K9 | F1, F2, F3 | done | `5772c0a` | `displays.json` overrides (by name, mtime-cached), `display <name|n> on|off`, source column, status.json `displays` list; uncommitted |
-| K10 | F4, F6, F7 | done | | `swiftbar/plaud.5s.py` (pure `render`, stdlib only, no file-schema imports) + `install-swiftbar`/`uninstall-swiftbar` in jobs_cli, 31 tests in `tests/test_swiftbar_plugin.py`; uncommitted |
-| K11 | F5, D2, D9 | pending | | SwiftBar actions: toggles, pause, retry/cancel/seen |
+| K10 | F4, F6, F7 | done | `c97acae` | `swiftbar/plaud.5s.py` (pure `render`, stdlib only, no file-schema imports) + `install-swiftbar`/`uninstall-swiftbar` in jobs_cli, 31 tests in `tests/test_swiftbar_plugin.py`; uncommitted |
+| K11 | F5, D2, D9 | done | | menu actions (display toggle, pause/resume, per-job retry/log/cancel/seen, held hint) via `~/.plaud-sync/swiftbar.json` interpreter + `--notify-errors`; watcher now records `displays` while idle (`display_refresh_s`); uncommitted |
 | K12 | G1, G3 (logic) | pending | | Plan logic without UI: pending list, suggestions, build_job |
 | K13 | G1, G2, G4 | pending | | Textual plan screen + tests (needs venv with textual) |
 | K14 | E1, E2, E3 | pending | | Armed jobs: meeting_ready, promotion, timeouts |

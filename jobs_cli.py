@@ -123,6 +123,11 @@ recipes:
   remove it
     plaud-transcribe uninstall-swiftbar
 The plugin reads local files only (jobs, autocapture status) and imports none of this repo.
+Its menu actions (toggle a monitor, pause, retry/cancel/mark seen) run this repo's commands with
+the Python that ran install-swiftbar. That path is recorded in ~/.plaud-sync/swiftbar.json
+(env PLAUD_SWIFTBAR_CONFIG moves it): {"python": "<abs interpreter>", "repo": "<abs repo dir>"}.
+Re-run install-swiftbar after moving the repo or switching Python; without the file the menu
+shows no actions. Actions pass --notify-errors, so a failure becomes a notification.
 """
 
 
@@ -167,6 +172,9 @@ def build_parser():
                        ("seen", "mark a failed/held job as seen; keeps the job")):
         s = js.add_parser(name, help=text, description=text)
         s.add_argument("id", help="job id or unique prefix")
+        s.add_argument("--notify-errors", action="store_true",
+                       help="show a macOS notification if this fails (the SwiftBar menu runs it "
+                            "with terminal=false, where errors would be invisible)")
     sub.add_parser("runner", help="process queued jobs, then exit (see runner --help)",
                    add_help=False)
     i = sub.add_parser("install-runner", help="install the LaunchAgent that runs the runner",
@@ -224,6 +232,22 @@ def swiftbar_dir(explicit=None):
     return SWIFTBAR_DEFAULT_DIR, installed
 
 
+def swiftbar_config_path():
+    return Path(os.environ.get("PLAUD_SWIFTBAR_CONFIG")
+                or Path.home() / ".plaud-sync" / "swiftbar.json").expanduser()
+
+
+def write_swiftbar_config():
+    """Record the interpreter and repo the menu actions run: SwiftBar has no PATH and the
+    plugin itself runs on /usr/bin/python3, which cannot import this repo's dependencies."""
+    path = swiftbar_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"python": sys.executable, "repo": str(REPO_DIR)}, indent=2) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
 def install_swiftbar(directory=None):
     target_dir, found = swiftbar_dir(directory)
     if not found:
@@ -233,6 +257,7 @@ def install_swiftbar(directory=None):
         return 0
     link = target_dir / SWIFTBAR_PLUGIN.name
     target_dir.mkdir(parents=True, exist_ok=True)
+    print(f"menu actions will run {sys.executable} (recorded in {write_swiftbar_config()})")
     if link.is_symlink() or link.exists():
         if link.is_symlink() and Path(os.readlink(link)) == SWIFTBAR_PLUGIN:
             print(f"already linked: {link}")
@@ -248,6 +273,7 @@ def install_swiftbar(directory=None):
 def uninstall_swiftbar(directory=None):
     target_dir, _ = swiftbar_dir(directory)
     link = target_dir / SWIFTBAR_PLUGIN.name
+    swiftbar_config_path().unlink(missing_ok=True)
     if link.is_symlink():
         link.unlink()
         print(f"removed {link}")
@@ -397,6 +423,14 @@ def cmd_jobs(args):
     return 0
 
 
+def _notify_failure(args, message):
+    """--notify-errors: terminal=false menu actions have nowhere to print an error."""
+    if getattr(args, "notify_errors", False):
+        from autocapture import notify
+        notify("Plaud job action failed", f"{getattr(args, 'jobs_command', args.command)}: {message}"[:200],
+               sound="Basso")
+
+
 def main(argv=None, host=None):
     if argv and argv[0] == "runner":   # own parser; --help must not build jobs parsers' required args
         import runner
@@ -417,7 +451,11 @@ def main(argv=None, host=None):
         return cmd_jobs(args)
     except jobs.JobError as e:
         print(f"plaud-transcribe {args.command}: {e}", file=sys.stderr)
+        _notify_failure(args, str(e))
         return 2
+    except Exception as e:  # noqa: BLE001
+        _notify_failure(args, f"{type(e).__name__}: {e}")
+        raise
 
 
 if __name__ == "__main__":

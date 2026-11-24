@@ -139,4 +139,4 @@ class TestProjectTypoDoesNotStopScreenCapture:
         assert pt.load_config(validate=False)["projects"]["H"]["push"] == "foo"
         with pytest.raises(pt.ConfigError):
             pt.load_config()  # plaud-transcribe itself still refuses
-        assert "pt.load_config(validate=False)" in inspect.getsource(autocapture.main)
+        assert "pt.load_config(validate=False)" in inspect.getsource(autocapture._main)
