@@ -280,8 +280,20 @@ The old interactive `process` flow stays unchanged.
 3. G (Textual plan screen).
 4. E (pre-arm), which builds on G's "live meeting" row and F's "Arm current meeting…".
 
-## Open questions
+## Resolved questions (2026-11-24)
 
-- Q1. A default "process it" ask per project (`deliver_ask` in config), or always typed in the note?
-- Q2. Should `push = main` repos with required CI checks fall back to `pr` automatically, or fail and notify?
-- Q3. Should "seen" for ⚠ need a click, or clear after 24 h?
+- Q1 → **D7**: per-project `deliver_ask` in config is the default "process it" ask; the note typed in the plan overrides it. (Part A gains `deliver_ask`; Part D uses it.)
+- Q2 → **D8**: a rejected push to `main` **fails the job and notifies**; the commit stays on `transcripts/<job-id>`. No automatic fallback to a PR.
+- Q3 → **D9**: ⚠ stays until the job is retried, cancelled or explicitly marked **Seen** in the menu. No time-based clearing.
+
+## Progress
+
+_Managed via `/manage feature`; updated per chunk._
+
+| Chunk | Parts | Status | Commit | Notes |
+|-------|-------|--------|--------|-------|
+| _plan pending_ | | | | |
+
+## Future work
+
+_(out-of-scope proposals from implementation are logged here)_
