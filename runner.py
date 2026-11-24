@@ -8,8 +8,9 @@ Steps run in order transcribe -> commit -> push -> deliver. A step runs only if 
 is not already done/skipped, and its state is written to the job file before and
 after, so a crash or reboot resumes at the first unfinished step (B2). The
 transcribe step leans on the pipeline's work-dir cache, so a resume does not pay
-for the transcription twice. commit/push/deliver are pluggable (STEP_FUNCS);
-until their chunks land they are placeholders that mark themselves `skipped`.
+for the transcription twice. Steps are pluggable (STEP_FUNCS): commit/push are
+publish.py (worktree commit + push, never touching the user's checkout);
+deliver is still a placeholder that marks itself `skipped`.
 
 One runner at a time: a flock on the lock file (the kernel drops it when the
 process dies, so a crash never leaves a stale lock). A second runner exits 0 at
@@ -27,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import jobs
+import publish
 from autocapture import notify  # module-level, dependency-free: reused, not copied
 import visuals
 
@@ -229,13 +231,13 @@ def step_transcribe(job, ctx, checkpoint=None):
 
 
 def _placeholder(job, ctx, checkpoint=None):
-    return "skipped"   # K6-K8 register the real commit / push / deliver
+    return "skipped"   # K8 registers the real deliver
 
 
 STEP_FUNCS = {
     "transcribe": step_transcribe,
-    "commit": _placeholder,
-    "push": _placeholder,
+    "commit": publish.step_commit,
+    "push": publish.step_push,
     "deliver": _placeholder,
 }
 

@@ -148,6 +148,14 @@ For each job's output repo (the git root containing `dir`):
 
 `push = none`: files are written as today, plus today's `auto_commit` behaviour.
 
+_As built (K6):_ commits are made on a local branch `transcripts/<job-id>` (kept after the
+worktree is removed) and pushed as `transcripts/<job-id>:main`, so a retry never commits twice.
+The pipeline itself writes the transcript into the user's checkout as untracked files, which
+would block step 7's `--ff-only`. So the fast-forward first removes exactly those files, and
+only when each is untracked, lies inside this job's own output dir, and is byte-identical to the
+blob just pushed. The merge then restores them as tracked files; if the merge fails they are
+written back. Nothing else in the checkout is touched.
+
 **Acceptance** (tests run against throwaway repos with a bare "origin")
 - C1. Uncommitted changes in the user's checkout (modified + untracked + staged) are byte-for-byte
   identical before and after a job, and `git stash list` is unchanged.
@@ -444,8 +452,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K2 | B (store, enqueue, jobs list/show/cancel/seen), G3 | done | 6937115 | `jobs.py` (atomic store, validate, schema 1), `jobs_cli.py` (`enqueue`, `jobs list/show/cancel/seen`), dispatched at top of `main()`, 39 tests; deviations: cancel sets new state `cancelled`; `deliver` gained an `ask` field (project deliver_ask); job ids accept a unique prefix; `jobs_cli.main(argv, host=)` takes the plaud_transcribe module to avoid a second import of `__main__` |
 | K3 | B3, B5 | done | 3ec0a21 | `forced_project`/`interactive` keyword-only on both process functions, `visuals.set_interactive`/`PLAUD_NONINTERACTIVE`, richer result dict, 12 tests in `tests/test_noninteractive_pipeline.py` |
 | K4 | B2, B6, B8, B9, B7 retry | done | 1f87447 | `runner.py` (flock, step machine, resume, failure notify, `--once/--job/--lock-file/--days`), `jobs retry`, 26 tests in `tests/test_runner.py` |
-| K5 | B1, B4 | done | | `load_runner_env` (direnv exec, only 3 keys + PATH), `preflight` before any paid call, Wispr/recorder jobs resolved without the Plaud API, `install-runner`/`uninstall-runner` (WatchPaths + StartInterval 60), shared `--help` test; uncommitted. B1 (starts within 10 s after enqueue, live) pending a manual check by the manager after install |
-| K6 | C1, C2, C3, C5, C7 | pending | | Worktree commit + push to main + safe ff |
+| K5 | B1, B4 | done | af01afa | `load_runner_env` (direnv exec, only 3 keys + PATH), `preflight` before any paid call, Wispr/recorder jobs resolved without the Plaud API, `install-runner`/`uninstall-runner` (WatchPaths + StartInterval 60), shared `--help` test; uncommitted. B1 (starts within 10 s after enqueue, live) pending a manual check by the manager after install |
+| K6 | C1, C2, C3, C5, C7 | done | | `publish.py` commit/push steps registered in runner (worktree on `transcripts/<id>`, push to main with rebase retry, safe ff), 22 tests in `tests/test_publish_main.py`; uncommitted; pr mode fails with "pr lands in K7" |
 | K7 | C4, C6, D8 | pending | | PR mode, kept branch, retry without re-commit |
 | K8 | D1-D4 | pending | | cc-tree deliver step + stage-1 e2e test + README |
 | K9 | F1, F2, F3 | pending | | Display overrides + `display` command |
