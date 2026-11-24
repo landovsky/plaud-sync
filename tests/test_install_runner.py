@@ -101,7 +101,7 @@ class TestHelpNeverRunsAnything:
 
     COMMANDS = [["enqueue"], ["jobs", "list"], ["jobs", "show", "x"], ["jobs", "cancel", "x"],
                 ["jobs", "seen", "x"], ["jobs", "retry", "x"], ["runner"], ["install-runner"],
-                ["uninstall-runner"]]
+                ["uninstall-runner"], ["install-swiftbar"], ["uninstall-swiftbar"]]
 
     @pytest.mark.parametrize("argv", COMMANDS, ids=lambda a: " ".join(a))
     def test_help_exits_zero_and_calls_no_side_effect(self, argv, monkeypatch, capsys):
@@ -114,6 +114,8 @@ class TestHelpNeverRunsAnything:
         monkeypatch.setattr(jobs_cli.subprocess, "run", boom)
         monkeypatch.setattr(jobs_cli, "install_runner", boom)
         monkeypatch.setattr(jobs_cli, "uninstall_runner", boom)
+        monkeypatch.setattr(jobs_cli, "install_swiftbar", boom)
+        monkeypatch.setattr(jobs_cli, "uninstall_swiftbar", boom)
         with pytest.raises(SystemExit) as e:
             jobs_cli.main(argv + ["--help"], host=pt)
         assert e.value.code == 0

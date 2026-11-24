@@ -14,7 +14,8 @@ from pathlib import Path
 
 import jobs
 
-COMMANDS = ("enqueue", "jobs", "runner", "install-runner", "uninstall-runner")
+COMMANDS = ("enqueue", "jobs", "runner", "install-runner", "uninstall-runner",
+            "install-swiftbar", "uninstall-swiftbar")
 
 REPO_DIR = Path(__file__).resolve().parent
 RUNNER_ID = "local.plaud-sync.runner"
@@ -113,11 +114,23 @@ recipes:
 """
 
 
+SWIFTBAR_EPILOG = """\
+recipes:
+  show autocapture state and the job queue in the menu bar
+    plaud-transcribe install-swiftbar
+  a non-default plugin folder
+    plaud-transcribe install-swiftbar --dir ~/SwiftBarPlugins     (or env PLAUD_SWIFTBAR_DIR)
+  remove it
+    plaud-transcribe uninstall-swiftbar
+The plugin reads local files only (jobs, autocapture status) and imports none of this repo.
+"""
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="plaud-transcribe",
         description="Job queue commands (offline: they only read/write job files).")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner,install-runner,uninstall-runner}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{enqueue,jobs,runner,install-runner,uninstall-runner,install-swiftbar,uninstall-swiftbar}")
 
     e = sub.add_parser(
         "enqueue", help="write a job file for the runner (no network)",
@@ -172,7 +185,75 @@ def build_parser():
                        description="Unload and remove the runner LaunchAgent and its launcher script.")
     u.add_argument("--bin-dir", metavar="DIR", default=None,
                    help="launcher directory used at install time (env PLAUD_RUNNER_BIN_DIR)")
+    sw = sub.add_parser("install-swiftbar", help="symlink the SwiftBar menu-bar plugin into SwiftBar's plugin folder",
+                        description="Symlink swiftbar/plaud.5s.py into SwiftBar's plugin folder. "
+                                    "SwiftBar is optional: without it this prints a hint and exits 0.",
+                        epilog=SWIFTBAR_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sw.add_argument("--dir", metavar="DIR", default=None,
+                    help="SwiftBar plugin folder (env PLAUD_SWIFTBAR_DIR; default: SwiftBar's "
+                         "PluginDirectory preference, else ~/Library/Application Support/SwiftBar/Plugins)")
+    usw = sub.add_parser("uninstall-swiftbar", help="remove the SwiftBar plugin symlink",
+                         description="Remove the plaud.5s.py symlink from SwiftBar's plugin folder.",
+                         epilog=SWIFTBAR_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    usw.add_argument("--dir", metavar="DIR", default=None,
+                     help="plugin folder used at install time (env PLAUD_SWIFTBAR_DIR)")
     return p
+
+
+SWIFTBAR_PLUGIN = REPO_DIR / "swiftbar" / "plaud.5s.py"
+SWIFTBAR_DEFAULT_DIR = Path.home() / "Library" / "Application Support" / "SwiftBar" / "Plugins"
+SWIFTBAR_APP_DIRS = (Path("/Applications/SwiftBar.app"), Path.home() / "Applications" / "SwiftBar.app")
+
+
+def swiftbar_dir(explicit=None):
+    """Plugin folder: --dir, then PLAUD_SWIFTBAR_DIR, then SwiftBar's own preference,
+    then SwiftBar's default folder. Returns (path, found) - found is False when SwiftBar
+    does not look installed and nothing was asked for explicitly."""
+    chosen = explicit or os.environ.get("PLAUD_SWIFTBAR_DIR")
+    if chosen:
+        return Path(chosen).expanduser(), True
+    try:
+        r = subprocess.run(["defaults", "read", "com.ameba.SwiftBar", "PluginDirectory"],
+                           capture_output=True, text=True, timeout=5)
+        pref = r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        pref = ""
+    if pref:
+        return Path(pref).expanduser(), True
+    installed = any(p.exists() for p in SWIFTBAR_APP_DIRS) or SWIFTBAR_DEFAULT_DIR.is_dir()
+    return SWIFTBAR_DEFAULT_DIR, installed
+
+
+def install_swiftbar(directory=None):
+    target_dir, found = swiftbar_dir(directory)
+    if not found:
+        print("SwiftBar does not look installed (brew install --cask swiftbar), so no plugin was "
+              "linked. Everything else works without it; run this again after installing, or pass "
+              "--dir / PLAUD_SWIFTBAR_DIR.")
+        return 0
+    link = target_dir / SWIFTBAR_PLUGIN.name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        if link.is_symlink() and Path(os.readlink(link)) == SWIFTBAR_PLUGIN:
+            print(f"already linked: {link}")
+            return 0
+        if not link.is_symlink():
+            raise jobs.JobError(f"{link} exists and is not a symlink: move it away first")
+        link.unlink()
+    link.symlink_to(SWIFTBAR_PLUGIN)
+    print(f"linked {link} -> {SWIFTBAR_PLUGIN} (SwiftBar picks it up on its next refresh)")
+    return 0
+
+
+def uninstall_swiftbar(directory=None):
+    target_dir, _ = swiftbar_dir(directory)
+    link = target_dir / SWIFTBAR_PLUGIN.name
+    if link.is_symlink():
+        link.unlink()
+        print(f"removed {link}")
+    else:
+        print(f"nothing to remove: {link} is not a symlink")
+    return 0
 
 
 def launcher_path(bin_dir=None):
@@ -327,6 +408,10 @@ def main(argv=None, host=None):
             return install_runner(args.interval, args.env, args.bin_dir)
         if args.command == "uninstall-runner":
             return uninstall_runner(args.bin_dir)
+        if args.command == "install-swiftbar":
+            return install_swiftbar(args.dir)
+        if args.command == "uninstall-swiftbar":
+            return uninstall_swiftbar(args.dir)
         if args.command == "enqueue":
             return cmd_enqueue(args, _host(host))
         return cmd_jobs(args)

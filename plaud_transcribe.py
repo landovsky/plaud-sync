@@ -2256,7 +2256,8 @@ def main():
     )
     parser.add_argument("command", nargs="?", default="process",
                         choices=["list", "process", "move", "init", "file", "enqueue", "jobs", "runner",
-                                 "install-runner", "uninstall-runner"])
+                                 "install-runner", "uninstall-runner",
+                                 "install-swiftbar", "uninstall-swiftbar"])
     parser.add_argument("extra", nargs="*",
                         help="For 'move': <file_id|dir-name|path> <project>; for 'file': <audio> ...; "
                              "for 'process': one recording (id, id prefix or title words)")
