@@ -200,7 +200,7 @@ def list_nodes(tree, config=None):
 
 # --- the one job builder ---
 
-FIELDS = ("recordings", "merge", "cuts", "instructions", "project", "push", "node", "mode", "note")
+FIELDS = ("recordings", "merge", "cuts", "instructions", "project", "push", "node", "mode", "note", "arm")
 
 
 def build_job(fields, host=None, config=None):
@@ -237,8 +237,14 @@ def build_job(fields, host=None, config=None):
     push = fields.get("push") or push
     node = fields.get("node") or node
     mode = fields.get("mode") or ("now" if node else "none")
+    extra = {}
+    if fields.get("arm"):
+        if fields.get("recordings") or fields.get("merge") or cuts:
+            raise jobs.JobError("an armed job waits for a meeting that is still running: "
+                                "it cannot also name recordings, --merge or --cut")
+        extra = {"state": "armed", "trigger": {"wispr": fields["arm"], "armed_at": jobs.now_iso()}}
 
-    job = jobs.new_job(
+    job = jobs.new_job(**extra,
         recordings=list(fields.get("recordings") or []), merge=bool(fields.get("merge")),
         cuts=cuts, instructions=fields.get("instructions") or None, project=project, push=push,
         deliver={"node": node, "mode": mode, "note": fields.get("note") or None, "ask": ask})

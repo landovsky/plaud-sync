@@ -100,7 +100,7 @@ class TestHelpNeverRunsAnything:
     """--help is how the next agent learns the recipes; it must be safe everywhere."""
 
     COMMANDS = [["enqueue"], ["jobs", "list"], ["jobs", "show", "x"], ["jobs", "cancel", "x"],
-                ["jobs", "seen", "x"], ["jobs", "retry", "x"], ["runner"], ["install-runner"],
+                ["jobs", "seen", "x"], ["jobs", "retry", "x"], ["jobs", "promote"], ["runner"], ["install-runner"],
                 ["uninstall-runner"], ["install-swiftbar"], ["uninstall-swiftbar"], ["plan"]]
 
     @pytest.mark.parametrize("argv", COMMANDS, ids=lambda a: " ".join(a))
@@ -111,6 +111,7 @@ class TestHelpNeverRunsAnything:
         monkeypatch.setattr(runner, "run_queue", boom)
         monkeypatch.setattr(runner, "load_runner_env", boom)
         monkeypatch.setattr(runner, "acquire_lock", boom)
+        monkeypatch.setattr(runner, "promote_armed", boom)
         monkeypatch.setattr(jobs_cli.subprocess, "run", boom)
         monkeypatch.setattr(jobs_cli, "install_runner", boom)
         monkeypatch.setattr(jobs_cli, "uninstall_runner", boom)

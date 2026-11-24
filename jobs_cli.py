@@ -92,6 +92,10 @@ recipes:
     plaud-transcribe enqueue --recording <id> --cut 29:16-34:55
   merge two recordings into one transcript
     plaud-transcribe enqueue --recording <a> --recording <b> --merge
+  plan before the meeting ends: arm the one that is live now (or a given Wispr uuid);
+  the runner queues it once Wispr's transcript is ready and runs it, nothing more to do
+    plaud-transcribe enqueue --arm-wispr live --project "Hřiště Hrou"
+    plaud-transcribe enqueue --arm-wispr <wispr-uuid>
   see the job without writing it
     plaud-transcribe enqueue --recording <id> --dry-run
 
@@ -100,6 +104,11 @@ defaults:
   and --push / --node override them. Without --project they stay unset and are
   resolved after classification, when the transcript is committed.
   --mode defaults to 'now' when a node is known, else 'none'.
+  --arm-wispr cannot be combined with --recording/--merge/--cut. The job is `armed`
+  until the meeting is over and transcribed by Wispr (refined, or its live transcript
+  wispr.live_fallback_minutes - 30 by default - after it ended); that can take up to that
+  long. A deleted meeting, or none ready within arm.max_hours (default 3), fails the job
+  with a notification. Plaud and Recorder recordings cannot be armed.
   Recording ids are checked for shape only; nothing is fetched at enqueue time.
   PLAUD_JOBS_DIR changes where job files go (default ~/.plaud-sync/jobs).
 """
@@ -111,6 +120,10 @@ recipes:
   plaud-transcribe jobs retry <id>          failed/held job back to queued, done steps kept
   plaud-transcribe jobs cancel <id>         only queued/failed/held/armed jobs
   plaud-transcribe jobs seen <id>           clear the warning, keep the job
+  plaud-transcribe jobs promote             check armed jobs once: queue the ones whose
+                                            meeting is ready, fail deleted/overdue ones
+                                            (the runner does this itself every minute)
+    --arm-max-hours H   give up after H hours (env PLAUD_ARM_MAX_HOURS, config arm.max_hours)
 """
 
 
@@ -169,6 +182,10 @@ def build_parser():
         epilog=ENQUEUE_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     e.add_argument("--recording", action="append", default=[], metavar="ID",
                    help="recording id (plaud id, wispr:<uuid>, recorder:<n>, local:<hex>); repeatable")
+    e.add_argument("--arm-wispr", metavar="UUID|live",
+                   help="plan before the meeting ends: wait for this Wispr meeting ('live' = the one "
+                        "being recorded now) and queue it when its transcript is ready; "
+                        "instead of --recording")
     e.add_argument("--merge", action="store_true",
                    help="treat the recordings as one session (cannot be combined with --cut)")
     e.add_argument("--cut", action="append", default=[], metavar="REC=START-END",
@@ -190,7 +207,13 @@ def build_parser():
     j = sub.add_parser("jobs", help="list and manage jobs",
                        description="List and manage job files.", epilog=JOBS_EPILOG,
                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    js = j.add_subparsers(dest="jobs_command", required=True, metavar="{list,show,retry,cancel,seen}")
+    js = j.add_subparsers(dest="jobs_command", required=True, metavar="{list,show,retry,cancel,seen,promote}")
+    pr = js.add_parser("promote", help="check armed jobs once and queue the ones whose meeting is ready",
+                       description="Run the runner's armed-job check once: ready -> queued, deleted or "
+                                   "overdue -> failed (with a notification). Does not run any job.")
+    pr.add_argument("--arm-max-hours", type=float, default=None, metavar="H",
+                    help="give up on an armed job's meeting after H hours "
+                         "(env PLAUD_ARM_MAX_HOURS; config arm.max_hours; default autocapture max_hours, 3)")
     js.add_parser("list", help="one line per job", description="One line per job, oldest first.")
     for name, text in (("show", "print one job as JSON"),
                        ("retry", "requeue a failed or held job; steps already done are kept"),
@@ -406,10 +429,22 @@ def build_enqueue_job(args, host):
             raise jobs.JobError(f"--cut must be REC=START-END, got {item!r}")
         cuts.setdefault(rec, []).append(span)
     import plan_logic   # the one place plan fields become a job (same for the plan screen)
+    arm = None
+    if getattr(args, "arm_wispr", None):
+        if args.recording or args.merge or args.cut:
+            raise jobs.JobError("--arm-wispr waits for a meeting that is still running; it cannot "
+                                "be combined with --recording, --merge or --cut")
+        arm = args.arm_wispr.removeprefix("wispr:")
+        if arm == "live":
+            row = plan_logic.live_meeting(host.load_config(), host)
+            if not row:
+                raise jobs.JobError("no Wispr meeting is live right now (is Wispr recording, and "
+                                    "wispr.enabled set?); pass --arm-wispr <uuid> to arm a known one")
+            arm = row["id"].removeprefix("wispr:")
     return plan_logic.build_job(
         {"recordings": args.recording, "merge": args.merge, "cuts": cuts,
          "instructions": args.instructions, "project": args.project, "push": args.push,
-         "node": args.node, "mode": args.mode, "note": args.note}, host=host)
+         "node": args.node, "mode": args.mode, "note": args.note, "arm": arm}, host=host)
 
 
 def cmd_enqueue(args, host):
@@ -425,12 +460,14 @@ def cmd_enqueue(args, host):
 def _summary(job):
     recs = job.get("recordings") or []
     what = recs[0] if len(recs) == 1 else f"{len(recs)} recordings"
+    if not recs and job.get("trigger"):
+        what = f"waiting for wispr:{job['trigger'].get('wispr', '?')}"
     flag = "!" if job.get("state") in ("failed", "held") and not job.get("seen") else " "
     return (f"{flag} {job['id']}  {job.get('state', '?'):<9} "
             f"{(job.get('project') or '(classifier)'):<20} {what}")
 
 
-def cmd_jobs(args):
+def cmd_jobs(args, host=None):
     if args.jobs_command == "list":
         listed = jobs.list_jobs()
         if not listed:
@@ -445,6 +482,20 @@ def cmd_jobs(args):
     elif args.jobs_command == "cancel":
         job = jobs.cancel_job(args.id)
         print(f"cancelled {job['id']}")
+    elif args.jobs_command == "promote":
+        import runner
+        lock = runner.acquire_lock()
+        if lock is None:
+            print("a runner is active; it promotes armed jobs itself before every job and at its next start")
+            return 0
+        try:
+            changes = runner.promote_armed(_host(host), max_hours=args.arm_max_hours)
+        finally:
+            lock.close()
+        if not changes:
+            print("no armed jobs")
+        for jid, state in changes:
+            print(f"{jid}: {'still armed' if state == 'armed' else state}")
     elif args.jobs_command == "seen":
         job = jobs.mark_seen(args.id)
         print(f"marked {job['id']} as seen")
@@ -520,7 +571,7 @@ def main(argv=None, host=None):
             return cmd_plan(args, _host(host))
         if args.command == "enqueue":
             return cmd_enqueue(args, _host(host))
-        return cmd_jobs(args)
+        return cmd_jobs(args, host)
     except jobs.JobError as e:
         print(f"plaud-transcribe {args.command}: {e}", file=sys.stderr)
         _notify_failure(args, str(e))

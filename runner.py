@@ -19,12 +19,19 @@ once (B9); the launchd WatchPaths re-trigger relies on that.
 """
 
 import argparse
+import contextlib
 import fcntl
+import io
+import json
+import math
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -319,17 +326,184 @@ def run_job(job, ctx):
     return "done"
 
 
+# ---------------------------------------------------------------- armed jobs (Part E)
+
+ARM_ENV = "PLAUD_ARM_MAX_HOURS"
+
+
+def arm_max_hours(config=None, flag=None):
+    """How long an armed job may wait for its meeting: --arm-max-hours, else env
+    PLAUD_ARM_MAX_HOURS, else config arm.max_hours, else the autocapture max_hours
+    (3 by default: the same "a meeting never lasts longer" bound the watcher uses)."""
+    import autocapture
+    config = config or {}
+    for raw in (flag, os.environ.get(ARM_ENV), (config.get("arm") or {}).get("max_hours")):
+        if raw not in (None, ""):
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return float(autocapture.settings(config)["max_hours"])
+
+
+def _meeting_row(config, uuid):
+    """'deleted' when the meeting has no row or isDeleted=1, 'present' when it
+    exists, None when Wispr's store cannot be read (not installed, locked, odd
+    schema: the caller waits, it never guesses)."""
+    import wispr_flow
+    db = wispr_flow.wispr_db_path(config)
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT isDeleted FROM Meetings WHERE id = ?", (uuid,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return "deleted" if row is None or row[0] else "present"
+
+
+def _last_marker(config, uuid):
+    """(marker, age in seconds of live.ndjson) for the meeting's newest
+    paused/stopped/resumed marker; (None, None) without a live transcript."""
+    import wispr_flow
+    p = wispr_flow._live_path(config, uuid)
+    try:
+        age = time.time() - p.stat().st_mtime
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        if '"marker"' not in line:
+            continue
+        try:
+            marker = json.loads(line).get("marker")
+        except json.JSONDecodeError:
+            continue
+        if marker in ("paused", "stopped", "resumed"):
+            return marker, age
+    return None, age
+
+
+def meeting_ready(config, uuid):
+    """Where a Wispr meeting stands for an armed job:
+
+    "gone"     its row is deleted (or never existed): nothing will ever arrive
+    "live"     autocapture.wispr_live_meeting says it is being recorded: still
+               running, which includes a paused-then-resumed meeting whose endedAt
+               Wispr set at the pause and never cleared (2026-11-02, E2)
+    "ready"    not live and wispr_flow.list_meetings lists it: its transcript is
+               refined, or live_fallback_minutes passed since it ended
+    "waiting"  anything else: ended but not refined yet, finalized=0, a pause that
+               may still be resumed, Wispr not installed or its store unreadable
+
+    A pause leaves the meeting looking ended, with a refined first segment, so
+    list_meetings alone would list it: while the newest marker is `paused` and the
+    live transcript changed less than live_fallback_minutes ago it stays waiting.
+    """
+    import autocapture
+    import wispr_flow
+    state = _meeting_row(config, uuid)
+    if state == "deleted":
+        return "gone"
+    if state is None or not wispr_flow.wispr_enabled(config):
+        return "waiting"
+    live = autocapture.wispr_live_meeting(config, autocapture.settings(config)["max_hours"])
+    if live and live["id"] == uuid:
+        return "live"
+    marker, age = _last_marker(config, uuid)
+    if marker == "paused" and age is not None and age < wispr_flow.live_fallback_minutes(config) * 60:
+        return "waiting"
+    days = max(2, math.ceil(arm_max_hours(config) / 24) + 1)
+    with contextlib.redirect_stderr(io.StringIO()):   # "still refining" notes would fill the runner log every minute
+        listed = wispr_flow.list_meetings(config, days)
+    return "ready" if any(m["id"] == f"wispr:{uuid}" for m in listed) else "waiting"
+
+
+def _armed_age_hours(job):
+    try:
+        armed = datetime.fromisoformat(job["trigger"]["armed_at"])
+        return (datetime.now(armed.tzinfo) - armed).total_seconds() / 3600
+    except (KeyError, TypeError, ValueError):
+        return 0.0   # no usable armed_at: do not time it out on a guess
+
+
+def _fail_armed(job, message, notify_fn):
+    jobs.set_step(job, "arm", "failed", error=message)
+    job.update(state="failed", error=message, failed_step="arm")
+    jobs.save_job(job)
+    notify_fn("Plaud armed job failed", f"{job['id']}: {message}"[:200], sound="Basso")
+
+
+def promote_armed(host, max_hours=None, notify_fn=None, say=print):
+    """Turn armed jobs whose meeting is over into queued ones. Returns
+    [(job id, "queued" | "failed" | "armed")] for the jobs it looked at.
+
+    ready -> recordings ["wispr:<uuid>"], state queued (the same runner pass runs it);
+    gone -> failed + one notification; armed longer than max_hours -> failed + one
+    notification (a meeting that never ends must not wait forever, E3);
+    live / waiting -> unchanged. Never raises: a broken store leaves jobs armed."""
+    notify_fn = notify_fn or (lambda *a, **k: notify(*a, **k))
+    armed = [j for j in jobs.list_jobs() if j.get("state") == "armed" and j.get("trigger")]
+    if not armed:
+        return []
+    try:
+        config = host.load_config(validate=False)
+    except (OSError, ValueError):
+        config = {}
+    limit = arm_max_hours(config, max_hours)
+    changes = []
+    for job in armed:
+        uuid = job["trigger"]["wispr"]
+        try:
+            status = meeting_ready(config, uuid)
+            fresh = jobs.load_job(job["id"])
+            if fresh.get("state") != "armed":     # cancelled while we looked
+                continue
+            job = fresh
+            if status == "ready":
+                job["recordings"] = [f"wispr:{uuid}"]
+                job["state"] = "queued"
+                job["trigger"]["promoted_at"] = jobs.now_iso()
+                jobs.save_job(job)
+            elif status == "gone":
+                _fail_armed(job, f"the Wispr meeting {uuid} was deleted before its transcript "
+                                 "was ready; nothing to transcribe", notify_fn)
+            elif _armed_age_hours(job) > limit:
+                _fail_armed(job, f"armed for more than {limit:g} h and meeting {uuid} never became "
+                                 f"ready ({status}); retry re-arms it, or enqueue the recording by hand",
+                            notify_fn)
+            else:
+                say(f"runner: {job['id']} still armed ({status})")
+        except Exception as e:  # noqa: BLE001  one bad job must not stop the queue
+            say(f"runner: could not check armed job {job['id']}: {type(e).__name__}: {e}")
+            continue
+        changes.append((job["id"], job["state"]))
+        if job["state"] != "armed":
+            say(f"runner: {job['id']} armed -> {job['state']}"
+                + (f" ({job['error']})" if job["state"] == "failed" else ""))
+    return changes
+
+
 def _runnable(job):
     # a job still `running` while we hold the lock was left by a crash or reboot
     return job.get("state") in ("queued", "running")
 
 
-def run_queue(host, days=DEFAULT_DAYS, once=False, only=None, say=print, deliver_plan=False):
-    """Oldest queued job first, until none is left. Returns the ids it ran."""
+def run_queue(host, days=DEFAULT_DAYS, once=False, only=None, say=print, deliver_plan=False,
+              arm_hours=None):
+    """Oldest queued job first, until none is left. Returns the ids it ran.
+    Armed jobs are promoted before each pick, so one that became ready while a long
+    job ran is run in this pass."""
     visuals.set_interactive(False)   # before anything can reach the phone prompt
     ctx = SimpleNamespace(host=host, days=days, deliver_plan=deliver_plan, notify=lambda *a, **k: notify(*a, **k))
     ran = []
     while True:
+        promote_armed(host, max_hours=arm_hours, notify_fn=ctx.notify, say=say)
         candidates = [j for j in jobs.list_jobs()
                       if _runnable(j) and j["id"] not in ran and (only is None or j["id"] == only)]
         if not candidates:
@@ -355,6 +529,8 @@ recipes:
     plaud-transcribe runner --days 90        (or config: {"runner": {"days": 90}})
   see what delivery would do, without messaging any session
     plaud-transcribe runner --deliver-plan
+  wait longer (or shorter) for an armed job's meeting before giving up
+    plaud-transcribe runner --arm-max-hours 5   (or PLAUD_ARM_MAX_HOURS=5, or config {"arm": {"max_hours": 5}})
   use another lock file (tests)
     plaud-transcribe runner --lock-file /tmp/r.lock
 
@@ -390,6 +566,17 @@ hand-off (deliver.py): `cc-tree deliver <node> -` with the work text on stdin
                                    `cc-tree deliver <node> --plan`, records its
                                    answer, never messages anything
 
+armed jobs (enqueue --arm-wispr): before every pick the runner checks each armed
+  job's Wispr meeting. Live (incl. paused-then-resumed) or still being refined: the
+  job stays armed. Ready: it becomes queued and runs in the same pass. Deleted, or
+  armed longer than the limit (default: config arm.max_hours, else
+  visuals.autocapture.max_hours, else 3 h): failed with one notification.
+  Ready = Wispr's refined transcript, or its live one wispr.live_fallback_minutes
+  (default 30) after the meeting ended, so a meeting that Wispr does not refine is
+  picked up up to that long after it ends. A meeting whose last marker is a pause
+  waits that long too, in case it is resumed. Without Wispr installed armed jobs
+  just wait for the limit. `plaud-transcribe jobs promote` does this check once.
+
 credentials:
   Started by launchd there is no shell, so at start the runner fills in what is
   missing (CLAUDE_CODE_OAUTH_TOKEN, ELEVENLABS_API_KEY, PLAUD_BEARER_TOKEN) by
@@ -415,6 +602,9 @@ def build_parser():
     p.add_argument("--days", type=int, default=None,
                    help=f"how far back to look up Plaud recordings by id "
                         f"(default: config runner.days, else {DEFAULT_DAYS})")
+    p.add_argument("--arm-max-hours", type=float, default=None, metavar="H",
+                   help="give up on an armed job's meeting after H hours "
+                        f"(env {ARM_ENV}; config arm.max_hours; default autocapture max_hours, 3)")
     p.add_argument("--deliver-plan", action="store_true",
                    help="dry-run the hand-off: `cc-tree deliver <node> --plan`, nothing is sent "
                         "(same as PLAUD_DELIVER_PLAN=1)")
@@ -448,7 +638,8 @@ def main(argv=None, host=None):
                 days = int((host.load_config(validate=False).get("runner") or {}).get("days", DEFAULT_DAYS))
             except (OSError, ValueError, TypeError):
                 days = DEFAULT_DAYS
-        run_queue(host, days=days, once=args.once, only=only, deliver_plan=args.deliver_plan)
+        run_queue(host, days=days, once=args.once, only=only, deliver_plan=args.deliver_plan,
+                  arm_hours=args.arm_max_hours)
     finally:
         lock.close()
     return 0

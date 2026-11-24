@@ -203,6 +203,13 @@ When that meeting ends and Wispr's transcript is ready (refined, or the live fal
   no further input. Tested with a recorded Wispr fixture DB.
 - E2. A paused-then-resumed meeting (the 2026-11-02 case) does not fire the job at the pause.
 - E3. An armed job whose meeting is deleted, or that never ends within `max_hours`, fails with a notification instead of waiting forever.
+_As built (K14):_ Wispr writes no distinct "ended" marker. In the last 12 real meetings
+(checked 2026-11-24), none ended on `stopped` and 3 ended on `paused`, sometimes as their only
+marker. A pause and an end therefore look alike until a later `resumed`. So an armed job whose
+meeting's last marker is `paused` waits up to `wispr.live_fallback_minutes` (default 30) before
+promotion: a quick resume keeps the meeting whole (the 2026-11-02 failure), at the cost of that
+delay for meetings that really ended on a pause.
+
 - E4. Plaud/Recorder recordings cannot be armed in this phase. The plan screen says so instead of offering it.
 
 ## Part F — SwiftBar menu (status + toggles)
@@ -460,8 +467,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K10 | F4, F6, F7 | done | `c97acae` | `swiftbar/plaud.5s.py` (pure `render`, stdlib only, no file-schema imports) + `install-swiftbar`/`uninstall-swiftbar` in jobs_cli, 31 tests in `tests/test_swiftbar_plugin.py`; uncommitted |
 | K11 | F5, D2, D9 | done | `6fd5b68` | menu actions (display toggle, pause/resume, per-job retry/log/cancel/seen, held hint) via `~/.plaud-sync/swiftbar.json` interpreter + `--notify-errors`; watcher now records `displays` while idle (`display_refresh_s`); uncommitted |
 | K12 | G1, G3 (logic) | done | `9756c4d` | `plan_logic.py` (pending_recordings, live_meeting, suggest_project, list_nodes, build_job; enqueue now builds through it), `split_pending`/`short_unseen` extracted in plaud_transcribe, fixture + tests/test_plan_logic.py; uncommitted |
-| K13 | G1, G2, G4 | done | | `plan_app.py` (one screen; default case Enter, Enter = 2 keystrokes via a one-line confirm; Esc asks once when the form was changed), `plan` with re-exec/hint, SwiftBar "Plan a transcript…" + `swiftbar.terminal_cmd`, `requirements-plan.txt`; app tests need `.venv/bin/pytest` (Homebrew run skips them); uncommitted |
-| K14 | E1, E2, E3 | pending | | Armed jobs: meeting_ready, promotion, timeouts |
+| K13 | G1, G2, G4 | done | `200540c` | `plan_app.py` (one screen; default case Enter, Enter = 2 keystrokes via a one-line confirm; Esc asks once when the form was changed), `plan` with re-exec/hint, SwiftBar "Plan a transcript…" + `swiftbar.terminal_cmd`, `requirements-plan.txt`; app tests need `.venv/bin/pytest` (Homebrew run skips them); uncommitted |
+| K14 | E1, E2, E3 | done | | `runner.meeting_ready`/`promote_armed` (run before every pick), `jobs promote`, `enqueue --arm-wispr <uuid\|live>`, `arm.max_hours`/`--arm-max-hours`/`PLAUD_ARM_MAX_HOURS`, 31 tests in `tests/test_armed_jobs.py`; a `paused` last marker holds a meeting back for live_fallback_minutes; uncommitted |
 | K15 | E4, F menu, docs | pending | | Arm entry points (enqueue/plan/menu) + final docs |
 
 ## Future work

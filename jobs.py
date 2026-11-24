@@ -6,7 +6,8 @@ launchd WatchPaths trigger or a crash never sees half a file.
 
 Fields (schema 1): id, schema, created, recordings, merge, cuts, instructions,
 project, push, deliver {node, mode, note, ask}, state, steps, result, error,
-seen. `project`, `push`, `deliver.node` and `deliver.ask` are null when the job
+seen, and for an armed job trigger {"wispr": "<uuid>", "armed_at": <iso>}
+(recordings stays empty until the runner promotes it). `project`, `push`, `deliver.node` and `deliver.ask` are null when the job
 was enqueued without a project: they resolve at the commit step from the
 project the classifier picks.
 
@@ -85,7 +86,11 @@ def validate_job(job):
     recs = job.get("recordings")
     if not isinstance(recs, list) or not all(isinstance(r, str) for r in recs):
         raise JobError("recordings must be a list of ids")
-    if not recs and not job.get("trigger"):
+    trig = job.get("trigger")
+    if trig is not None and not (isinstance(trig, dict) and isinstance(trig.get("wispr"), str)
+                                 and _REC_ID_RE.match(trig["wispr"])):
+        raise JobError('trigger must look like {"wispr": "<meeting uuid>", "armed_at": ...}')
+    if not recs and not trig:
         raise JobError("a job needs at least one recording (--recording ID)")
     for r in recs:
         if not _REC_ID_RE.match(r):
@@ -210,6 +215,16 @@ def retry_job(job_id):
     if job["state"] not in RETRYABLE:
         raise JobError(f"job {job['id']} is {job['state']}: only "
                        f"{'/'.join(RETRYABLE)} jobs can be retried")
+    if job.get("trigger") and not job.get("recordings"):
+        # An armed job that timed out or lost its meeting never got a recording:
+        # retrying means waiting for the meeting again, from now.
+        job["state"] = "armed"
+        job["trigger"]["armed_at"] = now_iso()
+        job["error"] = None
+        job.pop("failed_step", None)
+        job["steps"] = []
+        save_job(job)
+        return job
     job["state"] = "queued"
     job["error"] = None
     job.pop("failed_step", None)
