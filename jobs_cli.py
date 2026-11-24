@@ -356,32 +356,12 @@ def build_enqueue_job(args, host):
         rec, sep, span = item.partition("=")
         if not sep or not rec or not span:
             raise jobs.JobError(f"--cut must be REC=START-END, got {item!r}")
-        try:
-            host.parse_cut(span)
-        except ValueError as e:
-            raise jobs.JobError(str(e))
         cuts.setdefault(rec, []).append(span)
-
-    project = push = node = ask = None
-    if args.project:
-        try:
-            specs = host.project_specs(host.load_config())
-        except host.ConfigError as e:
-            raise jobs.JobError(f"config error: {e}")
-        if args.project not in specs:
-            raise jobs.JobError(f"unknown project {args.project!r}; configured: "
-                                + (", ".join(sorted(specs)) or "(none)"))
-        spec = specs[args.project]
-        project, push, node, ask = args.project, spec["push"], spec["node"], spec["deliver_ask"]
-    push = args.push or push
-    node = args.node or node
-    mode = args.mode or ("now" if node else "none")
-
-    job = jobs.new_job(
-        recordings=list(args.recording), merge=args.merge, cuts=cuts,
-        instructions=args.instructions, project=project, push=push,
-        deliver={"node": node, "mode": mode, "note": args.note, "ask": ask})
-    return jobs.validate_job(job)
+    import plan_logic   # the one place plan fields become a job (same for the plan screen)
+    return plan_logic.build_job(
+        {"recordings": args.recording, "merge": args.merge, "cuts": cuts,
+         "instructions": args.instructions, "project": args.project, "push": args.push,
+         "node": args.node, "mode": args.mode, "note": args.note}, host=host)
 
 
 def cmd_enqueue(args, host):

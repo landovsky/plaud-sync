@@ -1545,18 +1545,34 @@ def _process_merged(recordings, token, config, folders, projects, state, languag
 
 # --- Commands ---
 
+def short_unseen(recordings, state):
+    """Recordings never seen before that are too short to bother with (auto-skipped)."""
+    return [r for r in recordings
+            if r["id"] not in state.get("transcribed", {})
+            and r.get("duration", 0) < AUTO_SKIP_DURATION_MS]
+
+
+def split_pending(recordings, state):
+    """The one definition of "pending": (pending, incomplete).
+
+    pending = never-seen recordings first, then those transcribed but not yet
+    summarised/filed (status "transcribed"); incomplete is the second group.
+    Shared by the interactive list and the plan screen (plan_logic)."""
+    transcribed = state.get("transcribed", {})
+    incomplete = [r for r in recordings
+                  if r["id"] in transcribed and transcribed[r["id"]].get("status") == "transcribed"]
+    new = [r for r in recordings if r["id"] not in transcribed]
+    return new + incomplete, incomplete
+
+
 def auto_skip_short(recordings, state):
     skipped = 0
-    for r in recordings:
-        fid = r["id"]
-        if fid in state.get("transcribed", {}):
-            continue
-        if r.get("duration", 0) < AUTO_SKIP_DURATION_MS:
-            state.setdefault("transcribed", {})[fid] = {
-                "status": "skipped",
-                "reason": f"Auto-skipped: {r.get('duration', 0) / 1000:.0f}s < 10s",
-            }
-            skipped += 1
+    for r in short_unseen(recordings, state):
+        state.setdefault("transcribed", {})[r["id"]] = {
+            "status": "skipped",
+            "reason": f"Auto-skipped: {r.get('duration', 0) / 1000:.0f}s < 10s",
+        }
+        skipped += 1
     if skipped:
         save_state(state)
         print(f"  Auto-skipped {skipped} recording(s) under 10 seconds.")
@@ -1589,11 +1605,8 @@ def parse_indices(text, max_len):
 
 def show_pending(recordings, folders, state, config):
     """Show pending recordings list. Returns (pending, incomplete) lists."""
-    transcribed = state.get("transcribed", {})
-    incomplete = [r for r in recordings
-                  if r["id"] in transcribed and transcribed[r["id"]].get("status") == "transcribed"]
-    new = [r for r in recordings if r["id"] not in transcribed]
-    pending = new + incomplete
+    pending, incomplete = split_pending(recordings, state)
+    new = [r for r in pending if r not in incomplete]
 
     if not pending:
         print("No new recordings to process.")

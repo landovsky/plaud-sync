@@ -458,8 +458,8 @@ _Managed via `/manage feature`; updated per chunk._
 | K8 | D1-D4 | done | `de1510c` | `deliver.py` (work text, parsed outcome message/fresh/held/unknown/plan, held step state so retry re-delivers only), `runner --deliver-plan`, README stage-1 section, 34 tests in `tests/test_deliver.py` + `tests/test_runner_e2e.py`; uncommitted |
 | K9 | F1, F2, F3 | done | `5772c0a` | `displays.json` overrides (by name, mtime-cached), `display <name|n> on|off`, source column, status.json `displays` list; uncommitted |
 | K10 | F4, F6, F7 | done | `c97acae` | `swiftbar/plaud.5s.py` (pure `render`, stdlib only, no file-schema imports) + `install-swiftbar`/`uninstall-swiftbar` in jobs_cli, 31 tests in `tests/test_swiftbar_plugin.py`; uncommitted |
-| K11 | F5, D2, D9 | done | | menu actions (display toggle, pause/resume, per-job retry/log/cancel/seen, held hint) via `~/.plaud-sync/swiftbar.json` interpreter + `--notify-errors`; watcher now records `displays` while idle (`display_refresh_s`); uncommitted |
-| K12 | G1, G3 (logic) | pending | | Plan logic without UI: pending list, suggestions, build_job |
+| K11 | F5, D2, D9 | done | `6fd5b68` | menu actions (display toggle, pause/resume, per-job retry/log/cancel/seen, held hint) via `~/.plaud-sync/swiftbar.json` interpreter + `--notify-errors`; watcher now records `displays` while idle (`display_refresh_s`); uncommitted |
+| K12 | G1, G3 (logic) | done | | `plan_logic.py` (pending_recordings, live_meeting, suggest_project, list_nodes, build_job; enqueue now builds through it), `split_pending`/`short_unseen` extracted in plaud_transcribe, fixture + tests/test_plan_logic.py; uncommitted |
 | K13 | G1, G2, G4 | pending | | Textual plan screen + tests (needs venv with textual) |
 | K14 | E1, E2, E3 | pending | | Armed jobs: meeting_ready, promotion, timeouts |
 | K15 | E4, F menu, docs | pending | | Arm entry points (enqueue/plan/menu) + final docs |

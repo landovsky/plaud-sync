@@ -1,0 +1,15 @@
+# Garden Project  [garden]
+- ⏸ Plan the spring planting  #4gfd
+  - [x] Order seeds  #249f
+    - [x] compare three suppliers  #7g4k
+  - [x] Check the greenhouse heating  #7dnw
+  - [x] Measure the beds (analysis)  #3dtw
+    - [x] ❓ Raised beds or flat: which one?  #53rw
+    - [ ] 👤 Two deliveries today, one is missing, please chase  #25g4
+  - [ ] Fix the irrigation timer  #5dq4  ◆ (to define)
+    - [ ] 🔨 replace the valve  #2fw6
+  - [ ] 3. Write the planting calendar (after ❓1)  #32dc  ◆ keep it to one page  #notanid
+- Compost  #3vkb  ◆ none
+- Tool shed  #5bws  ◆ Tidy up and list what is missing …
+
+  ▣ workspace manager: [cold] ccmsg a48898 (or ccmsg garden:root) on example-host
