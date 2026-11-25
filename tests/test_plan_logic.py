@@ -233,6 +233,36 @@ class TestCcTreeNodePicker:
         assert plan_logic.list_nodes("") == [] and plan_logic.list_nodes(None) == []
 
 
+class TestTreeListForProjectsWithoutANode:
+    """A project that is a bare path names no node, so the picker must offer the trees first
+    (Tomas could not pick a node at all on 2026-11-25)."""
+
+    TREES = "garden\tGarden\t12 open\nhriste\tHřiště\t217 open\n"
+
+    def _stub(self, tmp_path, monkeypatch, body, code=0):
+        script = tmp_path / "cc-tree-stub"
+        script.write_text(f"#!/bin/bash\necho \"$@\" > {tmp_path}/argv\n{body}\nexit {code}\n")
+        script.chmod(0o755)
+        monkeypatch.setenv("CC_TREE_BIN", str(script))
+
+    def test_runs_only_the_read_only_trees_command(self, tmp_path, monkeypatch):
+        self._stub(tmp_path, monkeypatch, f"printf '{self.TREES}'")
+        assert plan_logic.list_trees() == [{"tree": "garden", "title": "Garden"},
+                                           {"tree": "hriste", "title": "Hřiště"}]
+        assert (tmp_path / "argv").read_text().strip() == "trees"
+
+    def test_a_broken_cc_tree_means_an_empty_list_not_a_crash(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CC_TREE_BIN", str(tmp_path / "nope"))
+        assert plan_logic.list_trees() == []
+        self._stub(tmp_path, monkeypatch, "echo broken", code=2)
+        assert plan_logic.list_trees() == []
+
+    def test_lines_that_are_not_tree_rows_are_skipped(self):
+        assert plan_logic.parse_trees("\nError: no repo\n  \nok\tOK\t1 open\n") == [
+            {"tree": "ok", "title": "OK"}]
+        assert plan_logic.parse_trees(None) == []
+
+
 class TestOneJobWhoeverBuildsIt:
     """`enqueue` is what scripts and SwiftBar use, the plan screen is what Tomas uses;
     a job must not depend on which one made it (G3)."""
@@ -274,7 +304,7 @@ class TestOneJobWhoeverBuildsIt:
         job = plan_logic.build_job({"recordings": ["r1"], "project": "Hriste"}, host=pt)
         assert (job["project"], job["push"]) == ("Hriste", "main")
         assert job["deliver"] == {"node": "hriste:root", "mode": "now", "note": None,
-                                  "ask": "do the backlog"}
+                                  "ask": "do the backlog", "host": None}
 
     def test_explicit_push_and_node_beat_the_project_defaults(self, env):
         write_config(env, self.PROJECTS)
@@ -291,7 +321,8 @@ class TestOneJobWhoeverBuildsIt:
     def test_no_project_leaves_everything_to_the_classifier(self, env):
         job = plan_logic.build_job({"recordings": ["r1"]}, host=pt, config={"projects": {}})
         assert job["project"] is None and job["push"] is None
-        assert job["deliver"] == {"node": None, "mode": "none", "note": None, "ask": None}
+        assert job["deliver"] == {"node": None, "mode": "none", "note": None, "ask": None,
+                                 "host": None}
 
     def test_mistakes_are_rejected_with_a_message_for_the_form(self, env):
         write_config(env, self.PROJECTS)
@@ -308,3 +339,23 @@ class TestOneJobWhoeverBuildsIt:
         write_config(env, self.PROJECTS)
         with pytest.raises(jobs.JobError, match="needs a node"):
             plan_logic.build_job({"recordings": ["r1"], "project": "Plain", "mode": "now"}, host=pt)
+
+
+class TestHandOffHostComesFromTheProjectUnlessOverridden:
+    PROJECTS = {"K": {"dir": "/x/k", "push": "main", "node": "k:1", "host": "hp-ubuntu"},
+                "L": {"dir": "/x/l", "push": "main", "node": "l:1"}}
+
+    def _build(self, **fields):
+        from types import SimpleNamespace  # noqa: F401
+        import plaud_transcribe as pt
+        return plan_logic.build_job({"recordings": ["r1"], **fields}, host=pt,
+                                    config={"projects": self.PROJECTS})
+
+    def test_the_projects_host_is_used(self):
+        assert self._build(project="K")["deliver"]["host"] == "hp-ubuntu"
+
+    def test_an_explicit_this_mac_beats_the_projects_host(self):
+        assert self._build(project="K", host="")["deliver"]["host"] == ""
+
+    def test_a_host_can_be_given_for_a_project_without_one(self):
+        assert self._build(project="L", host="hp-ubuntu")["deliver"]["host"] == "hp-ubuntu"

@@ -13,6 +13,12 @@ Keys (the footer shows them too)
   m      merge the selected recordings into one transcript     c  cut a span out of the
          (not combinable with cuts)                               highlighted recording
   p      pick the project (fuzzy)       n  pick the node (fuzzy)       x  clear the node
+  u      push: main -> pr -> none (default: the project's)
+  h      host to hand off on: this Mac -> each config deliver.hosts entry (e.g. hp-ubuntu):
+         cc-tree deliver runs there over ssh, so a fresh session starts there; needs u = main|pr
+         n with no node known (the project names none) lists the cc-tree trees first;
+         "(another tree…)" in the node list goes back to them
+         either list takes a pasted node ref (kopernici:#2vqv or kopernici:2vqv) + Enter
   a      arm: select only the highlighted row, to run its job when the meeting ends (the live
          Wispr meeting only; saving with it selected arms the job, it cannot be combined with
          other recordings, m or c)
@@ -29,6 +35,7 @@ Recipes
   first and marked "LIVE".
 """
 
+import re
 import unicodedata
 
 from textual import work
@@ -46,6 +53,16 @@ import plan_logic
 
 MODES = ("now", "later", "none")
 NONE_CHOICE = ""           # picker value for "no project" / "clear"
+SWITCH_TREE = "\x00switch-tree"   # node picker value: go back to the tree list
+SWITCH_TREE_LABEL = "(another tree…)"
+REF_HINT = "type to filter, or paste a node ref (kopernici:#2vqv)"
+
+
+def parse_node_ref(text):
+    """A pasted cc-tree node ref, "tree:id" or "tree:#id" (as cc-tree prints it), -> "tree:id";
+    anything else -> None, so the query just filters."""
+    m = re.fullmatch(r"\s*([\w.-]+):#?([0-9a-z]{3,})\s*", text or "")
+    return f"{m.group(1)}:{m.group(2)}" if m else None
 
 
 def _fold(text):
@@ -85,14 +102,16 @@ class PickerScreen(ModalScreen):
     PickerScreen OptionList { height: 1fr; }
     """
 
-    def __init__(self, title, items):
+    def __init__(self, title, items, typed=None, placeholder="type to filter"):
+        """typed: optional fn(query) -> value or None; a query it accepts (a pasted node ref)
+        is picked on Enter even when it matches no row."""
         super().__init__()
-        self._title, self._items = title, list(items)
+        self._title, self._items, self._typed, self._placeholder = title, list(items), typed, placeholder
 
     def compose(self):
         with Vertical():
             yield Label(self._title)
-            yield Input(placeholder="type to filter", id="picker-query")
+            yield Input(placeholder=self._placeholder, id="picker-query")
             yield OptionList(id="picker-list")
 
     def on_mount(self):
@@ -111,6 +130,10 @@ class PickerScreen(ModalScreen):
         self._refill(event.value)
 
     def on_input_submitted(self, event):
+        typed = self._typed(event.value) if self._typed else None
+        if typed:
+            self.dismiss(typed)
+            return
         ol = self.query_one(OptionList)
         if ol.highlighted is not None and self._shown:
             self.dismiss(self._shown[ol.highlighted][1])
@@ -196,6 +219,8 @@ class PlanApp(App):
         Binding("p", "pick_project", "Project"),
         Binding("n", "pick_node", "Node"),
         Binding("x", "clear_node", "Clear node"),
+        Binding("h", "cycle_host", "Host"),
+        Binding("u", "cycle_push", "Push"),
         Binding("a", "arm", "Arm"),
     ]
 
@@ -216,7 +241,10 @@ class PlanApp(App):
         self.project_touched = False
         self.node_override = None  # None = follow the project; "" = cleared; else a ref
         self.mode_choice = None    # None = default (now when a node is known, else none)
+        self.host_override = None  # None = the project's host; "" = this Mac; else an ssh host
+        self.push_override = None  # None = the project's push; else main|pr|none
         self.nodes_cache = {}
+        self.trees_cache = None    # `cc-tree trees`, fetched on the first n without a node
         self._discard_armed = False
 
     # --- layout ---
@@ -330,6 +358,16 @@ class PlanApp(App):
             return self.node_override or None
         return (self.specs.get(self.project) or {}).get("node") if self.project else None
 
+    def effective_host(self):
+        if self.host_override is not None:
+            return self.host_override or None
+        return (self.specs.get(self.project) or {}).get("host") if self.project else None
+
+    def effective_push(self):
+        if self.push_override:
+            return self.push_override
+        return (self.specs.get(self.project) or {}).get("push") if self.project else None
+
     def effective_mode(self):
         return self.mode_choice or ("now" if self.effective_node() else "none")
 
@@ -364,6 +402,10 @@ class PlanApp(App):
             f["project"] = self.project
         if self.node_override:
             f["node"] = self.node_override
+        if self.host_override is not None:
+            f["host"] = self.host_override
+        if self.push_override:
+            f["push"] = self.push_override
         mode = self.mode_choice or ("none" if self.node_override == "" else None)
         if mode:
             f["mode"] = mode
@@ -383,15 +425,18 @@ class PlanApp(App):
                      and r.get("source") == "wispr" and r["id"].startswith("wispr:")), None)
 
     def _refresh_labels(self):
-        spec = self.specs.get(self.project) if self.project else None
+        push = self.effective_push()
         if self.project:
-            proj = f"2. Project: {self.project}   push: {spec['push'] if spec else '?'}   (p: change)"
+            proj = f"2. Project: {self.project}   push: {push or '?'}   (p: change, u: push)"
         else:
-            proj = "2. Project: (none, the classifier routes it)   push: set after routing   (p: pick)"
+            proj = (f"2. Project: (none, the classifier routes it)   push: "
+                    f"{push or 'set after routing'}   (p: pick, u: push)")
         self.query_one("#project", Static).update(proj)
         node = self.effective_node()
+        host = self.effective_host()
         self.query_one("#node", Static).update(
-            f"3. Node: {node or '(none)'}   (n: pick from the tree, x: clear)")
+            f"3. Node: {node or '(none)'}   on: {host or 'this Mac'}   "
+            "(n: pick from the tree, x: clear, h: host)")
         want = f"mode-{self.effective_mode()}"
         with self.prevent(RadioSet.Changed):
             self.query_one(f"#{want}", RadioButton).value = True
@@ -417,7 +462,7 @@ class PlanApp(App):
 
     def check_action(self, action, parameters):
         if action in ("save", "save_now", "quit_form", "merge", "cut", "pick_project",
-                      "pick_node", "clear_node", "arm"):
+                      "pick_node", "clear_node", "arm", "cycle_host", "cycle_push"):
             if len(self.screen_stack) > 1:      # a picker is open: its own keys apply
                 return False
             # inside a text area Enter and the letters are text; only Esc and ctrl+s act
@@ -494,26 +539,55 @@ class PlanApp(App):
     def action_pick_node(self):
         tree = (self.effective_node() or "").split(":")[0]
         if not tree:
-            self._error("No tree known: choose a project that has a node first")
+            self._pick_tree()
             return
+        self._pick_node_in(tree)
+
+    def _pick_tree(self):
+        """No node known (the project names none): pick the tree first, then its node."""
+        if self.trees_cache is None:
+            self.trees_cache = plan_logic.list_trees(self.config)
+        if not self.trees_cache:
+            self._error("No cc-tree trees listed (cc-tree trees failed)")
+            return
+        items = [(f"{t['tree']}  {t['title']}", t["tree"]) for t in self.trees_cache]
+
+        def done(value):
+            if not value:
+                return
+            if ":" in value:                    # a pasted node ref
+                self._set_node(value)
+            else:
+                self._pick_node_in(value)
+        self.push_screen(PickerScreen("Tree", items, typed=parse_node_ref, placeholder=REF_HINT), done)
+
+    def _pick_node_in(self, tree):
         if tree not in self.nodes_cache:
             self.nodes_cache[tree] = plan_logic.list_nodes(tree, self.config)
         nodes = self.nodes_cache[tree]
         if not nodes:
             self._error(f"No nodes listed for {tree} (cc-tree show failed); the project's node stays")
             return
-        items = [("(clear: no hand-off)", NONE_CHOICE), (f"{tree}  (the tree itself)", tree)]
+        items = [("(clear: no hand-off)", NONE_CHOICE), (SWITCH_TREE_LABEL, SWITCH_TREE),
+                 (f"{tree}  (the tree itself)", tree)]
         items += [("  " * n["depth"] + f"{'[x] ' if n['state'] == 'done' else ''}{n['title']}  #{n['ref'].split(':')[1]}",
                    n["ref"]) for n in nodes]
 
         def done(value):
             if value is None:
                 return
-            self.node_override = value
-            self.mode_choice = None if value else "none"
-            self._error("")
-            self._refresh_labels()
-        self.push_screen(PickerScreen(f"Node in {tree}", items), done)
+            if value == SWITCH_TREE:
+                self._pick_tree()
+                return
+            self._set_node(value)
+        self.push_screen(PickerScreen(f"Node in {tree}", items, typed=parse_node_ref,
+                                      placeholder=REF_HINT), done)
+
+    def _set_node(self, value):
+        self.node_override = value
+        self.mode_choice = None if value else "none"
+        self._error("")
+        self._refresh_labels()
 
     def action_arm(self):
         """Select only the highlighted row for arming; refused for anything that is not a
@@ -530,6 +604,32 @@ class PlanApp(App):
         recs.select(row["id"])
         self.merge = False
         self.cuts.pop(row["id"], None)
+        self._error("")
+        self._refresh_labels()
+
+    def action_cycle_host(self):
+        """this Mac -> each config deliver.hosts entry (and the project's host) -> this Mac."""
+        hosts = [""] + [h for h in (self.config.get("deliver") or {}).get("hosts") or []
+                        if isinstance(h, str) and h]
+        own = (self.specs.get(self.project) or {}).get("host") if self.project else None
+        if own and own not in hosts:
+            hosts.append(own)
+        if len(hosts) == 1:
+            self._error('No other host configured: add "deliver": {"hosts": ["hp-ubuntu"]} to the config')
+            return
+        cur = self.effective_host() or ""
+        self.host_override = hosts[(hosts.index(cur) + 1) % len(hosts)] if cur in hosts else hosts[0]
+        if self.host_override and self.effective_push() in (None, "none"):
+            self._error(f"A session on {self.host_override} reads the transcript from origin: "
+                        "press u for push main or pr")
+        else:
+            self._error("")
+        self._refresh_labels()
+
+    def action_cycle_push(self):
+        order = ["main", "pr", "none"]
+        cur = self.effective_push()
+        self.push_override = order[(order.index(cur) + 1) % 3] if cur in order else order[0]
         self._error("")
         self._refresh_labels()
 
@@ -589,4 +689,6 @@ class PlanApp(App):
                  if job["project"] else "classifier-routed project (push set after routing)")
         d = job["deliver"]
         node = d["node"] or "no hand-off"
+        if d["node"] and d.get("host"):
+            node += f" on {d['host']}"
         return f"{what} \u2192 {where} \u2192 {node}, {d['mode']}"

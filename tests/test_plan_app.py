@@ -52,6 +52,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(pt.google_recorder, "list_recordings", lambda *a: [])
     monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: None)
     monkeypatch.setattr(plan_logic, "list_nodes", lambda tree, config=None: list(NODES))
+    monkeypatch.setattr(plan_logic, "list_trees", lambda config=None: [
+        {"tree": "garden", "title": "Garden"}, {"tree": "hriste", "title": "Hřiště"}])
     return tmp_path
 
 
@@ -193,6 +195,128 @@ class TestNodeOverride:
             await pilot.press("enter", "enter")
         run(scenario)
         assert len(saved_jobs()) == 1
+
+
+class TestNodeForAProjectWithoutOne:
+    """Projects configured as a bare path name no node; n must still reach every node by
+    listing the cc-tree trees first, or a hand-off can never be planned (2026-11-25)."""
+
+    def _private(self, app):
+        app.project, app.project_touched = "Private", True
+        app._refresh_labels()
+
+    def test_n_lists_the_trees_then_the_chosen_trees_nodes(self, env, monkeypatch):
+        asked = []
+        monkeypatch.setattr(plan_logic, "list_nodes",
+                            lambda tree, config=None: asked.append(tree) or list(NODES))
+
+        async def scenario(app, pilot):
+            self._private(app)
+            await pilot.press("n")
+            assert app.screen.query_one("Label").render().plain == "Tree"
+            await pilot.press(*"hriste", "enter")       # the tree
+            await pilot.press(*"release", "enter")      # its node
+            assert len(app.screen_stack) == 1
+            await pilot.press("enter", "enter")
+        run(scenario)
+        assert asked == ["hriste"]
+        (job,) = saved_jobs()
+        assert job["deliver"]["node"] == "hriste:c2d" and job["deliver"]["mode"] == "now"
+
+    def test_another_tree_goes_back_to_the_tree_list(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("n")                       # Hřiště Hrou's node: straight to nodes
+            await pilot.press(*"another tree", "enter")
+            assert app.screen.query_one("Label").render().plain == "Tree"
+            await pilot.press(*"garden", "enter")
+            assert app.screen.query_one("Label").render().plain == "Node in garden"
+        run(scenario)
+
+    def test_a_pasted_node_ref_is_taken_as_is_from_the_tree_list(self, env):
+        """Tomas knows the ref (kopernici:#2vqv, as cc-tree prints it) and pastes it where
+        only tree names are listed; it must not just filter the list down to nothing."""
+        async def scenario(app, pilot):
+            self._private(app)
+            await pilot.press("n", *"kopernici:#2vqv", "enter")
+            assert len(app.screen_stack) == 1
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["deliver"]["node"] == "kopernici:2vqv" and job["deliver"]["mode"] == "now"
+
+    def test_a_pasted_ref_also_works_in_the_node_list(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("n", *"garden:4gfd", "enter")
+            await pilot.press("enter", "enter")
+        run(scenario)
+        assert saved_jobs()[0]["deliver"]["node"] == "garden:4gfd"
+
+    def test_words_that_are_not_a_ref_still_just_filter(self):
+        assert plan_app.parse_node_ref("Tereza") is None
+        assert plan_app.parse_node_ref("hriste") is None
+        assert plan_app.parse_node_ref(" kopernici:#2vqv ") == "kopernici:2vqv"
+
+    def test_no_trees_listed_says_so_and_keeps_the_form(self, env, monkeypatch):
+        monkeypatch.setattr(plan_logic, "list_trees", lambda config=None: [])
+
+        async def scenario(app, pilot):
+            self._private(app)
+            await pilot.press("n")
+            assert len(app.screen_stack) == 1
+            assert "cc-tree trees failed" in str(app.query_one("#error", Static).render())
+        run(scenario)
+
+
+class TestHandOffHost:
+    """h picks the machine the hand-off runs on (a fresh session starts there); u sets push,
+    which a remote host needs: that session reads the transcript from origin."""
+
+    def _hosts(self, env):
+        cfg = json.loads((env / "config.json").read_text())
+        cfg["deliver"] = {"hosts": ["hp-ubuntu"]}
+        (env / "config.json").write_text(json.dumps(cfg))
+
+    def test_h_moves_the_hand_off_to_the_hp_and_the_job_says_so(self, env):
+        self._hosts(env)
+
+        async def scenario(app, pilot):
+            await pilot.press("h")
+            assert "on: hp-ubuntu" in str(app.query_one("#node", Static).render())
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["deliver"]["host"] == "hp-ubuntu" and job["push"] == "main"
+
+    def test_h_again_comes_back_to_this_mac(self, env):
+        self._hosts(env)
+
+        async def scenario(app, pilot):
+            await pilot.press("h", "h")
+            assert "on: this Mac" in str(app.query_one("#node", Static).render())
+        run(scenario)
+
+    def test_a_project_that_pushes_nothing_is_warned_and_u_turns_push_on(self, env):
+        self._hosts(env)
+
+        async def scenario(app, pilot):
+            app.project, app.project_touched = "Private", True      # push none
+            app.node_override = "hriste:c2d"
+            app._refresh_labels()
+            await pilot.press("h")
+            assert "press u" in str(app.query_one("#error", Static).render())
+            await pilot.press("u")                                     # none -> main
+            assert "push: main" in str(app.query_one("#project", Static).render())
+            await pilot.press("enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        assert job["push"] == "main" and job["deliver"]["host"] == "hp-ubuntu"
+
+    def test_no_hosts_configured_says_how_to_add_one(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("h")
+            assert "deliver" in str(app.query_one("#error", Static).render())
+            assert "on: this Mac" in str(app.query_one("#node", Static).render())
+        run(scenario)
 
 
 class TestQuittingWritesNothing:

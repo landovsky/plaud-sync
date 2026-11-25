@@ -7,6 +7,7 @@ argparse subparsers, so `--help` and `enqueue` never touch the Plaud API.
 import argparse
 import json
 import os
+import shutil
 import plistlib
 import subprocess
 import sys
@@ -25,6 +26,21 @@ DEFAULT_INTERVAL = 60
 # launchd's own PATH has none of claude, gh, cc-tree, terminal-notifier or Homebrew git
 AGENT_PATH = ["/opt/homebrew/bin", str(Path.home() / ".local" / "bin"),
               "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+# tools the runner calls; install-runner adds the folder each one is found in on the
+# installing shell's PATH (cc-tree lives in ~/.dotfiles/bin, which the fixed list lacks)
+AGENT_TOOLS = ("cc-tree", "claude", "gh", "git", "sops", "direnv", "terminal-notifier")
+
+
+def agent_path(which=shutil.which):
+    """The fixed PATH plus the folder of every AGENT_TOOLS tool found now, in that order."""
+    dirs = list(AGENT_PATH)
+    for tool in AGENT_TOOLS:
+        found = which(tool)
+        if found:
+            d = str(Path(found).parent)
+            if d not in dirs:
+                dirs.append(d)
+    return os.pathsep.join(dirs)
 
 LAUNCHER_NAME = "plaud-transcribe-runner"   # what macOS Login Items shows for the agent
 DEFAULT_BIN_DIR = Path.home() / ".plaud-sync" / "bin"
@@ -96,12 +112,15 @@ recipes:
   the runner queues it once Wispr's transcript is ready and runs it, nothing more to do
     plaud-transcribe enqueue --arm-wispr live --project "Hřiště Hrou"
     plaud-transcribe enqueue --arm-wispr <wispr-uuid>
+  hand it to a node whose session lives on the HP (a fresh one starts there, not here)
+    plaud-transcribe enqueue --recording <id> --project "Koperníci ops" --push main \
+        --node kopernici:2vqv --host hp-ubuntu
   see the job without writing it
     plaud-transcribe enqueue --recording <id> --dry-run
 
 defaults:
   With --project, push / node / deliver_ask come from that project in the config
-  and --push / --node override them. Without --project they stay unset and are
+  and --push / --node / --host override them. Without --project they stay unset and are
   resolved after classification, when the transcript is committed.
   --mode defaults to 'now' when a node is known, else 'none'.
   --arm-wispr cannot be combined with --recording/--merge/--cut. The job is `armed`
@@ -208,6 +227,9 @@ def build_parser():
                    help="main | pr | none; default: the project's push mode")
     e.add_argument("--node", help="cc-tree ref to hand the transcript to (tree or tree:id); "
                                   "default: the project's node")
+    e.add_argument("--host", help="ssh host to hand off on, e.g. hp-ubuntu: cc-tree deliver runs "
+                                  "there, so a fresh session starts there (needs push main|pr); "
+                                  "'local' = this Mac; default: the project's host")
     e.add_argument("--mode", choices=jobs.DELIVER_MODES,
                    help="now: hand over and start processing; later: tell the node it is waiting; "
                         "none: no hand-off (default: now if a node is known, else none)")
@@ -392,7 +414,7 @@ def runner_plist(interval_s, extra_env=(), launcher=None):
         "WatchPaths": [str(jobs.JOBS_DIR)],
         "StartInterval": int(interval_s),
         "WorkingDirectory": str(REPO_DIR),   # the summarizer reads only below its cwd
-        "EnvironmentVariables": {"PATH": os.pathsep.join(AGENT_PATH), **carried_env(extra_env)},
+        "EnvironmentVariables": {"PATH": agent_path(), **carried_env(extra_env)},
         "ProcessType": "Background",
         "StandardOutPath": "/dev/null",
         "StandardErrorPath": str(RUNNER_LOG),
@@ -458,7 +480,8 @@ def build_enqueue_job(args, host):
     return plan_logic.build_job(
         {"recordings": args.recording, "merge": args.merge, "cuts": cuts,
          "instructions": args.instructions, "project": args.project, "push": args.push,
-         "node": args.node, "mode": args.mode, "note": args.note, "arm": arm, "arm_title": arm_title}, host=host)
+         "node": args.node, "host": ("" if getattr(args, "host", None) == "local" else getattr(args, "host", None)),
+         "mode": args.mode, "note": args.note, "arm": arm, "arm_title": arm_title}, host=host)
 
 
 def cmd_enqueue(args, host):

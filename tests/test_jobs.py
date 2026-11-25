@@ -101,7 +101,7 @@ class TestProjectDefaults:
         job = jobs.list_jobs()[0]
         assert job["project"] == "Hriste" and job["push"] == "pr"
         assert job["deliver"] == {"node": "hriste:root", "mode": "now", "note": None,
-                                  "ask": "process it"}
+                                  "ask": "process it", "host": None}
 
     def test_flags_override_the_project_defaults(self, env, capsys):
         _config(env, {"Hriste": HRISTE})
@@ -254,3 +254,25 @@ class TestDispatchBeforeNetwork:
             pt.main()
         out = capsys.readouterr().out
         assert "enqueue" in out and "jobs" in out
+
+
+class TestHandOffHost:
+    """A host other than this Mac means the session there reads the transcript from origin."""
+
+    def _job(self, **deliver):
+        job = jobs.new_job(recordings=["r1"], push=deliver.pop("push", "main"),
+                           deliver={"node": "t:1", "mode": "now", "note": None, "ask": None, **deliver})
+        return job
+
+    def test_a_remote_host_with_push_none_is_refused_up_front(self):
+        with pytest.raises(jobs.JobError, match="push must be main or pr"):
+            jobs.validate_job(self._job(host="hp-ubuntu", push="none"))
+
+    def test_a_host_that_is_not_a_name_is_refused(self):
+        for bad in ("hp ubuntu", "-oProxyCommand=x", 5):
+            with pytest.raises(jobs.JobError):
+                jobs.validate_job(self._job(host=bad))
+
+    def test_empty_means_this_mac_and_is_fine_with_any_push(self):
+        jobs.validate_job(self._job(host="", push="none"))
+        jobs.validate_job(self._job(host="hp-ubuntu"))

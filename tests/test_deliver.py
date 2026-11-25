@@ -371,3 +371,76 @@ class TestDryRunNeverMessagesASession:
         host = SimpleNamespace(load_config=lambda validate=True: {})
         runner.main(["--deliver-plan", "--lock-file", str(tmp_path / "l")], host=host)
         assert seen["deliver_plan"] is True
+
+
+class TestHandOffOnAnotherMachine:
+    """cc-tree on the Mac starts a fresh session on the Mac. On 2026-11-25 a node whose
+    session lives on the HP got a new Mac session instead; a job can now name the host the
+    hand-off runs on, and cc-tree runs there over ssh (a stub ssh here, nothing leaves)."""
+
+    @pytest.fixture
+    def ssh(self, tmp_path, monkeypatch):
+        log = tmp_path / "ssh.log"
+        script = tmp_path / "ssh-stub"
+        script.write_text(f"""#!{sys.executable}
+import json, sys
+stdin = "" if "--plan" in sys.argv[-1] else sys.stdin.read()
+open({str(log)!r}, "a").write(json.dumps([sys.argv[1:], stdin]) + "\\n")
+sys.stdout.write({STARTED!r})
+""")
+        script.chmod(0o755)
+        monkeypatch.setenv("PLAUD_DELIVER_SSH", str(script))
+        return lambda: [tuple(json.loads(l)) for l in log.read_text().splitlines()] if log.exists() else []
+
+    def test_cc_tree_runs_on_the_host_in_its_login_shell_with_the_work_on_stdin(self, repo, ssh, cc_tree):
+        job, ctx = pushed(repo)
+        job["deliver"]["host"] = "hp-ubuntu"
+
+        assert deliver.step_deliver(job, ctx) == "done"
+
+        (argv, stdin), = ssh()
+        assert argv[:4] == ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+        assert argv[4] == "hp-ubuntu"
+        assert argv[5] == "zsh -lc 'cc-tree deliver tree/1 -'"   # ~/.dotfiles/bin is on PATH only there
+        assert "New transcript: Weekly" in stdin
+        assert cc_tree.calls() == []                              # nothing ran on this machine
+        assert job["result"]["delivered"]["host"] == "hp-ubuntu"
+        assert job["result"]["delivered"]["outcome"] == "fresh"
+
+    def test_the_session_there_is_told_to_pull_because_the_files_are_on_origin_only(self, repo):
+        job, _ = pushed(repo)
+        job["deliver"]["host"] = "hp-ubuntu"
+        assert "pull" in deliver.build_work_text(job)
+        job["deliver"]["host"] = None
+        assert "pull" not in deliver.build_work_text(job)
+
+    def test_nothing_pushed_means_no_remote_hand_off_the_session_could_not_read_it(self, repo, ssh):
+        job, ctx = pushed(repo)
+        job["push"] = "none"           # e.g. a classifier-routed job whose project pushes nothing
+        job["deliver"]["host"] = "hp-ubuntu"
+
+        with pytest.raises(deliver.DeliverError, match="needs the transcript on origin"):
+            deliver.step_deliver(job, ctx)
+        assert ssh() == []
+
+    def test_this_machines_own_name_or_local_runs_cc_tree_here(self, monkeypatch):
+        monkeypatch.setattr(deliver.socket, "gethostname", lambda: "Toms-MBP.local")
+        for h in (None, "", "local", "localhost", "toms-mbp", "Toms-MBP.local"):
+            assert not deliver.is_remote(h), h
+        assert deliver.is_remote("hp-ubuntu")
+
+    def test_an_unreachable_host_fails_the_step_with_a_retry_hint(self, repo, tmp_path, monkeypatch):
+        bad = tmp_path / "ssh-down"
+        bad.write_text("#!/bin/sh\necho 'ssh: connect to host hp-ubuntu: timed out' >&2\nexit 255\n")
+        bad.chmod(0o755)
+        monkeypatch.setenv("PLAUD_DELIVER_SSH", str(bad))
+        job, ctx = pushed(repo)
+        job["deliver"]["host"] = "hp-ubuntu"
+
+        with pytest.raises(deliver.DeliverError, match="ssh to hp-ubuntu failed.*jobs retry"):
+            deliver.step_deliver(job, ctx)
+
+    def test_remote_shell_and_binary_are_config_knobs(self):
+        argv = deliver.remote_argv("box", ["deliver", "a:b", "-"],
+                                   {"deliver": {"remote_shell": "bash -lc", "remote_bin": "/opt/cc-tree"}})
+        assert argv[-1] == "bash -lc '/opt/cc-tree deliver a:b -'"

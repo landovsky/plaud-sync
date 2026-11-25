@@ -114,7 +114,7 @@ def save_state(state):
 
 
 def project_specs(config):
-    """Full per-project settings: {name: {dir, push, node, hints, deliver_ask}}.
+    """Full per-project settings: {name: {dir, push, node, host, hints, deliver_ask}}.
 
     A `projects` value is either a path string (the original form: push "none",
     no node) or an object with `dir` plus optional `push` (main|pr|none),
@@ -139,7 +139,7 @@ def project_specs(config):
         push = value.get("push", "none")
         if push not in PUSH_MODES:
             raise ConfigError(f"project '{name}': push must be main|pr|none, got {push!r}")
-        for key in ("node", "hints", "deliver_ask"):
+        for key in ("node", "host", "hints", "deliver_ask"):
             if value.get(key) is not None and not isinstance(value[key], str):
                 raise ConfigError(f"project '{name}': {key} must be a string")
         hints = value.get("hints") or top_hints.get(name)
@@ -147,6 +147,7 @@ def project_specs(config):
             "dir": d,
             "push": push,
             "node": value.get("node") or None,
+            "host": value.get("host") or None,
             "hints": hints if isinstance(hints, str) and hints.strip() else None,
             "deliver_ask": value.get("deliver_ask") or None,
         }
@@ -2249,6 +2250,10 @@ config: projects  (~/.plaud-sync/config.json)
                PR from a branch, or only write files. Other values are
                rejected when the config loads, naming the project.
   node         default cc-tree ref ("tree" or "tree:id") to hand transcripts to
+  host         ssh host to hand off on (e.g. "hp-ubuntu"): cc-tree deliver runs there over
+               ssh, so a session live there is messaged and a fresh one starts there.
+               Needs push main|pr (that session reads the transcript from origin).
+               Unset = this Mac.
   hints        topic keywords for classification (also read from "project_hints")
   deliver_ask  default "process it" request sent to the node; a note given
                when planning a job overrides it
