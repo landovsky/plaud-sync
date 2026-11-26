@@ -198,9 +198,35 @@ def list_nodes(tree, config=None):
         return []
 
 
+def parse_trees(text):
+    """`cc-tree trees` lines ("slug<TAB>title<TAB>N open") -> [{tree, title}]; junk skipped."""
+    trees = []
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        slug = parts[0].strip()
+        if not slug or not re.fullmatch(r"[\w.-]+", slug):
+            continue
+        trees.append({"tree": slug, "title": parts[1].strip() if len(parts) > 1 else slug})
+    return trees
+
+
+def list_trees(config=None):
+    """Every cc-tree tree, for picking a node when the project names none; [] on any failure.
+    Runs only the read-only `cc-tree trees`."""
+    try:
+        out = subprocess.run([deliver.bin_path(config), "trees"], capture_output=True,
+                             text=True, timeout=NODES_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return parse_trees(out.stdout)
+
+
 # --- the one job builder ---
 
-FIELDS = ("recordings", "merge", "cuts", "instructions", "project", "push", "node", "mode", "note", "arm", "arm_title")
+FIELDS = ("recordings", "merge", "cuts", "instructions", "project", "push", "node", "host", "mode",
+          "note", "arm", "arm_title")
 
 
 def build_job(fields, host=None, config=None):
@@ -225,7 +251,7 @@ def build_job(fields, host=None, config=None):
                 raise jobs.JobError(str(e))
         cuts[rec] = list(spans)
 
-    project = push = node = ask = None
+    project = push = node = ask = host_ = None
     if fields.get("project"):
         try:
             specs = host.project_specs(config if config is not None else host.load_config())
@@ -236,8 +262,11 @@ def build_job(fields, host=None, config=None):
                                 + (", ".join(sorted(specs)) or "(none)"))
         spec = specs[fields["project"]]
         project, push, node, ask = fields["project"], spec["push"], spec["node"], spec["deliver_ask"]
+        host_ = spec.get("host")
     push = fields.get("push") or push
     node = fields.get("node") or node
+    if "host" in fields and fields["host"] is not None:
+        host_ = fields["host"]               # "" = this Mac, overriding the project's host
     mode = fields.get("mode") or ("now" if node else "none")
     extra = {}
     if fields.get("arm"):
@@ -252,5 +281,6 @@ def build_job(fields, host=None, config=None):
     job = jobs.new_job(**extra,
         recordings=list(fields.get("recordings") or []), merge=bool(fields.get("merge")),
         cuts=cuts, instructions=fields.get("instructions") or None, project=project, push=push,
-        deliver={"node": node, "mode": mode, "note": fields.get("note") or None, "ask": ask})
+        deliver={"node": node, "mode": mode, "note": fields.get("note") or None, "ask": ask,
+                 "host": host_})
     return jobs.validate_job(job)

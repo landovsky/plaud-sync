@@ -18,15 +18,29 @@ What `cc-tree deliver` prints on success (cc_tree_deliver.py `cmd`, last lines):
 Exit codes: 0 sent/started/held; 9 refused (node closed, nothing sent); 1/2/3-7 failures.
 Any other stdout on exit 0 is "unknown": the raw text is kept and the step is still done.
 
+On another machine (job deliver.host, from the project's "host" or `enqueue --host`):
+
+    ssh -o BatchMode=yes <host> zsh -lc 'cc-tree deliver <node> -'
+
+cc-tree runs there, so a session live on that machine is messaged and a missing one starts
+there (cc-tree on the Mac starts fresh sessions on the Mac). That session reads the transcript
+from origin: the job must push (main|pr) and the work text says to pull first.
+
 Knobs
   CC_TREE_BIN            the cc-tree binary (default config deliver.bin, else `cc-tree`)
   PLAUD_DELIVER_TIMEOUT  seconds to wait for cc-tree (default 180); config deliver.timeout
   PLAUD_DELIVER_PLAN=1   or `runner --deliver-plan`: run `<bin> deliver <node> --plan`
                          instead; its answer is recorded as outcome "plan", nothing is sent.
+  config deliver.remote_shell   how ssh runs cc-tree on the host (default "zsh -lc": a login
+                         shell, where ~/.dotfiles/bin and claude are on PATH)
+  config deliver.remote_bin     cc-tree on the host (default "cc-tree")
+  PLAUD_DELIVER_SSH      the ssh binary (default "ssh")
 """
 
 import os
 import re
+import shlex
+import socket
 import subprocess
 from pathlib import Path
 
@@ -49,6 +63,24 @@ def _cfg(config):
 
 def bin_path(config=None):
     return os.environ.get("CC_TREE_BIN") or _cfg(config).get("bin") or DEFAULT_BIN
+
+
+def is_remote(host):
+    """True when host names another machine (not empty, "local" or this machine's name)."""
+    if not host or host in ("local", "localhost"):
+        return False
+    me = socket.gethostname().lower()
+    return host.lower() not in (me, me.split(".")[0])
+
+
+def remote_argv(host, args, config=None):
+    """ssh argv that runs `<remote_bin> <args>` on host in its login shell."""
+    cfg = _cfg(config)
+    shell = shlex.split(cfg.get("remote_shell") or "zsh -lc")
+    inner = " ".join(shlex.quote(a) for a in [cfg.get("remote_bin") or "cc-tree", *args])
+    ssh = os.environ.get("PLAUD_DELIVER_SSH") or "ssh"
+    return [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host,
+            " ".join(shlex.quote(p) for p in [*shell, inner])]
 
 
 def timeout_s(config=None):
@@ -126,6 +158,8 @@ def build_work_text(job):
                 commit += f"  PR: {pr}"
             lines.append(commit)
         blocks.append("\n".join(lines))
+    if is_remote(deliver.get("host")):
+        blocks.append("Pushed to origin from the Mac: pull (or fetch the PR branch) before reading.")
     if deliver.get("mode") == "later":
         tail = LATER_LINE
     else:
@@ -149,12 +183,16 @@ def parse_outcome(stdout):
     return "unknown", None
 
 
-def run_cc_tree(args, text=None, config=None, run=subprocess.run):
+def run_cc_tree(args, text=None, config=None, run=subprocess.run, host=None):
     bin_ = bin_path(config)
+    argv = remote_argv(host, args, config) if is_remote(host) else [bin_, *args]
+    where = f" on {host}" if is_remote(host) else ""
     try:
-        proc = run([bin_, *args], input=text, capture_output=True, text=True,
+        proc = run(argv, input=text, capture_output=True, text=True,
                    timeout=timeout_s(config))
     except FileNotFoundError:
+        if where:
+            raise DeliverError(f"ssh not found ({argv[0]!r}); `jobs retry` re-delivers")
         raise DeliverError(f"cc-tree not found ({bin_!r}): install it or set CC_TREE_BIN / "
                            "config deliver.bin; the transcript is pushed, `jobs retry` re-delivers")
     except subprocess.TimeoutExpired:
@@ -163,19 +201,22 @@ def run_cc_tree(args, text=None, config=None, run=subprocess.run):
         raise DeliverError(f"cc-tree could not run: {type(e).__name__}: {e}"[:500])
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip() or "no output"
-        raise DeliverError(f"cc-tree deliver exited {proc.returncode}: {msg}"[:500])
+        if where and proc.returncode == 255:
+            raise DeliverError(f"ssh to {host} failed: {msg}; `jobs retry` re-delivers"[:500])
+        raise DeliverError(f"cc-tree deliver{where} exited {proc.returncode}: {msg}"[:500])
     return proc.stdout or ""
 
 
 def deliver(job, text, config=None, plan=False, run=subprocess.run):
     """Hand the work over (or ask what would happen); returns the result.delivered dict."""
-    node = job["deliver"]["node"]
+    node, host = job["deliver"]["node"], job["deliver"].get("host")
+    extra = {"host": host} if is_remote(host) else {}
     if plan:
-        stdout = run_cc_tree(["deliver", node, "--plan"], None, config, run)
-        return {"outcome": "plan", "id": None, "raw": stdout.strip()[:500]}
-    stdout = run_cc_tree(["deliver", node, "-"], text, config, run)
+        stdout = run_cc_tree(["deliver", node, "--plan"], None, config, run, host)
+        return {"outcome": "plan", "id": None, "raw": stdout.strip()[:500], **extra}
+    stdout = run_cc_tree(["deliver", node, "-"], text, config, run, host)
     outcome, held_id = parse_outcome(stdout)
-    return {"outcome": outcome, "id": held_id, "raw": stdout.strip()[:500]}
+    return {"outcome": outcome, "id": held_id, "raw": stdout.strip()[:500], **extra}
 
 
 def step_deliver(job, ctx, checkpoint=None):
@@ -188,6 +229,10 @@ def step_deliver(job, ctx, checkpoint=None):
         config = ctx.host.load_config(validate=False)
     except (AttributeError, OSError, ValueError):
         config = {}
+    host = d.get("host")
+    if is_remote(host) and job.get("push") == "none":
+        raise DeliverError(f"hand-off on {host} needs the transcript on origin, but this job "
+                           "pushes nothing: set push main|pr for the project (or --push) and re-plan")
     plan = plan_mode(ctx)
     delivered = deliver(job, build_work_text(job), config, plan)
     job.setdefault("result", {})["delivered"] = delivered

@@ -60,6 +60,18 @@ class TestRunnerStartsWithoutATerminal:
                   "/usr/sbin", "/sbin"):
             assert d in path
 
+    def test_tools_outside_the_fixed_path_are_found_where_the_installing_shell_finds_them(self):
+        """cc-tree lives in ~/.dotfiles/bin; launchd's fixed PATH missed it and a job's
+        hand-off failed with 'cc-tree not found' (2026-11-25)."""
+        found = {"cc-tree": "/Users/x/.dotfiles/bin/cc-tree", "claude": "/opt/homebrew/bin/claude"}
+        path = jobs_cli.agent_path(which=found.get).split(os.pathsep)
+        assert path[:len(jobs_cli.AGENT_PATH)] == jobs_cli.AGENT_PATH   # fixed list first
+        assert "/Users/x/.dotfiles/bin" in path
+        assert path.count("/opt/homebrew/bin") == 1                    # no duplicates
+
+    def test_a_tool_missing_now_just_adds_nothing(self):
+        assert jobs_cli.agent_path(which=lambda t: None) == os.pathsep.join(jobs_cli.AGENT_PATH)
+
     def test_log_goes_to_a_file_and_stdout_is_discarded(self, agent, tmp_path):
         jobs_cli.main(["install-runner"], host=pt)
         p = self.plist(tmp_path)

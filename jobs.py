@@ -32,6 +32,7 @@ JOBS_DIR = Path(os.environ.get("PLAUD_JOBS_DIR") or "~/.plaud-sync/jobs").expand
 
 # Plaud ids are opaque tokens, others are "wispr:<uuid>", "recorder:<n>", "local:<hex>".
 _REC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]*$")
+_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]*")
 _CUT_RE = re.compile(r"^\d+(:\d+){0,2}-\d+(:\d+){0,2}$")
 
 
@@ -61,7 +62,7 @@ def new_job(**fields):
         "instructions": None,
         "project": None,
         "push": None,
-        "deliver": {"node": None, "mode": "none", "note": None, "ask": None},
+        "deliver": {"node": None, "mode": "none", "note": None, "ask": None, "host": None},
         "state": "queued",
         "steps": [],
         "result": {"paths": [], "commits": [], "pr": None, "delivered": None},
@@ -117,6 +118,15 @@ def validate_job(job):
     if deliver["mode"] != "none" and job.get("project") and not deliver.get("node"):
         raise JobError(f"deliver mode '{deliver['mode']}' needs a node, and project "
                        f"{job['project']!r} has none: pass --node or use --mode none")
+    host = deliver.get("host")
+    if host is not None and not isinstance(host, str):
+        raise JobError(f"deliver.host must be an ssh host name, got {host!r}")
+    if host:                                 # None: the project's (or this Mac); "": this Mac
+        if not isinstance(host, str) or not _HOST_RE.fullmatch(host):
+            raise JobError(f"deliver.host {host!r} is not an ssh host name")
+        if job.get("push") == "none":
+            raise JobError(f"hand-off on {host}: the session there reads the transcript from "
+                           "origin, so push must be main or pr (not none)")
     return job
 
 

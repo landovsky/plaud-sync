@@ -471,6 +471,25 @@ _Managed via `/manage feature`; updated per chunk._
 | K14 | E1, E2, E3 | done | `03604bb` | `runner.meeting_ready`/`promote_armed` (run before every pick), `jobs promote`, `enqueue --arm-wispr <uuid\|live>`, `arm.max_hours`/`--arm-max-hours`/`PLAUD_ARM_MAX_HOURS`, 31 tests in `tests/test_armed_jobs.py`; a `paused` last marker holds a meeting back for live_fallback_minutes; uncommitted |
 | K15 | E4, F menu, docs | done | | plan screen arms the live row (build_job `arm` + `arm_title`), `plan --arm-live`, `a` key refuses non-Wispr rows, menu 'Arm current meeting...' fed by status.json `meeting` {id,title}, armed jobs read '⏳ … waiting for <title> to end', README recipe; uncommitted |
 
+## Follow-ups after first live use (2026-11-25)
+
+- **Node picker without a project node.** `n` lists `cc-tree trees` first, then the
+  chosen tree's nodes; "(another tree…)" goes back; a pasted ref (`kopernici:#2vqv`) is
+  taken as is in either list.
+- **cc-tree not found under launchd.** The runner's PATH lacked `~/.dotfiles/bin`.
+  `install-runner` now appends the folder of each tool it finds (cc-tree, claude, gh,
+  git, sops, direnv, terminal-notifier) to the fixed list.
+- **Hand-off host.** A job with no live session got a fresh session on the Mac although
+  the node had run on the HP (the Mac's cc-tree did not see the HP session). New
+  `deliver.host` (project `host`, `enqueue --host`, plan screen `h`; hosts offered from
+  config `deliver.hosts`): the runner runs `ssh <host> zsh -lc 'cc-tree deliver <node> -'`,
+  so a session there is messaged and a missing one starts there. A remote host needs
+  push main|pr (refused at enqueue, failed at deliver otherwise); the work text says to
+  pull. Plan screen `u` cycles push. Knobs: `deliver.remote_shell` (default `zsh -lc`),
+  `deliver.remote_bin` (default `cc-tree`), `PLAUD_DELIVER_SSH`.
+- **Open, in cc-tree (not this repo):** the Mac's `cc-tree deliver` reported "no session"
+  for `kopernici:2vqv` while the HP had one live; its cross-machine binding view missed it.
+
 ## Future work
 
 _(out-of-scope proposals from implementation are logged here)_

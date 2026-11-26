@@ -121,6 +121,8 @@ def resolve(job, results, specs):
     if spec:
         deliver["node"] = deliver.get("node") or spec["node"]
         deliver["ask"] = deliver.get("ask") or spec["deliver_ask"]
+        if deliver.get("host") is None:
+            deliver["host"] = spec.get("host")
     elif not job.get("project"):
         deliver["mode"] = "none"
     job.setdefault("result", {})["project"] = project

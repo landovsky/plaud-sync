@@ -18,7 +18,7 @@ class TestExistingConfigsKeepWorking:
     def test_a_string_project_never_pushes_so_upgrading_cannot_start_publishing(self):
         spec = pt.project_specs(_config(projects={"A": "~/a"}))["A"]
 
-        assert spec == {"dir": "~/a", "push": "none", "node": None,
+        assert spec == {"dir": "~/a", "push": "none", "node": None, "host": None,
                         "hints": None, "deliver_ask": None}
 
     def test_folder_mapping_fallback_still_feeds_projects_and_skips_null_folders(self):
@@ -32,10 +32,11 @@ class TestObjectFormProject:
 
     def test_all_keys_are_read_from_the_object(self):
         config = _config(projects={"H": {"dir": "~/h", "push": "pr", "node": "hriste:root",
+                                         "host": "hp-ubuntu",
                                          "hints": "BOM", "deliver_ask": "pull action items"}})
 
         assert pt.project_specs(config)["H"] == {
-            "dir": "~/h", "push": "pr", "node": "hriste:root",
+            "dir": "~/h", "push": "pr", "node": "hriste:root", "host": "hp-ubuntu",
             "hints": "BOM", "deliver_ask": "pull action items"}
 
     def test_get_projects_flattens_to_dir_so_expanduser_stays_at_the_use_site(self):
