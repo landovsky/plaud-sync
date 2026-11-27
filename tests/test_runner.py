@@ -523,3 +523,23 @@ class TestWisprOnlyJobNeedsNoPlaud:
         (env.tmp / "cfg").mkdir()
         run_all()
         assert jobs.load_job(job["id"])["state"] == "done"
+
+
+class TestFailuresReachTheRunnerLog:
+    """launchd sends the runner's stdout to /dev/null, so a job that failed in
+    preflight left nothing in runner.log: only the notification said why."""
+
+    def test_a_failed_job_writes_its_error_and_the_credential_status_to_stderr(self, env, monkeypatch, capsys):
+        def no_key(*a, **k):
+            raise runner.PreflightError("missing before start: ELEVENLABS_API_KEY")
+        monkeypatch.setattr(runner, "preflight", no_key)
+        job = make_job(recordings=["call:20261127-112757"])
+        run_all(env_status="env: imported CLAUDE_CODE_OAUTH_TOKEN")
+        err = capsys.readouterr().err
+        assert f"{job['id']} -> failed at preflight: missing before start: ELEVENLABS_API_KEY" in err
+        assert "[env: imported CLAUDE_CODE_OAUTH_TOKEN]" in err
+
+    def test_a_job_that_succeeds_adds_nothing_so_the_log_stays_readable(self, env, capsys):
+        make_job()
+        run_all(env_status="env: stubbed")
+        assert capsys.readouterr().err == ""

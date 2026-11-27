@@ -490,8 +490,11 @@ def promote_armed(host, max_hours=None, notify_fn=None, say=print):
             continue
         changes.append((job["id"], job["state"]))
         if job["state"] != "armed":
-            say(f"runner: {job['id']} armed -> {job['state']}"
-                + (f" ({job['error']})" if job["state"] == "failed" else ""))
+            line = (f"runner: {job['id']} armed -> {job['state']}"
+                    + (f" ({job['error']})" if job["state"] == "failed" else ""))
+            say(line)
+            if job["state"] == "failed":
+                log_line(line)
     return changes
 
 
@@ -500,11 +503,19 @@ def _runnable(job):
     return job.get("state") in ("queued", "running")
 
 
+def log_line(msg, stream=None):
+    """One timestamped line on stderr, which launchd appends to runner.log (stdout
+    goes to /dev/null there, so `say` lines are visible only on a terminal)."""
+    print(f"{datetime.now().astimezone().isoformat(timespec='seconds')} {msg}",
+          file=stream or sys.stderr, flush=True)
+
+
 def run_queue(host, days=DEFAULT_DAYS, once=False, only=None, say=print, deliver_plan=False,
-              arm_hours=None):
+              arm_hours=None, env_status=None, log=log_line):
     """Oldest queued job first, until none is left. Returns the ids it ran.
     Armed jobs are promoted before each pick, so one that became ready while a long
-    job ran is run in this pass."""
+    job ran is run in this pass. A job that ends failed or held is also written
+    with `log` (stderr -> runner.log), with its error and the credential status."""
     visuals.set_interactive(False)   # before anything can reach the phone prompt
     ctx = SimpleNamespace(host=host, days=days, deliver_plan=deliver_plan, notify=lambda *a, **k: notify(*a, **k))
     ran = []
@@ -517,7 +528,12 @@ def run_queue(host, days=DEFAULT_DAYS, once=False, only=None, say=print, deliver
         job = candidates[0]
         say(f"runner: {job['id']} ({job.get('state')})")
         ran.append(job["id"])
-        say(f"runner: {job['id']} -> {run_job(job, ctx)}")
+        state = run_job(job, ctx)
+        say(f"runner: {job['id']} -> {state}")
+        if state in ("failed", "held"):
+            where = f" at {job['failed_step']}" if state == "failed" and job.get("failed_step") else ""
+            log(f"runner: {job['id']} -> {state}{where}: {job.get('error')}"
+                + (f" [{env_status}]" if env_status else ""))
         if once or only:
             break
     return ran
@@ -593,6 +609,16 @@ credentials:
                                  other command printing NUL-separated KEY=VALUE
     PLAUD_RUNNER_CLAUDE_LOGIN=1  accept a logged-in `claude` instead of the token
   Before any paid call a job whose credentials are missing fails naming them.
+  The .envrc must export every one of those names: if it pulls keys out of a
+  shared sops file with grep, list ELEVENLABS_API_KEY there too, or call jobs
+  fail with "missing before start: ELEVENLABS_API_KEY" under launchd while
+  working from a shell that has the key. Check it the way launchd sees it:
+    env -i HOME=$HOME PATH=/opt/homebrew/bin:/usr/bin:/bin SOPS_AGE_KEY_FILE=... \
+      direnv exec <repo> env -0 | tr '\0' '\n' | cut -d= -f1
+
+log: ~/.plaud-sync/runner.log gets stderr only. Every job that ends failed or
+  held (and an armed job that fails) adds one timestamped line there with its
+  error and the credential status ("env: imported ...").
   Wispr-only jobs need no ElevenLabs key and no Plaud token.
 """
 
@@ -638,7 +664,8 @@ def main(argv=None, host=None):
             cfg = host.load_config(validate=False)
         except (OSError, ValueError):
             cfg = {}
-        print("runner: " + load_runner_env(cfg))
+        env_status = load_runner_env(cfg)
+        print("runner: " + env_status)
         days = args.days
         if days is None:
             try:
@@ -646,7 +673,7 @@ def main(argv=None, host=None):
             except (OSError, ValueError, TypeError):
                 days = DEFAULT_DAYS
         run_queue(host, days=days, once=args.once, only=only, deliver_plan=args.deliver_plan,
-                  arm_hours=args.arm_max_hours)
+                  arm_hours=args.arm_max_hours, env_status=env_status)
     finally:
         lock.close()
     return 0
