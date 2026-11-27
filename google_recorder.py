@@ -52,6 +52,14 @@ _STAMP_RE = re.compile(
 )
 
 
+CONFIG_HELP = """\
+config: recorder  (Google Recorder on a Pixel, read over adb)
+    "recorder": {"enabled": true, "adb": "adb"}
+  enabled  list Recorder recordings as recorder:<datetaken> rows (default false)
+  adb      adb binary (default "adb"; also used by "calls")
+"""
+
+
 def _cfg(config):
     return config.get("recorder") or {}
 

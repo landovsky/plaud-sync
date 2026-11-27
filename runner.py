@@ -38,6 +38,7 @@ from types import SimpleNamespace
 import deliver
 import jobs
 import publish
+import sources
 from autocapture import notify  # module-level, dependency-free: reused, not copied
 import visuals
 
@@ -45,8 +46,8 @@ STEPS = ("transcribe", "commit", "push", "deliver")
 DONE_STEPS = ("done", "skipped")
 DEFAULT_DAYS = 30
 REPO_DIR = Path(__file__).resolve().parent
-REQUIRED_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ELEVENLABS_API_KEY", "PLAUD_BEARER_TOKEN")
-NON_PLAUD_PREFIXES = ("wispr:", "recorder:", "local:")
+# claude for every job, plus whatever any source may need (sources.SOURCES[].env)
+REQUIRED_ENV = ("CLAUDE_CODE_OAUTH_TOKEN",) + sources.all_env()
 LOCK_FILE = Path(os.environ.get("PLAUD_RUNNER_LOCK") or "~/.plaud-sync/runner.lock").expanduser()
 
 
@@ -123,8 +124,10 @@ def load_runner_env(config=None, environ=None, run=subprocess.run):
     return "env: imported " + (", ".join(imported) if imported else "nothing")
 
 
-def _is_plaud(rec_id):
-    return not rec_id.startswith(NON_PLAUD_PREFIXES)
+def _job_sources(ids):
+    """The registry entries a job's ids belong to; UnknownSource for a prefix no
+    source owns (it used to be taken for a Plaud id and failed on the Plaud API)."""
+    return {sources.source_for_id(i).name for i in ids}
 
 
 def preflight(job, config=None, environ=None):
@@ -136,20 +139,23 @@ def preflight(job, config=None, environ=None):
       Claude keychain cannot be checked without a paid call, so the token is
       required, unless PLAUD_RUNNER_CLAUDE_LOGIN=1 says "trust the CLI's own login".
       The `claude` binary must also be on PATH (launchd's PATH is short).
-    - ELEVENLABS_API_KEY: every recording but Wispr ones is transcribed there.
-    - PLAUD_BEARER_TOKEN (or config "token", as get_token does): Plaud ids only."""
+    - the rest comes from each source in the registry (sources.Source.env): ElevenLabs
+      for every source with audio (all but Wispr), the Plaud token (or config
+      "token", as get_token allows) for Plaud ids only. An unknown id prefix fails here."""
     environ = os.environ if environ is None else environ
     ids = job.get("recordings") or []
+    try:
+        needed = sources.needs_env(ids)
+    except sources.UnknownSource as e:
+        raise PreflightError(str(e)) from None
     missing = []
     if not environ.get("CLAUDE_CODE_OAUTH_TOKEN") and environ.get("PLAUD_RUNNER_CLAUDE_LOGIN") != "1":
         missing.append("CLAUDE_CODE_OAUTH_TOKEN (or PLAUD_RUNNER_CLAUDE_LOGIN=1 for a logged-in claude)")
     if not shutil.which("claude", path=environ.get("PATH")):
         missing.append("`claude` CLI on PATH")
-    if any(not i.startswith("wispr:") for i in ids) and not environ.get("ELEVENLABS_API_KEY"):
-        missing.append("ELEVENLABS_API_KEY")
-    if any(_is_plaud(i) for i in ids) and not environ.get("PLAUD_BEARER_TOKEN") \
-            and not (config or {}).get("token"):
-        missing.append("PLAUD_BEARER_TOKEN (or 'token' in the config)")
+    for var, alt in needed:
+        if not environ.get(var) and not (alt and (config or {}).get(alt)):
+            missing.append(f"{var} (or '{alt}' in the config)" if alt else var)
     if missing:
         raise PreflightError("missing before start: " + "; ".join(missing)
                              + " - the runner loads them via direnv (see `runner --help`)")
@@ -166,17 +172,17 @@ def _token(pt):
 
 def _resolve_recordings(ids, recordings):
     """Recording dicts for the job's ids, in the job's order. The listing is the
-    only place ids turn into dicts (plaud, wispr:, recorder:); `local:` ids are a
+    only place ids turn into dicts (plaud, wispr:, recorder:, call:); `local:` ids are a
     content hash of a file on disk, so they cannot be found again from the id."""
     by_id = {r["id"]: r for r in recordings}
     found, missing = [], []
     for rid in ids:
         (found if rid in by_id else missing).append(by_id.get(rid) or rid)
     if missing:
-        local = [m for m in missing if m.startswith("local:")]
-        if local:
-            raise RuntimeError(f"cannot resolve {', '.join(local)}: local files are not "
-                               "listed; run `plaud-transcribe file <audio>` instead")
+        unlisted = [m for m in missing if sources.source_for_id(m).lister is None]
+        if unlisted:
+            raise RuntimeError(f"cannot resolve {', '.join(unlisted)}: "
+                               f"{sources.source_for_id(unlisted[0]).unlisted_hint}")
         raise RuntimeError(f"recording(s) not found: {', '.join(missing)} - not in the "
                            "listing for the last days; raise --days / config runner.days")
     return found
@@ -186,16 +192,16 @@ def step_transcribe(job, ctx, checkpoint=None):
     pt = ctx.host
     config = pt.load_config()
     projects = pt.get_projects(config)
-    if any(_is_plaud(i) for i in job["recordings"]):
+    # List only the sources the job's ids come from: a job without Plaud ids
+    # needs no Plaud token and makes no Plaud call (K4 gap), a call-only job
+    # doesn't open Wispr's store.
+    needed = _job_sources(job["recordings"])
+    if sources.PLAUD.name in needed:
         token = _token(pt)
-        listing = pt.list_all_recordings(token, config, ctx.days)
         folders = pt.fetch_folders(token, config)
     else:
-        # Wispr / recorder / local only: their listers read the local store or the
-        # phone, so no Plaud token and no Plaud API call (K4 gap).
         token, folders = None, {}
-        listing = pt.wispr_flow.list_meetings(config, ctx.days) \
-            + pt.google_recorder.list_recordings(config, ctx.days)
+    listing = sources.list_recordings(pt, config, ctx.days, token, only=needed)
     recordings = _resolve_recordings(job["recordings"], listing)
     language = config.get("language", "cs")
     project = job.get("project")

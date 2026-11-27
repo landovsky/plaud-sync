@@ -235,7 +235,7 @@ class TestTranscribeStep:
                 {"id": "plaud:bbb", "source": "plaud", "filename": "B", "start_time": 2}]
         monkeypatch.setattr(runner, "STEP_FUNCS", {**runner.STEP_FUNCS, "transcribe": runner.step_transcribe})
         monkeypatch.setattr(pt, "get_token", lambda: "tok")
-        monkeypatch.setattr(pt, "list_all_recordings", lambda t, c, d: order.append(("list", d)) or recs)
+        monkeypatch.setattr(pt, "list_recordings", lambda t, c, d: order.append(("list", d)) or recs)
         monkeypatch.setattr(pt, "fetch_folders", lambda t, c: {})
         monkeypatch.setattr(pt, "get_projects", lambda c: {"P": "/tmp/p"})
         monkeypatch.setattr(pt, "prefetch_phone_files",

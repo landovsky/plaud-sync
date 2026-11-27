@@ -127,7 +127,7 @@ defaults:
   until the meeting is over and transcribed by Wispr (refined, or its live transcript
   wispr.live_fallback_minutes - 30 by default - after it ended); that can take up to that
   long. A deleted meeting, or none ready within arm.max_hours (default 3), fails the job
-  with a notification. Plaud and Recorder recordings cannot be armed.
+  with a notification. Plaud, Recorder and call recordings cannot be armed.
   Recording ids are checked for shape only; nothing is fetched at enqueue time.
   PLAUD_JOBS_DIR changes where job files go (default ~/.plaud-sync/jobs).
 """
@@ -211,7 +211,7 @@ def build_parser():
         description="Write a job file. Nothing is transcribed here; the runner does that.",
         epilog=ENQUEUE_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     e.add_argument("--recording", action="append", default=[], metavar="ID",
-                   help="recording id (plaud id, wispr:<uuid>, recorder:<n>, local:<hex>); repeatable")
+                   help="recording id (plaud id, wispr:<uuid>, recorder:<n>, call:<YYYYMMDD-HHMMSS>, local:<hex>); repeatable")
     e.add_argument("--arm-wispr", metavar="UUID|live",
                    help="plan before the meeting ends: wait for this Wispr meeting ('live' = the one "
                         "being recorded now) and queue it when its transcript is ready; "
