@@ -44,6 +44,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import google_recorder
+import phone_calls
+import sources
 import wispr_flow
 import visuals
 
@@ -255,22 +257,17 @@ def list_recordings(token, config, days):
 
 
 def list_all_recordings(token, config, days):
-    """Plaud recordings plus (if enabled) local Wispr Flow meetings and Google
-    Recorder recordings on a USB-connected phone, merged into one newest-first
-    list. All sources share the same recording shape, so the rest of the
-    pipeline treats them uniformly. Wispr and Recorder reads are best-effort and
-    never block the Plaud path."""
-    recordings = list_recordings(token, config, days)
-    recordings += wispr_flow.list_meetings(config, days)
-    recordings += google_recorder.list_recordings(config, days)
-    recordings.sort(key=lambda r: r.get("start_time", 0), reverse=True)
-    return recordings
+    """Every source in the registry (sources.SOURCES): Plaud plus, if enabled, Wispr
+    Flow meetings, Google Recorder recordings and exported phone calls, merged into
+    one newest-first list. All sources share the same recording shape, so the rest
+    of the pipeline treats them uniformly. A Plaud failure stops the run; the other
+    sources are best-effort inside their own listers."""
+    return sources.list_recordings(sys.modules[__name__], config, days, token)
 
 
 def source_label(recording):
     """Provider name, shown as its own column in list output."""
-    return {"wispr": "Wispr", "local": "Local", "recorder": "Phone"}.get(
-        recording.get("source"), "Plaud")
+    return sources.label(recording)
 
 
 def fetch_folders(token, config):
@@ -353,18 +350,21 @@ def probe_duration_ms(path):
 
 def obtain_audio(recording, token, config, step_prefix):
     """Return the audio path for a recording: the file itself for local audio,
-    the Recorder file pulled off the phone, otherwise the cached or freshly
-    downloaded Plaud mp3."""
-    if recording.get("source") == "local":
+    the Recorder file or call export pulled off the phone, otherwise the cached or
+    freshly downloaded Plaud mp3."""
+    src = sources.of(recording)
+    if src.name == "local":
         audio_path = Path(recording["_local_path"])
         size_mb = audio_path.stat().st_size / 1024 / 1024
         print(f"  {step_prefix} Local audio ({size_mb:.1f} MB)")
         return audio_path
-    if recording.get("source") == "recorder":
-        print(f"  {step_prefix} Recorder audio from phone...", end=" ", flush=True)
-        audio_path = google_recorder.pull(recording, config, AUDIO_DIR)
+    if src.pull:
+        print(f"  {step_prefix} {src.origin} audio from phone...", end=" ", flush=True)
+        audio_path = src.pull(recording, config, AUDIO_DIR)
         print(f"{audio_path.stat().st_size / 1024 / 1024:.1f} MB")
         return audio_path
+    if src is not sources.PLAUD:
+        raise RuntimeError(f"{recording['id']}: the {src.name} source has no audio to fetch")
     file_id = recording["id"]
     cached = list(AUDIO_DIR.glob(f"{file_id}.*"))
     if cached:
@@ -968,7 +968,7 @@ def write_outputs(classification, recording_meta, raw_transcript_text, output_di
         "source": source,
     }
     # Keep the source's native id under a source-specific key.
-    id_key = {"wispr": "wispr_id", "local": "local_id", "recorder": "recorder_id"}.get(source, "plaud_id")
+    id_key = sources.get(source).id_key
     front_matter[id_key] = recording_meta.get("file_id")
     # Surface the one-off steering in the document itself: reading a summary
     # months later, "why is this so BOM-heavy?" should be answerable in place.
@@ -1191,6 +1191,7 @@ def _process_recording(recording, token, config, folders, projects, state, langu
                        extra_instructions=None, cuts=None, forced_project=None):
     file_id = recording["id"]
     source = recording.get("source", "plaud")
+    src = sources.get(source)
     filename = recording.get("filename", "untitled")
     start_ms = recording.get("start_time", 0)
     dt = local_dt(start_ms, config)
@@ -1207,14 +1208,13 @@ def _process_recording(recording, token, config, folders, projects, state, langu
         "duration": duration,
         "folder": folder_name,
         "start_time": start_ms,
-        **({"source_path": recording["_local_path"]} if source == "local" else {}),
-        **({"source_path": recording["_recorder"]["path"]} if source == "recorder" else {}),
+        **({"source_path": src.path_of(recording)} if src.path_of else {}),
         **({"cuts": [format_cut(c) for c in cuts]} if cuts else {}),
         **({"transcript_from": "wispr-live"} if wispr_info.get("transcript_from") == "live" else {}),
     }
 
-    origin = {"wispr": "Wispr Flow", "local": recording.get("_local_path"),
-              "recorder": "Google Recorder"}.get(source) or folder_name or "—"
+    origin = ((folder_name or "—") if src is sources.PLAUD
+              else recording.get("_local_path") if source == "local" else src.origin)
     print(f"\n{'='*60}")
     print(f"  {filename}")
     print(f"  {date_str} · {format_duration(duration)} · {origin}")
@@ -1285,6 +1285,10 @@ def _process_recording(recording, token, config, folders, projects, state, langu
             "First-hand notes from the recording's owner. Treat as authoritative context "
             "and reflect them in the summary where relevant.\n\n" + user_notes
         )
+    # e.g. for a call: who, which way, and which stretch of the call was recorded
+    source_ctx = sources.summary_context(recording, local_tz(config))
+    if source_ctx:
+        summarize_input += f"\n\n{source_ctx}"
     classification = claude_summarize(summarize_input, recording_meta, projects, language,
                                       want_clean=(source != "wispr"),
                                       extra_instructions=with_visual_instructions(
@@ -1441,8 +1445,8 @@ def _process_merged(recordings, token, config, folders, projects, state, languag
     (merged_work_dir / "merged_transcript.txt").write_text(combined_transcript, encoding="utf-8")
 
     folder_name = get_folder_name(first, folders)
-    sources = {r.get("source", "plaud") for r in recordings}
-    merged_source = sources.pop() if len(sources) == 1 else "plaud"
+    kinds = {r.get("source", "plaud") for r in recordings}
+    merged_source = kinds.pop() if len(kinds) == 1 else "plaud"
     recording_meta = {
         "file_id": file_ids[0].split(":", 1)[-1],
         "source": merged_source,
@@ -1468,6 +1472,10 @@ def _process_merged(recordings, token, config, folders, projects, state, languag
     print(f"  [{step}/{step_total}] Classifying & summarizing merged session via Claude...", end=" ", flush=True)
     summarize_input = (f"{combined_transcript}\n\n{visual_ctx}" if visual_ctx
                        else combined_transcript)
+    for i, rec in enumerate(recordings):
+        part_ctx = sources.summary_context(rec, local_tz(config))
+        if part_ctx:
+            summarize_input += "\n\n" + part_ctx.replace("## ", f"## Part {i + 1} · ", 1)
 
     classification = claude_summarize(summarize_input, recording_meta, projects, language,
                                       want_clean=(merged_source != "wispr"),
@@ -1789,7 +1797,7 @@ def merged_work_dir_for(recordings):
 
 def prefetch_phone_files(selected, merge, config):
     """Copy everything this run needs from the phone before anything else runs:
-    Google Recorder audio, then the phone photos of every transcript.
+    Google Recorder audio and call exports, then the phone photos of every transcript.
 
     Per recording, the phone used to be needed twice — audio at the start,
     photos after transcription (minutes of ElevenLabs) — and again for every
@@ -1798,7 +1806,7 @@ def prefetch_phone_files(selected, merge, config):
     A failed audio pull is only a warning here: the recording's own step retries
     it and reports the error in context.
     """
-    recorder = [r for r in selected if r.get("source") == "recorder"]
+    recorder = [r for r in selected if sources.of(r).on_phone]
     photos = visuals.enabled(config) and visuals.phone_dirs(config)
     if not (recorder or photos):
         return
@@ -1813,10 +1821,10 @@ def prefetch_phone_files(selected, merge, config):
 
     used = False
     if recorder:
-        header()   # Recorder rows are only listed when the phone was found
+        header()   # Recorder and call rows are only listed when the phone was found
     for rec in recorder:
         try:
-            path = google_recorder.pull(rec, config, AUDIO_DIR)
+            path = sources.of(rec).pull(rec, config, AUDIO_DIR)
             used = True
             print(f"    {rec.get('filename', 'untitled')}: audio "
                   f"{path.stat().st_size / 1024 / 1024:.1f} MB")
@@ -2215,10 +2223,7 @@ EXAMPLE_CONFIG = {
         "data_dir": "~/Library/Application Support/Wispr Flow",
         "keep_wispr_summary": True,
     },
-    "recorder": {
-        "enabled": False,
-        "adb": "adb",
-    },
+    **sources.example_config(),   # "recorder", "calls"
 }
 
 
@@ -2270,7 +2275,7 @@ def main():
         prog="plaud-transcribe",
         description="Download, transcribe, classify and summarize Plaud recordings",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=CONFIG_HELP,
+        epilog=CONFIG_HELP + "\n" + sources.config_help(),
     )
     parser.add_argument("command", nargs="?", default="process",
                         choices=["list", "process", "move", "init", "file", "enqueue", "jobs", "runner",

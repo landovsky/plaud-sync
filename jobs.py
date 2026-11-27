@@ -30,7 +30,8 @@ DELIVER_MODES = ("now", "later", "none")
 
 JOBS_DIR = Path(os.environ.get("PLAUD_JOBS_DIR") or "~/.plaud-sync/jobs").expanduser()
 
-# Plaud ids are opaque tokens, others are "wispr:<uuid>", "recorder:<n>", "local:<hex>".
+# Plaud ids are opaque tokens, others are "wispr:<uuid>", "recorder:<n>",
+# "call:<YYYYMMDD-HHMMSS>", "local:<hex>".
 _REC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]*$")
 _HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]*")
 _CUT_RE = re.compile(r"^\d+(:\d+){0,2}-\d+(:\d+){0,2}$")

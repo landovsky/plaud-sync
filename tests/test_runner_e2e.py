@@ -38,7 +38,7 @@ def world(tmp_path, monkeypatch, repo, cc_tree):
     recs = [{"id": "plaud:aaa", "source": "plaud", "filename": "Weekly", "start_time": 1},
             {"id": "plaud:bbb", "source": "plaud", "filename": "Retro", "start_time": 2}]
     monkeypatch.setattr(pt, "get_token", lambda: "tok")
-    monkeypatch.setattr(pt, "list_all_recordings", lambda t, c, d: recs)
+    monkeypatch.setattr(pt, "list_recordings", lambda t, c, d: recs)
     monkeypatch.setattr(pt, "fetch_folders", lambda t, c: {})
     monkeypatch.setattr(pt, "prefetch_phone_files", lambda *a: None)
 

@@ -31,7 +31,8 @@ its title, the node and mode follow the project.
 Recipes
   more days of recordings: plaud-transcribe plan --days 60
   plan it during the meeting: `plaud-transcribe plan --arm-live` (the menu's "Arm current meeting...")
-  a recording of another source (Wispr/phone) shows in the same list; the live Wispr meeting is
+  a recording of another source (Wispr, Recorder, an exported phone call) shows in the same
+  list ("calls": {"enabled": true} in the config for calls); the live Wispr meeting is
   first and marked "LIVE".
 """
 
@@ -420,7 +421,7 @@ class PlanApp(App):
 
     def _live_selected(self, ids):
         """The selected live Wispr row, or None. Only a live Wispr meeting can be armed (E4):
-        Plaud and Recorder rows never are, whatever their flags say."""
+        Plaud, Recorder and call rows never are, whatever their flags say."""
         return next((r for r in self.rows if r["id"] in ids and r.get("live")
                      and r.get("source") == "wispr" and r["id"].startswith("wispr:")), None)
 
@@ -591,13 +592,13 @@ class PlanApp(App):
 
     def action_arm(self):
         """Select only the highlighted row for arming; refused for anything that is not a
-        live Wispr meeting (E4: Plaud / Recorder upload times are unknown)."""
+        live Wispr meeting (E4: Plaud / Recorder / call upload times are unknown)."""
         recs = self.query_one("#recs", SelectionList)
         if recs.highlighted is None or not self.rows:
             return
         row = self.rows[recs.highlighted]
         if not self._live_selected([row["id"]]):
-            self._error("Only a live Wispr meeting can be armed (Plaud and Recorder recordings "
+            self._error("Only a live Wispr meeting can be armed (Plaud, Recorder and call recordings "
                         "have no known upload time); this row can be saved as a normal job")
             return
         recs.deselect_all()

@@ -23,6 +23,7 @@ import subprocess
 
 import deliver
 import jobs
+import sources
 
 SUGGEST_THRESHOLD = 0.5   # Dice overlap of title tokens; below it there is no suggestion
 SUGGEST_HISTORY = 10      # past titles per project taken into account
@@ -52,21 +53,10 @@ class Pending(list):
 
 
 def _list_sources(token, config, days, host, notes):
-    """Like host.list_all_recordings, but a Plaud failure (offline, expired token, which
-    exits the process) costs only the Plaud rows and leaves a note."""
-    recs = []
-    try:
-        recs += host.list_recordings(token, config, days)
-    except (Exception, SystemExit) as e:   # plaud_get exits on a 401
-        notes.append(f"Plaud not reachable ({type(e).__name__}: {e}); showing local recordings only")
-    for label, fn in (("Wispr", host.wispr_flow.list_meetings),
-                      ("Recorder", host.google_recorder.list_recordings)):
-        try:
-            recs += fn(config, days)
-        except Exception as e:  # noqa: BLE001  best-effort sources
-            notes.append(f"{label} not readable ({type(e).__name__}: {e})")
-    recs.sort(key=lambda r: r.get("start_time", 0), reverse=True)
-    return recs
+    """The same listing as `list` (sources.list_recordings), but a failing source
+    (Plaud offline, an expired token, which exits the process) costs only its rows
+    and leaves a note."""
+    return sources.list_recordings(host, config, days, token, notes=notes)
 
 
 def pending_recordings(token, config, state, days, host=None):
@@ -283,4 +273,9 @@ def build_job(fields, host=None, config=None):
         cuts=cuts, instructions=fields.get("instructions") or None, project=project, push=push,
         deliver={"node": node, "mode": mode, "note": fields.get("note") or None, "ask": ask,
                  "host": host_})
+    for rid in job["recordings"]:
+        try:
+            sources.source_for_id(rid)
+        except sources.UnknownSource as e:
+            raise jobs.JobError(str(e)) from None
     return jobs.validate_job(job)

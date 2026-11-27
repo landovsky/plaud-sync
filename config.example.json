@@ -27,6 +27,11 @@
     "enabled": false,
     "adb": "adb"
   },
+  "calls": {
+    "enabled": false,
+    "dir": "/storage/emulated/0/Download",
+    "match_slack_s": 5
+  },
   "visuals": {
     "enabled": false,
     "screenshot_dirs": [

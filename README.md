@@ -233,7 +233,7 @@ recordings cannot be armed at all. With no live meeting, `plan --arm-live` says 
 | Command | Description |
 |---------|-------------|
 | `process` *(default)* | Interactively select and process recordings |
-| `list` | Show recordings, their status (✓ done · ~ incomplete · – skipped · blank pending), and where each processed recording's output landed. Local [Wispr Flow](#wispr-flow-meetings) meetings and [Google Recorder](#google-recorder-pixel-phone) recordings appear here too, in a `Plaud`/`Wispr`/`Phone` provider column |
+| `list` | Show recordings, their status (✓ done · ~ incomplete · – skipped · blank pending), and where each processed recording's output landed. Local [Wispr Flow](#wispr-flow-meetings) meetings, [Google Recorder](#google-recorder-pixel-phone) recordings and exported [phone calls](#phone-calls-pixel-phone-app) appear here too, in a `Plaud`/`Wispr`/`Phone`/`Call` provider column |
 | `move <ref> <project>` | Move an already-processed recording to a different project |
 | `file <audio> …` | Process [local audio files](#local-audio-files) (no Plaud account needed) |
 | `init` | Write a starter config to `~/.plaud-sync/config.json` |
@@ -424,6 +424,25 @@ The Pixel **Recorder** app saves every recording to the phone's shared storage (
 - **Title**: the date stamp is dropped (the date is already in the output path), so `Oct 14 at 09_51 hh Šárka obchodní` becomes `hh Šárka obchodní`.
 - **Identity** is MediaStore's `datetaken`, so renaming a recording on the phone doesn't make it look new. Outputs carry `source: recorder`, a `recorder_id`, and the on-phone `source_path`.
 - No phone, no `adb`, or an unauthorised phone just prints a note and lists no `Phone` rows. The other sources are never blocked.
+
+---
+
+## Phone calls (Pixel Phone app)
+
+The Pixel Phone app keeps call recordings in its private storage, which `adb` can't read. Export each call you want with the app's **Share → Files**: it lands in `/sdcard/Download/YYYY-MM-DD HH.MM.SS.m4a`. With the phone connected, `list`, `process`, `plan` and the runner show those exports as `Call` rows, titled `Call · <contact or number> · <in|out>` from the phone's call log.
+
+```json
+{
+  "calls": { "enabled": true }
+}
+```
+
+- Optional keys: `dir` (default `/storage/emulated/0/Download`), `pattern` (regex for the export names, group 1 = the stamp), `match_slack_s` (default 5). `adb` is shared with `recorder`. All of them are listed in `plaud-transcribe --help`.
+- **Identity** is the stamp in the file name: `call:20261126-090907`. Sharing the same call again (`… (1).m4a`) gives the same id, and it is listed once.
+- **Start time.** The stamp is when the *call* started. The recording can start later, so its start is MediaStore's `datetaken` (the recording's end) minus its duration. Screenshots and photos are anchored against that.
+- **Who.** The call whose call-log `date` matches the stamp (within `match_slack_s`) gives the contact name (or the number) and the direction. With no match the row is still listed, as `Call · <stamp>`. The summarizer is told who was on the line and which stretch of the call was recorded.
+- Outputs carry `source: call`, a `call_id`, and the on-phone `source_path`. The audio is copied off the phone with the Recorder audio and photos, before transcription starts.
+- No phone, no `adb`, or an unauthorised phone prints one note and lists no `Call` rows. The other sources carry on.
 
 ---
 
@@ -699,6 +718,7 @@ Downloaded audio is cached under `docs/audio/` and intermediate transcripts unde
 | `process_bookmarks` | transcribe | `true` to inline device bookmarks into the transcript (default off — see [Bookmarks](#bookmarks-device-marks)) |
 | `wispr` | transcribe | Ingest local [Wispr Flow](#wispr-flow-meetings) meetings: `{ "enabled": true, "data_dir": "~/…/Wispr Flow", "keep_wispr_summary": true, "live_fallback_minutes": 30 }` (default off) |
 | `recorder` | transcribe | List and pull [Google Recorder](#google-recorder-pixel-phone) recordings from a USB-connected Pixel: `{ "enabled": true, "adb": "adb" }` (default off) |
+| `calls` | transcribe | List and pull [phone call](#phone-calls-pixel-phone-app) exports from `/sdcard/Download`: `{ "enabled": true, "dir": "…", "pattern": "…", "match_slack_s": 5 }` (default off) |
 | `visuals` | transcribe | Attach screenshots and phone photos taken during the recording — see [Meeting visuals](#meeting-visuals) (default off) |
 | `timezone` | both | IANA tz for the Plaud API (default `Europe/Prague`) |
 | `token` | both | Optional: Plaud token here instead of the env var |
