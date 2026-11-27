@@ -4,6 +4,8 @@
 transcribes anything: its only write is jobs.save_job() on Enter, and quitting writes nothing
 (spec G2). The runner picks the job up. Every field goes through plan_logic.build_job, the same
 builder `enqueue` uses, so a job from here equals one from `enqueue` with the same values (G3).
+This file only draws and handles keys: loading, arm eligibility, host choices, the job's
+defaults and every save rule live in plan_logic, so another surface can reuse them.
 
 Keys (the footer shows them too)
   Enter  show a one-line summary; Enter again saves the job and exits, printing its id   (inside a text area Enter is a newline;
@@ -36,9 +38,6 @@ Recipes
   first and marked "LIVE".
 """
 
-import re
-import unicodedata
-
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -59,37 +58,8 @@ SWITCH_TREE_LABEL = "(another tree…)"
 REF_HINT = "type to filter, or paste a node ref (kopernici:#2vqv)"
 
 
-def parse_node_ref(text):
-    """A pasted cc-tree node ref, "tree:id" or "tree:#id" (as cc-tree prints it), -> "tree:id";
-    anything else -> None, so the query just filters."""
-    m = re.fullmatch(r"\s*([\w.-]+):#?([0-9a-z]{3,})\s*", text or "")
-    return f"{m.group(1)}:{m.group(2)}" if m else None
-
-
-def _fold(text):
-    """Lower-cased, diacritics removed, so "hriste" finds "Hřiště"."""
-    return "".join(c for c in unicodedata.normalize("NFKD", str(text).lower())
-                   if not unicodedata.combining(c))
-
-
-def fuzzy_filter(query, items):
-    """items: [(label, value)] whose label holds every word of the query (diacritics ignored)."""
-    words = _fold(query).split()
-    return [(label, value) for label, value in items if all(w in _fold(label) for w in words)]
-
-
-class _OfflineHost:
-    """Delegates to the real module, but the Plaud list fails at once instead of hitting the
-    network when there is no token."""
-
-    def __init__(self, host):
-        self._host = host
-
-    def __getattr__(self, name):
-        return getattr(self._host, name)
-
-    def list_recordings(self, *a, **k):
-        raise RuntimeError("no Plaud token")
+parse_node_ref = plan_logic.parse_node_ref
+fuzzy_filter = plan_logic.fuzzy_filter
 
 
 class PickerScreen(ModalScreen):
@@ -277,43 +247,8 @@ class PlanApp(App):
 
     @work(thread=True, exclusive=True)
     def load(self):
-        data = self._gather()
+        data = plan_logic.load_plan_data(self.host, self.days, arm_live=self.arm_live)
         self.call_from_thread(self._loaded, data)
-
-    def _gather(self):
-        host, notes = self.host, []
-        try:
-            config = host.load_config()
-        except Exception as e:  # noqa: BLE001  ConfigError, bad JSON, unreadable file
-            config = {}
-            notes.append(f"config not usable ({type(e).__name__}: {e}); no projects offered")
-        try:
-            state = host.load_state()
-        except Exception as e:  # noqa: BLE001
-            state = {"downloaded": {}, "transcribed": {}}
-            notes.append(f"state not readable ({type(e).__name__}: {e})")
-        token, source_host = None, host
-        try:
-            token = host.get_token()
-        except SystemExit:
-            notes.append("No Plaud token (PLAUD_BEARER_TOKEN); showing local recordings only")
-            source_host = _OfflineHost(host)
-        pending = plan_logic.pending_recordings(token, config, state, self.days, host=source_host)
-        notes += ([n for n in pending.notes if "no Plaud token" not in n] if token is None
-                  else pending.notes)
-        folders = {}
-        if token is not None:
-            try:
-                folders = host.fetch_folders(token, config)
-            except (Exception, SystemExit):  # noqa: BLE001  folders are decoration
-                pass
-        live = plan_logic.live_meeting(config, host=host)
-        try:
-            specs = host.project_specs(config)
-        except Exception:  # noqa: BLE001
-            specs = {}
-        return dict(config=config, state=state, rows=plan_logic.with_live_first(pending, live),
-                    folders=folders, specs=specs, notes=notes)
 
     def _loaded(self, data):
         self.config, self.state, self.folders = data["config"], data["state"], data["folders"]
@@ -325,13 +260,7 @@ class PlanApp(App):
             recs.select(self.rows[0]["id"])   # G1: the common case needs no extra keystroke
             recs.highlighted = 0
         self.query_one("#loading").display = False
-        notes = list(data["notes"])
-        if self.arm_live and not any(r.get("live") for r in self.rows):
-            notes.append("No Wispr meeting is live right now, so there is nothing to arm: "
-                         "this is a normal plan.")
-        if not self.rows:
-            notes.append("No pending recordings.")
-        self.query_one("#notes", Static).update("\n".join(notes))
+        self.query_one("#notes", Static).update("\n".join(data["notes"]))
         self.loaded = True
         recs.focus()
         self._suggest()
@@ -354,23 +283,22 @@ class PlanApp(App):
         picked = set(self.query_one("#recs", SelectionList).selected)
         return [r["id"] for r in self.rows if r["id"] in picked]
 
+    def _delivery(self):
+        """What the job would get now (plan_logic.resolve_delivery, as build_job does)."""
+        return plan_logic.resolve_delivery(self._common(), self.specs.get(self.project)
+                                           if self.project else None)
+
     def effective_node(self):
-        if self.node_override is not None:
-            return self.node_override or None
-        return (self.specs.get(self.project) or {}).get("node") if self.project else None
+        return self._delivery()["node"]
 
     def effective_host(self):
-        if self.host_override is not None:
-            return self.host_override or None
-        return (self.specs.get(self.project) or {}).get("host") if self.project else None
+        return self._delivery()["host"] or None
 
     def effective_push(self):
-        if self.push_override:
-            return self.push_override
-        return (self.specs.get(self.project) or {}).get("push") if self.project else None
+        return self._delivery()["push"]
 
     def effective_mode(self):
-        return self.mode_choice or ("now" if self.effective_node() else "none")
+        return self._delivery()["mode"]
 
     def _suggest(self):
         if self.project_touched or not self.specs:
@@ -384,11 +312,11 @@ class PlanApp(App):
     def fields(self):
         """The plan fields exactly as handed to build_job (empty ones left out)."""
         ids = self.selected_ids()
-        live = self._live_selected(ids)
-        if live:     # armed: no recordings yet, the job waits for this meeting
-            return self._with_text({"recordings": [], "arm": live["id"].removeprefix("wispr:"),
-                                    "arm_title": live.get("filename") or None, **self._common()})
+        live = plan_logic.live_selected(self.rows, ids)
         f = {"recordings": ids}
+        if live:     # armed: the job waits for this meeting; build_job refuses anything else
+            f = {"recordings": [i for i in ids if i != live["id"]],
+                 "arm": live["id"].removeprefix("wispr:"), "arm_title": live.get("filename") or None}
         if self.merge:
             f["merge"] = True
         cuts = {r: s for r, s in self.cuts.items() if r in ids and s}
@@ -401,15 +329,14 @@ class PlanApp(App):
         f = {}
         if self.project:
             f["project"] = self.project
-        if self.node_override:
-            f["node"] = self.node_override
+        if self.node_override is not None:
+            f["node"] = self.node_override       # "" = cleared: no hand-off
         if self.host_override is not None:
             f["host"] = self.host_override
         if self.push_override:
             f["push"] = self.push_override
-        mode = self.mode_choice or ("none" if self.node_override == "" else None)
-        if mode:
-            f["mode"] = mode
+        if self.mode_choice:
+            f["mode"] = self.mode_choice
         return f
 
     def _with_text(self, f):
@@ -418,12 +345,6 @@ class PlanApp(App):
             if text:
                 f[key] = text
         return f
-
-    def _live_selected(self, ids):
-        """The selected live Wispr row, or None. Only a live Wispr meeting can be armed (E4):
-        Plaud, Recorder and call rows never are, whatever their flags say."""
-        return next((r for r in self.rows if r["id"] in ids and r.get("live")
-                     and r.get("source") == "wispr" and r["id"].startswith("wispr:")), None)
 
     def _refresh_labels(self):
         push = self.effective_push()
@@ -597,7 +518,7 @@ class PlanApp(App):
         if recs.highlighted is None or not self.rows:
             return
         row = self.rows[recs.highlighted]
-        if not self._live_selected([row["id"]]):
+        if not plan_logic.armable(row):
             self._error("Only a live Wispr meeting can be armed (Plaud, Recorder and call recordings "
                         "have no known upload time); this row can be saved as a normal job")
             return
@@ -610,11 +531,7 @@ class PlanApp(App):
 
     def action_cycle_host(self):
         """this Mac -> each config deliver.hosts entry (and the project's host) -> this Mac."""
-        hosts = [""] + [h for h in (self.config.get("deliver") or {}).get("hosts") or []
-                        if isinstance(h, str) and h]
-        own = (self.specs.get(self.project) or {}).get("host") if self.project else None
-        if own and own not in hosts:
-            hosts.append(own)
+        hosts = plan_logic.host_options(self.config, self.specs, self.project)
         if len(hosts) == 1:
             self._error('No other host configured: add "deliver": {"hosts": ["hp-ubuntu"]} to the config')
             return
@@ -642,27 +559,8 @@ class PlanApp(App):
         if not self.loaded:
             self._error("Still loading the recordings")
             return
-        ids = self.selected_ids()
-        if self._live_selected(ids):
-            if len(ids) > 1:
-                self._error("The live meeting can only be armed on its own: unselect the other "
-                            "recordings (a job cannot mix a running meeting with finished ones)")
-                return
-            if self.merge or any(self.cuts.get(i) for i in ids):
-                self._error("An armed job cannot be merged or cut: press m / clear the cut first")
-                return
-        f = self.fields()
-        if not f["recordings"] and "arm" not in f:
-            self._error("Select at least one recording (Space)")
-            return
-        if self.merge and len(f["recordings"]) < 2:
-            self._error("merge needs two or more selected recordings")
-            return
         try:
-            job = plan_logic.build_job(f, host=self.host, config=self.config)
-            if self.node_override == "":       # cleared: build_job would refill the project's node
-                job["deliver"]["node"] = None
-                jobs.validate_job(job)
+            job = plan_logic.build_job(self.fields(), host=self.host, config=self.config)
         except jobs.JobError as e:
             self._error(str(e))
             return
@@ -677,19 +575,4 @@ class PlanApp(App):
                 self._error(str(e))
                 return
             self.exit(job["id"])
-        self.push_screen(ConfirmScreen(self._summary(job)), confirmed)
-
-    def _summary(self, job):
-        """One line: what will be transcribed, where it goes, who gets it."""
-        titles = {r["id"]: r.get("filename", r["id"]) for r in self.rows}
-        trig = job.get("trigger")
-        what = (f"arm: runs when '{trig.get('title') or 'the meeting'}' ends" if trig
-                else " + ".join(titles.get(r, r) for r in job["recordings"]))
-        spec = self.specs.get(job["project"]) if job["project"] else None
-        where = (f"{job['project']} (push {job['push'] or (spec or {}).get('push') or 'none'})"
-                 if job["project"] else "classifier-routed project (push set after routing)")
-        d = job["deliver"]
-        node = d["node"] or "no hand-off"
-        if d["node"] and d.get("host"):
-            node += f" on {d['host']}"
-        return f"{what} \u2192 {where} \u2192 {node}, {d['mode']}"
+        self.push_screen(ConfirmScreen(plan_logic.job_summary(job, self.rows, self.specs)), confirmed)

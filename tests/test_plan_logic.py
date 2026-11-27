@@ -359,3 +359,189 @@ class TestHandOffHostComesFromTheProjectUnlessOverridden:
 
     def test_a_host_can_be_given_for_a_project_without_one(self):
         assert self._build(project="L", host="hp-ubuntu")["deliver"]["host"] == "hp-ubuntu"
+
+
+# --- the form without the form: what plan_app used to do itself (any surface reuses it) ---
+
+LIVE = {"id": "wispr:9f2c", "source": "wispr", "filename": "Weekly in progress",
+        "start_time": 9_000_000, "duration": 0, "live": True, "filetag_id_list": []}
+
+
+class TestLoadingNeverStopsTheForm:
+    """A plan form opens on a plane, with a broken config or without a token: it must show
+    what it can plus a note saying why, never a traceback."""
+
+    @pytest.fixture
+    def online(self, env, monkeypatch):
+        write_config(env, {"Hriste": {"dir": "/x/h", "push": "main", "node": "hriste:root"}})
+        monkeypatch.setattr(pt, "get_token", lambda: "tok")
+        monkeypatch.setattr(pt, "fetch_folders", lambda *a: {"f1": "Work"})
+        monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: None)
+        sources(monkeypatch, plaud=[rec("r1")])
+        return env
+
+    def test_everything_the_form_shows_comes_back_in_one_call(self, online):
+        data = plan_logic.load_plan_data(pt, days=30)
+        assert [r["id"] for r in data["rows"]] == ["r1"]
+        assert set(data["specs"]) == {"Hriste"} and data["folders"] == {"f1": "Work"}
+        assert data["notes"] == [] and "projects" in data["config"]
+
+    def test_a_broken_config_is_a_note_and_the_list_still_loads(self, online):
+        (online / "config.json").write_text("{not json")
+        data = plan_logic.load_plan_data(pt)
+        assert data["config"] == {} and data["specs"] == {}
+        assert any("config not usable" in n for n in data["notes"])
+
+    def test_without_a_token_the_network_is_never_tried_and_local_rows_still_list(
+            self, online, monkeypatch):
+        def no_token():
+            raise SystemExit(1)
+        monkeypatch.setattr(pt, "get_token", no_token)
+        monkeypatch.setattr(pt, "list_recordings", lambda *a: pytest.fail("network call"))
+        monkeypatch.setattr(pt, "fetch_folders", lambda *a: pytest.fail("network call"))
+        monkeypatch.setattr(pt.wispr_flow, "list_meetings",
+                            lambda *a: [rec("wispr:z", source="wispr")])
+        data = plan_logic.load_plan_data(pt)
+        assert [r["id"] for r in data["rows"]] == ["wispr:z"]
+        assert [n for n in data["notes"] if "token" in n.lower()] == [
+            "No Plaud token (PLAUD_BEARER_TOKEN); showing local recordings only"]
+
+    def test_the_live_meeting_is_the_first_row_so_enter_enter_arms_it(self, online, monkeypatch):
+        monkeypatch.setattr(plan_logic, "live_meeting", lambda *a, **k: dict(LIVE))
+        data = plan_logic.load_plan_data(pt, arm_live=True)
+        assert [r["id"] for r in data["rows"]] == ["wispr:9f2c", "r1"] and data["notes"] == []
+
+    def test_asking_to_arm_with_no_meeting_live_says_it_is_a_normal_plan(self, online):
+        notes = plan_logic.load_plan_data(pt, arm_live=True)["notes"]
+        assert any("No Wispr meeting is live" in n for n in notes)
+
+    def test_an_empty_list_says_so_instead_of_looking_broken(self, online, monkeypatch):
+        sources(monkeypatch)
+        assert "No pending recordings." in plan_logic.load_plan_data(pt)["notes"]
+
+
+class TestOnlyALiveWisprMeetingCanBeArmed:
+    """E4: arming waits for a transcript to appear; only Wispr tells us when a meeting ends."""
+
+    def test_the_live_wispr_meeting_is_armable(self):
+        assert plan_logic.armable(LIVE)
+
+    def test_a_plaud_recorder_or_call_row_flagged_live_is_not(self):
+        for rid, src in (("r1", "plaud"), ("recorder:x1", "recorder"), ("call:20261126-1000", "call")):
+            assert not plan_logic.armable(dict(LIVE, id=rid, source=src))
+
+    def test_a_finished_wispr_meeting_is_a_normal_recording_not_an_arm(self):
+        assert not plan_logic.armable(rec("wispr:done", source="wispr"))
+
+    def test_live_selected_finds_the_armable_row_among_the_selection(self):
+        rows = [dict(LIVE), rec("r1")]
+        assert plan_logic.live_selected(rows, ["r1", "wispr:9f2c"])["id"] == "wispr:9f2c"
+        assert plan_logic.live_selected(rows, ["r1"]) is None
+
+
+class TestHostChoices:
+    """h cycles where the hand-off session starts; the list must offer every place it can."""
+
+    def test_this_mac_first_then_the_configured_hosts(self):
+        cfg = {"deliver": {"hosts": ["hp-ubuntu", "", 7, "nas"]}}
+        assert plan_logic.host_options(cfg, {}, None) == ["", "hp-ubuntu", "nas"]
+
+    def test_a_projects_own_host_is_offered_even_when_the_config_lists_none(self):
+        specs = {"K": {"host": "build-box"}}
+        assert plan_logic.host_options({}, specs, "K") == ["", "build-box"]
+        assert plan_logic.host_options({"deliver": {"hosts": ["build-box"]}}, specs, "K") == [
+            "", "build-box"]
+
+    def test_only_this_mac_means_no_other_host_is_configured(self):
+        assert plan_logic.host_options({}, {}, None) == [""]
+
+
+class TestClearingTheNodeIsAJobField:
+    """x on the screen and `enqueue --node ''` both mean: this time, no hand-off, even though
+    the project names a node. build_job decides that, so no surface patches the job after."""
+
+    PROJECTS = {"Hriste": {"dir": "/x/hriste", "push": "main", "node": "hriste:root",
+                           "deliver_ask": "do the backlog"}}
+
+    def test_an_empty_node_overrides_the_projects_node_and_mode_falls_to_none(self, env):
+        job = plan_logic.build_job({"recordings": ["r1"], "project": "Hriste", "node": ""},
+                                   host=pt, config={"projects": self.PROJECTS})
+        assert job["deliver"]["node"] is None and job["deliver"]["mode"] == "none"
+        assert job["push"] == "main"
+
+    def test_no_node_field_still_follows_the_project(self, env):
+        job = plan_logic.build_job({"recordings": ["r1"], "project": "Hriste", "node": None},
+                                   host=pt, config={"projects": self.PROJECTS})
+        assert job["deliver"]["node"] == "hriste:root"
+
+    def test_enqueue_with_an_empty_node_gives_the_same_job_as_the_screens_clear(self, env):
+        write_config(env, self.PROJECTS)
+        args = argparse.Namespace(recording=["r1"], merge=False, cut=[], instructions=None,
+                                  project="Hriste", push=None, node="", mode=None, note=None,
+                                  dry_run=True)
+        a = jobs_cli.build_enqueue_job(args, pt)
+        b = plan_logic.build_job({"recordings": ["r1"], "project": "Hriste", "node": ""}, host=pt)
+        strip = lambda j: {k: v for k, v in j.items() if k not in ("id", "created")}  # noqa: E731
+        assert strip(a) == strip(b)
+
+
+class TestFormRulesLiveInTheBuilder:
+    """The checks the screen used to repeat before build_job; any surface now gets the same
+    refusal and shows its text as it is."""
+
+    def _refuse(self, fields, text):
+        with pytest.raises(jobs.JobError, match=text):
+            plan_logic.build_job(fields, host=pt, config={"projects": {}})
+
+    def test_a_running_meeting_cannot_share_a_job_with_finished_recordings(self):
+        self._refuse({"recordings": ["r1"], "arm": "9f2c"}, "only be armed on its own")
+
+    def test_an_armed_job_cannot_merge_because_there_is_no_transcript_yet(self):
+        self._refuse({"recordings": [], "arm": "9f2c", "merge": True}, "cannot be merged or cut")
+
+    def test_merging_one_recording_is_a_mistake_not_a_silent_no_op(self):
+        self._refuse({"recordings": ["r1"], "merge": True}, "two or more")
+
+    def test_nothing_selected_says_what_to_do(self):
+        self._refuse({"recordings": []}, "Select at least one recording")
+
+    def test_an_armed_job_alone_needs_no_recordings(self):
+        job = plan_logic.build_job({"recordings": [], "arm": "9f2c", "arm_title": "Weekly"},
+                                   host=pt, config={"projects": {}})
+        assert job["state"] == "armed" and job["trigger"]["title"] == "Weekly"
+
+
+class TestLabelsShowWhatTheJobWillGet:
+    """A form labels push / node / host / mode before saving; those labels come from the same
+    resolution build_job uses, so the summary never disagrees with the saved job."""
+
+    SPEC = {"push": "main", "node": "k:1", "host": "hp-ubuntu", "deliver_ask": "ask"}
+
+    def test_resolution_equals_the_built_jobs_deliver_block(self):
+        cfg = {"projects": {"K": dict(self.SPEC, dir="/x/k")}}
+        for fields in ({}, {"node": ""}, {"host": ""}, {"push": "pr", "mode": "later"},
+                       {"node": "k:2", "host": "nas"}):
+            job = plan_logic.build_job({"recordings": ["r1"], "project": "K", **fields},
+                                       host=pt, config=cfg)
+            d = plan_logic.resolve_delivery(fields, pt.project_specs(cfg)["K"])
+            assert (d["push"], d["node"], d["host"], d["mode"], d["ask"]) == (
+                job["push"], job["deliver"]["node"], job["deliver"]["host"],
+                job["deliver"]["mode"], job["deliver"]["ask"]), fields
+
+    def test_no_project_means_no_defaults(self):
+        assert plan_logic.resolve_delivery({}) == {"push": None, "node": None, "host": None,
+                                                   "mode": "none", "ask": None}
+
+
+class TestSummaryBeforeSaving:
+    def test_names_the_recordings_the_project_and_the_hand_off(self):
+        job = plan_logic.build_job({"recordings": ["r1", "r2"], "merge": True, "project": "K"},
+                                   host=pt, config={"projects": {"K": {
+                                       "dir": "/x/k", "push": "pr", "node": "k:1", "host": "nas"}}})
+        line = plan_logic.job_summary(job, [rec("r1", "Part one"), rec("r2", "Part two")])
+        assert line == "Part one + Part two → K (push pr) → k:1 on nas, now"
+
+    def test_an_armed_job_says_when_it_will_run(self):
+        job = plan_logic.build_job({"recordings": [], "arm": "9f2c", "arm_title": "Weekly"},
+                                   host=pt, config={"projects": {}})
+        assert plan_logic.job_summary(job).startswith("arm: runs when 'Weekly' ends")

@@ -226,7 +226,8 @@ def build_parser():
     e.add_argument("--push", choices=jobs.PUSH_MODES,
                    help="main | pr | none; default: the project's push mode")
     e.add_argument("--node", help="cc-tree ref to hand the transcript to (tree or tree:id); "
-                                  "default: the project's node")
+                                  "default: the project's node; '' = no hand-off even if the "
+                                  "project names a node")
     e.add_argument("--host", help="ssh host to hand off on, e.g. hp-ubuntu: cc-tree deliver runs "
                                   "there, so a fresh session starts there (needs push main|pr); "
                                   "'local' = this Mac; default: the project's host")
