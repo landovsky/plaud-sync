@@ -547,3 +547,44 @@ class TestOffline:
         async def scenario(app, pilot):
             assert "No pending recordings" in str(app.query_one("#notes", Static).render())
         run(scenario)
+
+
+class TestTheScreenAndEnqueueWriteTheSameJob:
+    """G3: the screen is only a way to fill in build_job's fields, so the same choices made
+    with keys or with `enqueue` flags give the same job (id and timestamps aside)."""
+
+    @staticmethod
+    def _enqueue(**kw):
+        import argparse
+        import jobs_cli
+        base = dict(recording=[], merge=False, cut=[], instructions=None, project=None, push=None,
+                    node=None, host=None, mode=None, note=None, dry_run=True)
+        return jobs_cli.build_enqueue_job(argparse.Namespace(**{**base, **kw}), pt)
+
+    @staticmethod
+    def _strip(job):
+        return {k: v for k, v in job.items() if k not in ("id", "created")}
+
+    def test_merged_recordings_with_the_node_cleared(self, env):
+        async def scenario(app, pilot):
+            await pilot.press("down", "space", "m", "x", "enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        cli = self._enqueue(recording=["r-new", "r-mid"], merge=True, project="Hřiště Hrou",
+                            node="")
+        assert self._strip(job) == self._strip(cli) and job["deliver"]["node"] is None
+
+    def test_a_hand_off_moved_to_another_host_with_a_cut(self, env):
+        cfg = json.loads((env / "config.json").read_text())
+        cfg["deliver"] = {"hosts": ["hp-ubuntu"]}
+        (env / "config.json").write_text(json.dumps(cfg))
+
+        async def scenario(app, pilot):
+            await pilot.press("c")
+            await pilot.press(*"1:00-2:00", "enter")
+            await pilot.press("h", "enter", "enter")
+        run(scenario)
+        (job,) = saved_jobs()
+        cli = self._enqueue(recording=["r-new"], cut=["r-new=1:00-2:00"], project="Hřiště Hrou",
+                            host="hp-ubuntu")
+        assert self._strip(job) == self._strip(cli) and job["deliver"]["host"] == "hp-ubuntu"
